@@ -9,6 +9,7 @@
 ### ✨ Improvements
 - **Enhanced Peer Activity Visualization**: Redesigned the peer stream display with improved visual density—Braille-style dots for light activity and emphasized markers for heavy peer connections, making it easier to spot swarm health at a glance.
 - **Watch Path Visibility**: The configured watch folder path is now displayed in the interface for better transparency.
+- **Smart Progress Column**: The progress column in the torrent list will only show when torrents are downloading to validating.
 
 ### 🐛 Bug Fixes
 - None in this release.

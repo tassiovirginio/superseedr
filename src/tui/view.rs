@@ -161,6 +161,25 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
         .values()
         .any(|t| t.smoothed_upload_speed_bps > 0);
 
+    let has_incomplete_torrents = app_state.torrents.values().any(|t| {
+        let s = &t.latest_state;
+        if s.activity_message.contains("Seeding") || s.activity_message.contains("Finished") {
+            return false;
+        }
+
+        let skipped_count = s
+            .file_priorities
+            .values()
+            .filter(|&&p| p == FilePriority::Skip)
+            .count() as u32;
+        let effective_total = s.number_of_pieces_total.saturating_sub(skipped_count);
+
+        if effective_total == 0 {
+            return false;
+        }
+        s.number_of_pieces_completed < effective_total
+    });
+
     let all_cols = get_torrent_columns();
 
     let active_cols: Vec<_> = all_cols
@@ -168,6 +187,7 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
         .filter(|c| match c.id {
             ColumnId::DownSpeed => has_dl_activity,
             ColumnId::UpSpeed => has_ul_activity,
+            ColumnId::Status => has_incomplete_torrents,
             _ => true,
         })
         .collect();
