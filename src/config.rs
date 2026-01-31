@@ -292,14 +292,6 @@ pub fn save_settings(settings: &Settings) -> io::Result<()> {
     Ok(())
 }
 
-pub fn config_file_exists() -> bool {
-    if let Some((config_dir, _)) = get_app_paths() {
-        config_dir.join("settings.toml").exists()
-    } else {
-        false
-    }
-}
-
 fn cleanup_old_backups(backup_dir: &PathBuf, limit: usize) -> io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(backup_dir)?
         .filter_map(|res| res.ok())
