@@ -14,7 +14,9 @@ use strum_macros::EnumIter;
 
 use crate::torrent_manager::DiskIoOperation;
 
+use crate::config::{get_app_paths, save_settings};
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSettings, TorrentSortColumn};
+
 use crate::token_bucket::TokenBucket;
 
 use crate::tui::events;
@@ -35,9 +37,6 @@ use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
 use crate::torrent_manager::TorrentManager;
 use crate::torrent_manager::TorrentParameters;
-
-use crate::config::get_app_paths;
-use crate::config::save_settings;
 
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
@@ -756,7 +755,7 @@ impl App {
             }
         }
 
-        if app.app_state.torrents.is_empty() {
+        if app.app_state.torrents.is_empty() && app.app_state.lifetime_downloaded_from_config == 0 {
             app.app_state.mode = AppMode::Welcome;
         }
 
@@ -2617,6 +2616,10 @@ impl App {
             .insert(info_hash.clone(), placeholder_state);
         self.app_state.torrent_list_order.push(info_hash.clone());
 
+        if matches!(self.app_state.mode, AppMode::Welcome) {
+            self.app_state.mode = AppMode::Normal;
+        }
+
         let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(TcpStream, Vec<u8>)>(100);
         self.torrent_manager_incoming_peer_txs
             .insert(info_hash.clone(), incoming_peer_tx);
@@ -2729,6 +2732,10 @@ impl App {
             .torrents
             .insert(info_hash.clone(), placeholder_state);
         self.app_state.torrent_list_order.push(info_hash.clone());
+
+        if matches!(self.app_state.mode, AppMode::Welcome) {
+            self.app_state.mode = AppMode::Normal;
+        }
 
         let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(TcpStream, Vec<u8>)>(100);
         self.torrent_manager_incoming_peer_txs

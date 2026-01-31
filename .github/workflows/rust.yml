@@ -181,6 +181,7 @@ jobs:
           security list-keychains -s "$KEYCHAIN_NAME"
           security default-keychain -s "$KEYCHAIN_NAME"
           security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+          security set-keychain-settings -t 0 -u "$KEYCHAIN_NAME"
           
           # Decode and import the .p12
           echo $APPLE_INSTALLER_CERT_P12_BASE64 | base64 --decode > certificate.p12
@@ -401,6 +402,7 @@ jobs:
   build_and_push_docker: 
     name: Docker (${{ matrix.flavor }})
     if: startsWith(github.ref, 'refs/tags/')
+    needs: [package_linux, bundle_macos, build_windows]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

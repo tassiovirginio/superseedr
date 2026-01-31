@@ -222,6 +222,29 @@ pub fn load_settings() -> Settings {
     if let Some((config_dir, _)) = get_app_paths() {
         let config_file_path = config_dir.join("settings.toml");
 
+        if !config_file_path.exists() {
+            tracing_event!(
+                Level::INFO,
+                "No settings found. Performing first-run setup."
+            );
+            let mut settings = Settings::default();
+            if let Some(user_dirs) = directories::UserDirs::new() {
+                if let Some(dl_dir) = user_dirs.download_dir() {
+                    settings.default_download_folder = Some(dl_dir.to_path_buf());
+                }
+            }
+            if let Err(e) = save_settings(&settings) {
+                tracing_event!(Level::ERROR, "Failed to save initial settings: {}", e);
+            }
+            return settings;
+        }
+
+        tracing_event!(
+            Level::INFO,
+            "Found existing settings at: {:?}",
+            config_file_path
+        );
+
         match Figment::new()
             .merge(Toml::file(&config_file_path))
             .merge(Env::prefixed("SUPERSEEDR_"))

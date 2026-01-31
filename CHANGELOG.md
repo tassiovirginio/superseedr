@@ -1,5 +1,19 @@
 # Changelog
 
+## Release v0.9.36
+
+### 🚀 New Features
+- **Smart First-Run Setup**: On first launch, the app now automatically detects your system's Downloads folder and configures it as the default download location—no manual setup required.
+- **Intelligent Welcome Screen**: The welcome screen now only appears for truly new users and automatically dismisses when you add your first torrent.
+
+### ✨ Improvements
+- **Enhanced Peer Activity Visualization**: Redesigned the peer stream display with improved visual density—Braille-style dots for light activity and emphasized markers for heavy peer connections, making it easier to spot swarm health at a glance.
+- **Watch Path Visibility**: The configured watch folder path is now displayed in the interface for better transparency.
+- **Smart Progress Column**: The progress column in the torrent list will only show when torrents are downloading to validating.
+
+### 🐛 Bug Fixes
+- None in this release.
+
 ## Release v0.9.35
 ### Performance
 - Added periodic application state dump to JSON for external monitoring/integrations.

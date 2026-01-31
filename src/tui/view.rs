@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     match &app_state.mode {
         AppMode::Welcome => {
-            draw_welcome_screen(f);
+            draw_welcome_screen(f, settings);
             return;
         }
         AppMode::PowerSaving => {
@@ -161,6 +161,25 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
         .values()
         .any(|t| t.smoothed_upload_speed_bps > 0);
 
+    let has_incomplete_torrents = app_state.torrents.values().any(|t| {
+        let s = &t.latest_state;
+        if s.activity_message.contains("Seeding") || s.activity_message.contains("Finished") {
+            return false;
+        }
+
+        let skipped_count = s
+            .file_priorities
+            .values()
+            .filter(|&&p| p == FilePriority::Skip)
+            .count() as u32;
+        let effective_total = s.number_of_pieces_total.saturating_sub(skipped_count);
+
+        if effective_total == 0 {
+            return false;
+        }
+        s.number_of_pieces_completed < effective_total
+    });
+
     let all_cols = get_torrent_columns();
 
     let active_cols: Vec<_> = all_cols
@@ -168,6 +187,7 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
         .filter(|c| match c.id {
             ColumnId::DownSpeed => has_dl_activity,
             ColumnId::UpSpeed => has_ul_activity,
+            ColumnId::Status => has_incomplete_torrents,
             _ => true,
         })
         .collect();
@@ -1343,11 +1363,9 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let color_discovered = theme::YELLOW;
     let color_connected = theme::TEAL;
     let color_disconnected = theme::MAROON;
-    let color_title = theme::SUBTEXT0;
     let color_border = theme::SURFACE2;
-    let color_axis = theme::OVERLAY0;
 
-    let default_slice: Vec<u64> = Vec::new(); // Empty reference
+    let default_slice: Vec<u64> = Vec::new();
 
     let (disc_slice, conn_slice, disconn_slice) = if let Some(torrent) = selected_torrent {
         let width = area.width.saturating_sub(2).max(1) as usize;
@@ -1368,7 +1386,6 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let connected_count: u64 = conn_slice.iter().sum();
     let disconnected_count: u64 = disconn_slice.iter().sum();
 
-    // Use placeholder style for legend if count is 0 / no torrent
     let legend_style_fn = |count: u64, color: Color| {
         if selected_torrent.is_some() && count > 0 {
             Style::default().fg(color)
@@ -1383,8 +1400,8 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             legend_style_fn(connected_count, color_connected),
         ),
         Span::styled(
-            connected_count.to_string(),
-            legend_style_fn(connected_count, color_connected),
+            format!(" {} ", connected_count),
+            legend_style_fn(connected_count, color_connected).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
@@ -1392,8 +1409,8 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             legend_style_fn(discovered_count, color_discovered),
         ),
         Span::styled(
-            discovered_count.to_string(),
-            legend_style_fn(discovered_count, color_discovered),
+            format!(" {} ", discovered_count),
+            legend_style_fn(discovered_count, color_discovered).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
@@ -1401,162 +1418,134 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             legend_style_fn(disconnected_count, color_disconnected),
         ),
         Span::styled(
-            disconnected_count.to_string(),
-            legend_style_fn(disconnected_count, color_disconnected),
+            format!(" {} ", disconnected_count),
+            legend_style_fn(disconnected_count, color_disconnected).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
     ]);
 
-    let max_disc = disc_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
-    let max_conn = conn_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
-    let max_disconn = disconn_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
+    let time_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
-    // ... [Calculations for markers stay the same, they handle empty iterators gracefully] ...
+    let mut conn_points_small = Vec::new();
+    let mut disc_points_small = Vec::new();
+    let mut disconn_points_small = Vec::new();
 
-    let y_discovered = 2.0;
-    let y_connected = 3.0;
-    let y_disconnected = 1.0;
+    let mut conn_points_large = Vec::new();
+    let mut disc_points_large = Vec::new();
+    let mut disconn_points_large = Vec::new();
 
-    let small_marker = Marker::Block;
-    let medium_marker = Marker::Block;
-    let large_marker = Marker::Block;
+    let mut rng = StdRng::seed_from_u64(time_seed);
 
-    let mut disc_data_light = Vec::new();
-    let mut disc_data_medium = Vec::new();
-    let mut disc_data_dark = Vec::new();
-    // ... (Repeat for conn/disconn - code matches existing) ...
-    let mut conn_data_light = Vec::new();
-    let mut conn_data_medium = Vec::new();
-    let mut conn_data_dark = Vec::new();
-    let mut disconn_data_light = Vec::new();
-    let mut disconn_data_medium = Vec::new();
-    let mut disconn_data_dark = Vec::new();
+    let mut generate_points = |data_slice: &[u64],
+                               small_points: &mut Vec<(f64, f64)>,
+                               large_points: &mut Vec<(f64, f64)>,
+                               base_y: f64| {
+        for (i, &val) in data_slice.iter().enumerate() {
+            if val == 0 {
+                continue;
+            }
+            let val_f = val as f64;
+            let is_heavy = val > 3;
 
-    for (i, &v) in disc_slice.iter().enumerate() {
-        if v == 0 {
-            continue;
+            let small_dot_count = (val_f.sqrt().ceil() as usize).clamp(1, 6);
+            let activity_spread = (val_f * 0.08).min(0.6);
+            let base_jitter = 0.05;
+            let intensity = base_jitter + activity_spread;
+
+            for _ in 0..small_dot_count {
+                let x_jitter = rng.random_range(-intensity..intensity);
+                let y_jitter = rng.random_range(-intensity..intensity);
+                small_points.push((i as f64 + x_jitter, base_y + y_jitter));
+            }
+
+            if is_heavy {
+                let heavy_jitter = rng.random_range(-0.1..0.1);
+                large_points.push((i as f64 + heavy_jitter, base_y + heavy_jitter));
+            }
         }
-        let norm_val = v as f64 / max_disc;
-        let y_val = y_discovered;
-        if norm_val < 0.33 {
-            disc_data_light.push((i as f64, y_val));
-        } else if norm_val < 0.66 {
-            disc_data_medium.push((i as f64, y_val));
-        } else {
-            disc_data_dark.push((i as f64, y_val));
-        }
-    }
-    for (i, &v) in conn_slice.iter().enumerate() {
-        if v == 0 {
-            continue;
-        }
-        let norm_val = v as f64 / max_conn;
-        let y_val = y_connected;
-        if norm_val < 0.33 {
-            conn_data_light.push((i as f64, y_val));
-        } else if norm_val < 0.66 {
-            conn_data_medium.push((i as f64, y_val));
-        } else {
-            conn_data_dark.push((i as f64, y_val));
-        }
-    }
-    for (i, &v) in disconn_slice.iter().enumerate() {
-        if v == 0 {
-            continue;
-        }
-        let norm_val = v as f64 / max_disconn;
-        let y_val = y_disconnected;
-        if norm_val < 0.33 {
-            disconn_data_light.push((i as f64, y_val));
-        } else if norm_val < 0.66 {
-            disconn_data_medium.push((i as f64, y_val));
-        } else {
-            disconn_data_dark.push((i as f64, y_val));
-        }
-    }
+    };
+
+    generate_points(
+        conn_slice,
+        &mut conn_points_small,
+        &mut conn_points_large,
+        3.0,
+    );
+    generate_points(
+        disc_slice,
+        &mut disc_points_small,
+        &mut disc_points_large,
+        2.0,
+    );
+    generate_points(
+        disconn_slice,
+        &mut disconn_points_small,
+        &mut disconn_points_large,
+        1.0,
+    );
 
     let datasets = vec![
         Dataset::default()
-            .data(&disc_data_light)
-            .marker(small_marker)
-            .graph_type(GraphType::Scatter)
-            .style(
-                Style::default()
-                    .fg(color_discovered)
-                    .add_modifier(Modifier::DIM),
-            ),
-        Dataset::default()
-            .data(&disc_data_medium)
-            .marker(medium_marker)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(color_discovered)),
-        Dataset::default()
-            .data(&disc_data_dark)
-            .marker(large_marker)
-            .graph_type(GraphType::Scatter)
-            .style(
-                Style::default()
-                    .fg(color_discovered)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        Dataset::default()
-            .data(&conn_data_light)
-            .marker(small_marker)
-            .graph_type(GraphType::Scatter)
+            .marker(symbols::Marker::Braille)
             .style(
                 Style::default()
                     .fg(color_connected)
                     .add_modifier(Modifier::DIM),
-            ),
+            )
+            .data(&conn_points_small),
         Dataset::default()
-            .data(&conn_data_medium)
-            .marker(medium_marker)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(color_connected)),
-        Dataset::default()
-            .data(&conn_data_dark)
-            .marker(large_marker)
-            .graph_type(GraphType::Scatter)
+            .marker(symbols::Marker::Braille)
             .style(
                 Style::default()
-                    .fg(color_connected)
-                    .add_modifier(Modifier::BOLD),
-            ),
+                    .fg(color_discovered)
+                    .add_modifier(Modifier::DIM),
+            )
+            .data(&disc_points_small),
         Dataset::default()
-            .data(&disconn_data_light)
-            .marker(small_marker)
-            .graph_type(GraphType::Scatter)
+            .marker(symbols::Marker::Braille)
             .style(
                 Style::default()
                     .fg(color_disconnected)
                     .add_modifier(Modifier::DIM),
-            ),
+            )
+            .data(&disconn_points_small),
         Dataset::default()
-            .data(&disconn_data_medium)
-            .marker(medium_marker)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(color_disconnected)),
+            .marker(symbols::Marker::Dot)
+            .style(
+                Style::default()
+                    .fg(color_connected)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .data(&conn_points_large),
         Dataset::default()
-            .data(&disconn_data_dark)
-            .marker(large_marker)
-            .graph_type(GraphType::Scatter)
+            .marker(symbols::Marker::Dot)
+            .style(
+                Style::default()
+                    .fg(color_discovered)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .data(&disc_points_large),
+        Dataset::default()
+            .marker(symbols::Marker::Dot)
             .style(
                 Style::default()
                     .fg(color_disconnected)
                     .add_modifier(Modifier::BOLD),
-            ),
+            )
+            .data(&disconn_points_large),
     ];
 
-    // Bounds: X axis 0..width. If width=0 (empty), use 1.0 to avoid crash/ugly render
     let x_bound = disc_slice.len().max(1).saturating_sub(1) as f64;
 
-    let discovery_chart = Chart::new(datasets)
+    let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .title_top(
                     Line::from(Span::styled(
-                        "Peer Stream",
-                        Style::default().fg(color_title),
+                        " Peer Activity Stream ",
+                        Style::default().fg(theme::SUBTEXT0),
                     ))
                     .alignment(Alignment::Left),
                 )
@@ -1564,14 +1553,10 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(color_border)),
         )
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(color_axis))
-                .bounds([0.0, x_bound]),
-        )
+        .x_axis(Axis::default().bounds([0.0, x_bound]))
         .y_axis(Axis::default().bounds([0.5, 3.5]));
 
-    f.render_widget(discovery_chart, area);
+    f.render_widget(chart, area);
 }
 
 fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
@@ -2914,13 +2899,11 @@ fn draw_torrent_preview_panel(
     }
 }
 
-fn draw_welcome_screen(f: &mut Frame) {
+fn draw_welcome_screen(f: &mut Frame, settings: &Settings) {
     let area = f.area();
 
-    // 1. Draw the Background first (The stars/lines)
     draw_background_dust(f, area);
 
-    // --- SETUP CONTENT ---
     let get_dims = |text: &str| -> (u16, u16) {
         let h = text.lines().count() as u16;
         let w = text.lines().map(|l| l.len()).max().unwrap_or(0) as u16;
@@ -2929,6 +2912,12 @@ fn draw_welcome_screen(f: &mut Frame) {
 
     let (w_large, h_large) = get_dims(LOGO_LARGE);
     let (w_medium, h_medium) = get_dims(LOGO_MEDIUM);
+
+    let download_path_str = settings
+        .default_download_folder
+        .as_ref()
+        .map(|p| p.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("Manual Selection"));
 
     // Define the Main Body Text
     let text_lines = vec![
@@ -2987,6 +2976,18 @@ fn draw_welcome_screen(f: &mut Frame) {
             Span::raw("Drop files into your "),
             Span::styled("Watch Folder", Style::default().fg(theme::SKY).bold()),
             Span::raw(" to add them automatically."),
+        ]),
+        Line::from(vec![
+            Span::styled(" ★ ", Style::default().fg(theme::GREEN)),
+            Span::raw("Download Location: "),
+            Span::styled(download_path_str, Style::default().fg(theme::SKY).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("      - "),
+            Span::styled(
+                "Change or remove in Config [c]",
+                Style::default().fg(theme::SURFACE2).italic(),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -3080,12 +3081,6 @@ fn draw_welcome_screen(f: &mut Frame) {
     let final_logo_area = logo_layout[1];
     let final_box_area = box_layout[1];
 
-    // --- RENDER ---
-
-    // A. Render Transparent Gradient Logo
-    // We cannot use `Paragraph` because it overwrites the background with spaces.
-    // Instead, we manually calculate positions and write only non-space characters
-    // to the buffer.
     let buf = f.buffer_mut();
     for (y_local, line) in logo_text.lines().enumerate() {
         if y_local >= final_logo_area.height as usize {
@@ -3112,8 +3107,6 @@ fn draw_welcome_screen(f: &mut Frame) {
         }
     }
 
-    // B. Render Content Box (Opaque)
-    // We clear the box area first because we WANT this to obscure the background stars
     f.render_widget(Clear, final_box_area);
 
     let block = Block::default()
@@ -3167,6 +3160,12 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState) {
         )
     };
 
+    let watch_path_str = if let Some((system_watch, _)) = crate::config::get_watch_path() {
+        system_watch.to_string_lossy().to_string()
+    } else {
+        "Disabled".to_string()
+    };
+
     let area = centered_rect(60, 100, f.area());
     f.render_widget(Clear, area);
 
@@ -3215,11 +3214,18 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState) {
                     Style::default().fg(theme::SUBTEXT0),
                 ),
             ]),
+            Line::from(vec![
+                Span::styled("Watch Dir: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&watch_path_str, footer_inner_area.width as usize - 11),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
         ];
         let footer_paragraph = Paragraph::new(footer_lines).style(Style::default().fg(theme::TEXT));
         f.render_widget(footer_paragraph, footer_inner_area);
     } else {
-        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(area);
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).split(area);
         draw_help_table(f, app_state, chunks[0]);
         let footer_block = Block::default().border_style(Style::default().fg(theme::SURFACE2));
         let footer_inner_area = footer_block.inner(chunks[1]);
@@ -3239,6 +3245,13 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState) {
                 Span::styled("Log File: ", Style::default().fg(theme::TEXT)),
                 Span::styled(
                     truncate_with_ellipsis(&log_path_str, footer_inner_area.width as usize - 10),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Watch Dir: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&watch_path_str, footer_inner_area.width as usize - 11),
                     Style::default().fg(theme::SUBTEXT0),
                 ),
             ]),

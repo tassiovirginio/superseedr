@@ -10,13 +10,7 @@ I am preparing to merge my branch to main. Please perform the following 4 tasks 
    - **CONSTRAINT:** Do NOT change any program logic or behavior. Only apply mechanical fixes (e.g., removing unused imports, removing unnecessary `mut`, fixing whitespace).
    - **CONSTRAINT:** If any warning requires a logic changes, ambiguous meanings, or regresssions/bugs **STOP and report it** instead of attempting to fix it.
 
-3. **Update Changelog:**
-   - Analyze the new changes on this branch
-   - Update `CHANGELOG.md` following the **exact format** of the existing entries:
-     - Categorize changes under `### Performance`, `### Refactoring`, and `### Testing`.
-     - Use concise bullet points.
-
-4. **Verify:**
+3. **Verify:**
    - Run the full test suite using: `cargo test --all-targets --all-features`
    - Notify me only if all tests pass.
    - Review your changes one last time, ensure no logic was changed.
