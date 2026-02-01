@@ -154,6 +154,7 @@ jobs:
             flags: --no-default-features
     steps:
       - uses: actions/checkout@v6
+    
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -169,6 +170,14 @@ jobs:
         run: |
           rustup target add aarch64-apple-darwin
           rustup target add x86_64-apple-darwin
+
+      - name: Pre-compile Rust Binaries
+        run: |
+          echo "Starting pre-compilation to separate build time from signing time..."
+          echo "Building x86_64..."
+          cargo build --release --target x86_64-apple-darwin ${{ matrix.flags }}
+          echo "Building aarch64..."
+          cargo build --release --target aarch64-apple-darwin ${{ matrix.flags }}
 
       - name: Setup macOS Keychain and Certificate
         id: setup_keychain
@@ -201,6 +210,7 @@ jobs:
             security find-identity -v "$KEYCHAIN_NAME" # Print all identities for debugging
             exit 1
           fi
+     
           echo "Using certificate: $CERT_CN"
           echo "CERT_NAME=$CERT_CN" >> $GITHUB_ENV
       
@@ -244,7 +254,7 @@ jobs:
             --password "$APPLE_NOTARY_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-            
+             
           echo "Notarization successful. Stapling ticket..."
           
           xcrun stapler staple "$PKG_FILE_PATH"
@@ -267,7 +277,7 @@ jobs:
           DEST_PATH="staging/$PKG_NAME"
           echo "Moving $PKG_SRC_PATH to $DEST_PATH"
           mv "$PKG_SRC_PATH" "$DEST_PATH"
-          
+           
           echo "final_pkg_path=$DEST_PATH" >> $GITHUB_OUTPUT
 
       - name: Cleanup Keychain
