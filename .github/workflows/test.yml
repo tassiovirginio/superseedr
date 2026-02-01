@@ -2,7 +2,7 @@ name: Test macOS Build Fix
 
 on: 
   push:
-    branches: [ "**" ] # Triggers on push to any branch for testing
+    #branches: [ "**" ] # Triggers on push to any branch for testing
 
 env:
   CARGO_TERM_COLOR: always
