@@ -13,8 +13,8 @@ pub enum ThemeName {
     Aurora,
     #[strum(serialize = "Ayu Dark")]
     AyuDark,
-    #[strum(serialize = "Candy Land Pink")]
-    CandyLandPink,
+    #[strum(serialize = "Bubblegum")]
+    Bubblegum,
     #[strum(serialize = "Catppuccin Latte")]
     CatppuccinLatte,
     #[strum(serialize = "Catppuccin Mocha")]
@@ -84,7 +84,7 @@ impl Serialize for ThemeName {
             ThemeName::Andromeda => "andromeda",
             ThemeName::Aurora => "aurora",
             ThemeName::AyuDark => "ayu_dark",
-            ThemeName::CandyLandPink => "candy_land_pink",
+            ThemeName::Bubblegum => "bubblegum",
             ThemeName::CatppuccinLatte => "catppuccin_latte",
             ThemeName::CatppuccinMocha => "catppuccin_mocha",
             ThemeName::Cyberpunk => "cyberpunk",
@@ -126,7 +126,7 @@ impl<'de> Deserialize<'de> for ThemeName {
             "andromeda" | "Andromeda" => Ok(ThemeName::Andromeda),
             "aurora" | "Aurora" => Ok(ThemeName::Aurora),
             "ayu_dark" | "Ayu Dark" => Ok(ThemeName::AyuDark),
-            "candy_land_pink" | "Candy Land Pink" => Ok(ThemeName::CandyLandPink),
+            "bubblegum" | "Bubblegum" => Ok(ThemeName::Bubblegum),
             "catppuccin_latte" | "Catppuccin Latte" => Ok(ThemeName::CatppuccinLatte),
             "catppuccin_mocha" | "Catppuccin Mocha" => Ok(ThemeName::CatppuccinMocha),
             "cyberpunk" | "Cyberpunk" => Ok(ThemeName::Cyberpunk),
@@ -244,7 +244,7 @@ impl Theme {
             ThemeName::Andromeda => Self::andromeda(),
             ThemeName::Aurora => Self::aurora(),
             ThemeName::AyuDark => Self::ayu_dark(),
-            ThemeName::CandyLandPink => Self::candy_land_pink(),
+            ThemeName::Bubblegum => Self::bubblegum(),
             ThemeName::CatppuccinLatte => Self::catppuccin_latte(),
             ThemeName::CatppuccinMocha => Self::catppuccin_mocha(),
             ThemeName::Cyberpunk => Self::cyberpunk(),
@@ -369,7 +369,7 @@ impl Theme {
                 subtext0: Color::Rgb(90, 200, 220),
                 overlay0: Color::Rgb(30, 70, 95),
                 surface2: Color::Rgb(18, 40, 64),
-                surface1: Color::Rgb(12, 30, 52),
+                surface1: Color::Rgb(35, 70, 100),
                 surface0: Color::Rgb(8, 22, 42),
                 border: Color::Rgb(18, 40, 64),
                 white: Color::White,
@@ -406,48 +406,48 @@ impl Theme {
         }
     }
 
-    pub fn candy_land_pink() -> Self {
+    pub fn bubblegum() -> Self {
         let categorical = ThemeCategorical {
-            rosewater: Color::Rgb(255, 232, 244),
-            flamingo: Color::Rgb(255, 210, 236),
-            pink: Color::Rgb(255, 176, 220),
-            mauve: Color::Rgb(226, 180, 255),
-            red: Color::Rgb(255, 176, 214),
-            maroon: Color::Rgb(255, 192, 224),
-            peach: Color::Rgb(255, 202, 178),
-            yellow: Color::Rgb(255, 234, 190),
-            green: Color::Rgb(210, 236, 216),
-            teal: Color::Rgb(196, 230, 226),
-            sky: Color::Rgb(190, 216, 255),
-            sapphire: Color::Rgb(170, 200, 255),
-            blue: Color::Rgb(150, 184, 255),
-            lavender: Color::Rgb(214, 190, 255),
+            rosewater: Color::Rgb(255, 200, 230),
+            flamingo: Color::Rgb(255, 150, 220),
+            pink: Color::Rgb(255, 100, 200),
+            mauve: Color::Rgb(255, 120, 220),
+            red: Color::Rgb(255, 80, 180),
+            maroon: Color::Rgb(255, 90, 190),
+            peach: Color::Rgb(255, 160, 210),
+            yellow: Color::Rgb(255, 200, 230),
+            green: Color::Rgb(255, 180, 220),
+            teal: Color::Rgb(255, 170, 215),
+            sky: Color::Rgb(255, 190, 225),
+            sapphire: Color::Rgb(255, 185, 223),
+            blue: Color::Rgb(255, 175, 218),
+            lavender: Color::Rgb(255, 195, 228),
         };
 
         Self {
-            name: ThemeName::CandyLandPink,
+            name: ThemeName::Bubblegum,
             effects: ThemeEffects::default(),
             semantic: ThemeSemantic {
-                text: Color::Rgb(255, 250, 254),
-                subtext1: Color::Rgb(252, 228, 242),
-                subtext0: Color::Rgb(242, 204, 230),
-                overlay0: Color::Rgb(224, 182, 210),
-                surface2: Color::Rgb(186, 128, 164),
-                surface1: Color::Rgb(132, 68, 112),
-                surface0: Color::Rgb(112, 52, 96),
-                border: Color::Rgb(204, 144, 184),
+                text: Color::Rgb(255, 240, 250),
+                subtext1: Color::Rgb(255, 220, 240),
+                subtext0: Color::Rgb(255, 200, 230),
+                overlay0: Color::Rgb(255, 180, 220),
+                surface2: Color::Rgb(255, 150, 210),
+                surface1: Color::Rgb(255, 120, 200),
+                surface0: Color::Rgb(255, 100, 190),
+                border: Color::Rgb(255, 160, 215),
                 white: Color::White,
             },
             scale: ThemeScale {
                 speed: [
-                    Color::Rgb(255, 246, 252),
-                    Color::Rgb(255, 224, 244),
-                    Color::Rgb(255, 202, 236),
-                    Color::Rgb(255, 180, 228),
-                    Color::Rgb(255, 158, 220),
-                    Color::Rgb(255, 136, 212),
-                    Color::Rgb(255, 114, 204),
-                    Color::Rgb(255, 92, 196),
+                    Color::Rgb(255, 240, 250),
+                    Color::Rgb(255, 220, 240),
+                    Color::Rgb(255, 200, 230),
+                    Color::Rgb(255, 180, 220),
+                    Color::Rgb(255, 160, 210),
+                    Color::Rgb(255, 140, 205),
+                    Color::Rgb(255, 120, 200),
+                    Color::Rgb(255, 100, 195),
                 ],
                 ip_hash: [
                     categorical.rosewater,
@@ -469,7 +469,7 @@ impl Theme {
                     low: categorical.rosewater,
                     medium: categorical.pink,
                     high: categorical.mauve,
-                    empty: Color::Rgb(132, 68, 112),
+                    empty: Color::Rgb(255, 130, 205),
                 },
                 stream: ThemeStream {
                     inflow: categorical.sky,
@@ -478,7 +478,7 @@ impl Theme {
                 dust: ThemeDust {
                     foreground: categorical.pink,
                     midground: categorical.lavender,
-                    background: Color::Rgb(156, 86, 130),
+                    background: Color::Rgb(255, 140, 208),
                 },
                 categorical,
             },
@@ -704,7 +704,7 @@ impl Theme {
                 subtext0: Color::Rgb(86, 95, 137),
                 overlay0: Color::Rgb(65, 72, 104),
                 surface2: Color::Rgb(41, 46, 66),
-                surface1: Color::Rgb(36, 40, 59),
+                surface1: Color::Rgb(60, 65, 90),
                 surface0: Color::Rgb(26, 27, 38),
                 border: Color::Rgb(65, 72, 104),
                 white: Color::White,
@@ -768,7 +768,7 @@ impl Theme {
                 subtext0: Color::Rgb(92, 99, 112),
                 overlay0: Color::Rgb(73, 78, 90),
                 surface2: Color::Rgb(40, 44, 52),
-                surface1: Color::Rgb(33, 37, 43),
+                surface1: Color::Rgb(65, 72, 80),
                 surface0: Color::Rgb(30, 33, 39),
                 border: Color::Rgb(73, 78, 90),
                 white: Color::White,
@@ -832,7 +832,7 @@ impl Theme {
                 subtext0: Color::Rgb(101, 123, 131),
                 overlay0: Color::Rgb(88, 110, 117),
                 surface2: Color::Rgb(7, 54, 66),
-                surface1: Color::Rgb(0, 43, 54),
+                surface1: Color::Rgb(0, 90, 110),
                 surface0: Color::Rgb(0, 33, 44),
                 border: Color::Rgb(7, 54, 66),
                 white: Color::White,
@@ -896,7 +896,7 @@ impl Theme {
                 subtext0: Color::Rgb(117, 113, 94),
                 overlay0: Color::Rgb(73, 72, 62),
                 surface2: Color::Rgb(39, 40, 34),
-                surface1: Color::Rgb(32, 33, 28),
+                surface1: Color::Rgb(70, 72, 65),
                 surface0: Color::Rgb(27, 28, 24),
                 border: Color::Rgb(73, 72, 62),
                 white: Color::White,
@@ -1009,7 +1009,7 @@ impl Theme {
             yellow: Color::Rgb(192, 163, 110),    // boatmansYellow
             green: Color::Rgb(118, 148, 106),     // autumnGreen
             teal: Color::Rgb(106, 149, 137),      // waveAqua
-            sky: Color::Rgb(126, 156, 216),      // crystalBlue
+            sky: Color::Rgb(126, 156, 216),       // crystalBlue
             sapphire: Color::Rgb(101, 133, 153),  // dragonBlue
             blue: Color::Rgb(126, 156, 216),      // crystalBlue
             lavender: Color::Rgb(149, 127, 184),  // oniViolet
@@ -1088,7 +1088,7 @@ impl Theme {
                 subtext0: Color::Rgb(110, 118, 129),
                 overlay0: Color::Rgb(48, 54, 61),
                 surface2: Color::Rgb(33, 38, 45),
-                surface1: Color::Rgb(22, 27, 34),
+                surface1: Color::Rgb(50, 60, 70),
                 surface0: Color::Rgb(13, 17, 23),
                 border: Color::Rgb(48, 54, 61),
                 white: Color::White,
@@ -1128,16 +1128,16 @@ impl Theme {
     pub fn solarized_light() -> Self {
         let categorical = ThemeCategorical {
             rosewater: Color::Rgb(101, 123, 131), // base00
-            flamingo: Color::Rgb(203, 75, 22),   // orange
-            pink: Color::Rgb(211, 54, 130),      // magenta
+            flamingo: Color::Rgb(203, 75, 22),    // orange
+            pink: Color::Rgb(211, 54, 130),       // magenta
             mauve: Color::Rgb(108, 113, 196),     // violet
             red: Color::Rgb(220, 50, 47),         // red
             maroon: Color::Rgb(203, 75, 22),      // orange
-            peach: Color::Rgb(203, 75, 22),      // orange
-            yellow: Color::Rgb(181, 137, 0),     // yellow
-            green: Color::Rgb(133, 153, 0),      // green
-            teal: Color::Rgb(42, 161, 152),      // cyan
-            sky: Color::Rgb(38, 139, 210),       // blue
+            peach: Color::Rgb(203, 75, 22),       // orange
+            yellow: Color::Rgb(181, 137, 0),      // yellow
+            green: Color::Rgb(133, 153, 0),       // green
+            teal: Color::Rgb(42, 161, 152),       // cyan
+            sky: Color::Rgb(38, 139, 210),        // blue
             sapphire: Color::Rgb(38, 139, 210),   // blue
             blue: Color::Rgb(38, 139, 210),       // blue
             lavender: Color::Rgb(108, 113, 196),  // violet
@@ -1220,7 +1220,7 @@ impl Theme {
                 subtext0: Color::Rgb(0, 143, 17),
                 overlay0: Color::Rgb(0, 89, 11),
                 surface2: Color::Rgb(0, 59, 0),
-                surface1: Color::Rgb(0, 30, 0),
+                surface1: Color::Rgb(0, 180, 0),
                 surface0: Color::Rgb(0, 0, 0),
                 border: Color::Rgb(0, 143, 17),
                 white: Color::White,
@@ -1367,7 +1367,7 @@ impl Theme {
                 subtext0: Color::Rgb(255, 0, 255),
                 overlay0: Color::Rgb(50, 0, 100),
                 surface2: Color::Rgb(30, 0, 60),
-                surface1: Color::Rgb(15, 0, 30),
+                surface1: Color::Rgb(120, 50, 160),
                 surface0: Color::Rgb(0, 0, 0),
                 border: Color::Rgb(255, 0, 255),
                 white: Color::White,
@@ -1431,7 +1431,7 @@ impl Theme {
                 subtext0: Color::Rgb(92, 103, 115),
                 overlay0: Color::Rgb(62, 71, 82),
                 surface2: Color::Rgb(25, 30, 36),
-                surface1: Color::Rgb(20, 25, 31),
+                surface1: Color::Rgb(55, 65, 75),
                 surface0: Color::Rgb(15, 20, 25),
                 border: Color::Rgb(62, 71, 82),
                 white: Color::White,
@@ -1563,7 +1563,7 @@ impl Theme {
                 subtext0: Color::Rgb(54, 249, 246),
                 overlay0: Color::Rgb(103, 78, 131),
                 surface2: Color::Rgb(52, 43, 73),
-                surface1: Color::Rgb(38, 28, 52),
+                surface1: Color::Rgb(70, 50, 90),
                 surface0: Color::Rgb(36, 27, 47),
                 border: Color::Rgb(255, 126, 219),
                 white: Color::White,
@@ -1691,7 +1691,7 @@ impl Theme {
                 subtext0: Color::Rgb(110, 110, 110),
                 overlay0: Color::Rgb(70, 70, 70),
                 surface2: Color::Rgb(40, 40, 40),
-                surface1: Color::Rgb(24, 24, 24),
+                surface1: Color::Rgb(60, 60, 60),
                 surface0: Color::Rgb(16, 16, 16),
                 border: Color::Rgb(50, 50, 50),
                 white: Color::White,
@@ -1770,7 +1770,7 @@ impl Theme {
                 subtext0: Color::Rgb(84, 91, 107),
                 overlay0: Color::Rgb(53, 57, 74),
                 surface2: Color::Rgb(25, 27, 41),
-                surface1: Color::Rgb(18, 20, 30),
+                surface1: Color::Rgb(45, 50, 75),
                 surface0: Color::Rgb(15, 17, 26),
                 border: Color::Rgb(53, 57, 74),
                 white: Color::White,
@@ -1834,7 +1834,7 @@ impl Theme {
                 subtext0: Color::Rgb(102, 92, 84),
                 overlay0: Color::Rgb(146, 131, 116),
                 surface2: Color::Rgb(213, 196, 161),
-                surface1: Color::Rgb(235, 219, 178),
+                surface1: Color::Rgb(200, 185, 155),
                 surface0: Color::Rgb(251, 241, 199),
                 border: Color::Rgb(213, 196, 161),
                 white: Color::Black,
@@ -1898,7 +1898,7 @@ impl Theme {
                 subtext0: Color::Rgb(171, 171, 171),
                 overlay0: Color::Rgb(82, 82, 82),
                 surface2: Color::Rgb(57, 57, 57),
-                surface1: Color::Rgb(38, 38, 38),
+                surface1: Color::Rgb(50, 55, 65),
                 surface0: Color::Rgb(22, 22, 22),
                 border: Color::Rgb(57, 57, 57),
                 white: Color::White,
@@ -1966,7 +1966,7 @@ impl Theme {
                 subtext0: Color::Rgb(150, 150, 150),
                 overlay0: Color::Rgb(100, 100, 100),
                 surface2: Color::Rgb(50, 50, 50),
-                surface1: Color::Rgb(25, 25, 25),
+                surface1: Color::Rgb(55, 55, 55),
                 surface0: Color::Rgb(0, 0, 0),
                 border: Color::Rgb(255, 255, 255),
                 white: Color::White,
@@ -2034,7 +2034,7 @@ impl Theme {
                 subtext0: Color::Rgb(255, 100, 0),
                 overlay0: Color::Rgb(150, 50, 0),
                 surface2: Color::Rgb(80, 20, 0),
-                surface1: Color::Rgb(40, 10, 0),
+                surface1: Color::Rgb(100, 40, 20),
                 surface0: Color::Rgb(20, 0, 0),
                 border: Color::Rgb(255, 50, 0),
                 white: Color::White,
@@ -2102,7 +2102,7 @@ impl Theme {
                 subtext0: Color::Rgb(150, 150, 255),
                 overlay0: Color::Rgb(40, 60, 100),
                 surface2: Color::Rgb(20, 30, 60),
-                surface1: Color::Rgb(10, 15, 40),
+                surface1: Color::Rgb(30, 45, 90),
                 surface0: Color::Rgb(5, 5, 25),
                 border: Color::Rgb(0, 255, 128),
                 white: Color::White,
@@ -2166,7 +2166,7 @@ impl Theme {
                 subtext0: Color::Rgb(116, 123, 136),
                 overlay0: Color::Rgb(59, 64, 72),
                 surface2: Color::Rgb(43, 48, 59),
-                surface1: Color::Rgb(35, 38, 45),
+                surface1: Color::Rgb(65, 70, 80),
                 surface0: Color::Rgb(29, 32, 38),
                 border: Color::Rgb(59, 64, 72),
                 white: Color::White,
@@ -2230,7 +2230,7 @@ impl Theme {
                 subtext0: Color::Rgb(110, 106, 134),
                 overlay0: Color::Rgb(64, 61, 82),
                 surface2: Color::Rgb(38, 35, 58),
-                surface1: Color::Rgb(31, 29, 46),
+                surface1: Color::Rgb(65, 60, 90),
                 surface0: Color::Rgb(25, 23, 36),
                 border: Color::Rgb(64, 61, 82),
                 white: Color::White,
@@ -2304,7 +2304,7 @@ mod tests {
             ("andromeda", ThemeName::Andromeda),
             ("aurora", ThemeName::Aurora),
             ("ayu_dark", ThemeName::AyuDark),
-            ("candy_land_pink", ThemeName::CandyLandPink),
+            ("bubblegum", ThemeName::Bubblegum),
             ("catppuccin_latte", ThemeName::CatppuccinLatte),
             ("catppuccin_mocha", ThemeName::CatppuccinMocha),
             ("cyberpunk", ThemeName::Cyberpunk),
@@ -2346,7 +2346,7 @@ mod tests {
             ("Andromeda", ThemeName::Andromeda),
             ("Aurora", ThemeName::Aurora),
             ("Ayu Dark", ThemeName::AyuDark),
-            ("Candy Land Pink", ThemeName::CandyLandPink),
+            ("Bubblegum", ThemeName::Bubblegum),
             ("Catppuccin Latte", ThemeName::CatppuccinLatte),
             ("Catppuccin Mocha", ThemeName::CatppuccinMocha),
             ("Cyberpunk", ThemeName::Cyberpunk),
@@ -2418,7 +2418,7 @@ mod tests {
             ThemeName::Andromeda,
             ThemeName::Aurora,
             ThemeName::AyuDark,
-            ThemeName::CandyLandPink,
+            ThemeName::Bubblegum,
             ThemeName::CatppuccinLatte,
             ThemeName::CatppuccinMocha,
             ThemeName::Cyberpunk,
