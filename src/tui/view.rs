@@ -615,7 +615,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
             Block::default()
                 .title(chart_title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.semantic.surface2)),
+                .border_style(Style::default().fg(theme.semantic.border)),
         )
         .x_axis(
             Axis::default()
@@ -965,7 +965,7 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
             Block::default()
                 .title(Line::from(title_spans))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.semantic.surface2)),
+                .border_style(Style::default().fg(theme.semantic.border)),
         )
         .style(Style::default().fg(theme.semantic.text));
 
@@ -980,7 +980,7 @@ fn draw_details_panel(f: &mut Frame, app_state: &AppState, details_text_chunk: R
             Style::default().fg(theme.scale.categorical.mauve),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.semantic.surface2));
+        .border_style(Style::default().fg(theme.semantic.border));
     let details_inner_chunk = details_block.inner(details_text_chunk);
     f.render_widget(details_block, details_text_chunk);
 
@@ -1466,7 +1466,7 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let color_discovered = theme.scale.categorical.yellow;
     let color_connected = theme.scale.categorical.teal;
     let color_disconnected = theme.scale.categorical.maroon;
-    let color_border = theme.semantic.surface2;
+    let color_border = theme.semantic.border;
 
     let default_slice: Vec<u64> = Vec::new();
 
@@ -1678,7 +1678,7 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
 
     let color_inflow = theme.scale.categorical.blue;
     let color_outflow = theme.scale.categorical.green;
-    let color_border = theme.semantic.surface2;
+    let color_border = theme.semantic.border;
     let color_empty = theme.semantic.surface0;
 
     let (total_in, total_out) = if let Some(t) = selected_torrent {
@@ -1902,7 +1902,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
     let Some(torrent) = torrent else {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.semantic.surface2));
+            .border_style(Style::default().fg(theme.semantic.border));
         f.render_widget(block, area);
         return;
     };
@@ -1929,7 +1929,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
                         Style::default().fg(theme.semantic.subtext0),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.semantic.surface2)),
+                    .border_style(Style::default().fg(theme.semantic.border)),
             )
             .data(dl_slice)
             .max(nice_max_speed)
@@ -1948,7 +1948,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
                         Style::default().fg(theme.semantic.subtext0),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.semantic.surface2)),
+                    .border_style(Style::default().fg(theme.semantic.border)),
             )
             .data(ul_slice)
             .max(nice_max_speed)
@@ -1958,7 +1958,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
         let style = Style::default().fg(theme.scale.categorical.mauve);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.semantic.surface2));
+            .border_style(Style::default().fg(theme.semantic.border));
         let inner_area = block.inner(area);
         f.render_widget(block, area);
 
@@ -2029,7 +2029,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
                         Style::default().fg(theme.semantic.subtext0),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.semantic.surface2)),
+                    .border_style(Style::default().fg(theme.semantic.border)),
             )
             .data(dl_slice)
             .max(dl_nice_max)
@@ -2044,7 +2044,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
                         Style::default().fg(theme.semantic.subtext0),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.semantic.surface2)),
+                    .border_style(Style::default().fg(theme.semantic.border)),
             )
             .data(ul_slice)
             .max(ul_nice_max)
@@ -2248,7 +2248,7 @@ fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
             Style::default().fg(theme.scale.categorical.peach),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.semantic.surface2));
+        .border_style(Style::default().fg(theme.semantic.border));
     let inner_area = container_block.inner(area);
     f.render_widget(container_block, area);
 
@@ -2304,7 +2304,7 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.semantic.surface1));
+        .border_style(Style::default().fg(theme.semantic.border));
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -3000,7 +3000,7 @@ fn draw_torrent_preview_panel(
             Paragraph::new(info_text).block(
                 Block::default()
                     .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(theme.semantic.surface2)),
+                    .border_style(Style::default().fg(theme.semantic.border)),
             ),
             layout[0],
         );
@@ -3305,7 +3305,7 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.semantic.surface2));
+        .border_style(Style::default().fg(theme.semantic.border));
     let inner_box = block.inner(final_box_area);
     f.render_widget(block, final_box_area);
 
@@ -3389,7 +3389,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState) {
         draw_help_table(f, app_state, chunks[1]);
 
         let footer_block =
-            Block::default().border_style(Style::default().fg(theme.semantic.surface2));
+            Block::default().border_style(Style::default().fg(theme.semantic.border));
         let footer_inner_area = footer_block.inner(chunks[2]);
         f.render_widget(footer_block, chunks[2]);
         let footer_lines = vec![
@@ -3425,7 +3425,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState) {
         let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).split(area);
         draw_help_table(f, app_state, chunks[0]);
         let footer_block =
-            Block::default().border_style(Style::default().fg(theme.semantic.surface2));
+            Block::default().border_style(Style::default().fg(theme.semantic.border));
         let footer_inner_area = footer_block.inner(chunks[1]);
         f.render_widget(footer_block, chunks[1]);
         let footer_lines = vec![
@@ -3858,7 +3858,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect) {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.semantic.surface2))
+            .border_style(Style::default().fg(theme.semantic.border))
             .padding(Padding::new(2, 2, 1, 1)),
     );
 
@@ -3882,7 +3882,7 @@ fn draw_config_screen(
             Style::default().fg(theme.scale.categorical.mauve),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.semantic.surface2));
+        .border_style(Style::default().fg(theme.semantic.border));
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -4357,7 +4357,7 @@ fn draw_swarm_heatmap(
         .title(title)
         .borders(Borders::NONE)
         .padding(Padding::new(1, 1, 0, 1))
-        .border_style(Style::default().fg(theme.semantic.surface2));
+        .border_style(Style::default().fg(theme.semantic.border));
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 

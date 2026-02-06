@@ -371,7 +371,7 @@ impl Theme {
                 surface2: Color::Rgb(18, 40, 64),
                 surface1: Color::Rgb(35, 70, 100),
                 surface0: Color::Rgb(8, 22, 42),
-                border: Color::Rgb(18, 40, 64),
+                border: Color::Rgb(60, 100, 160),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -834,7 +834,7 @@ impl Theme {
                 surface2: Color::Rgb(7, 54, 66),
                 surface1: Color::Rgb(0, 90, 110),
                 surface0: Color::Rgb(0, 33, 44),
-                border: Color::Rgb(7, 54, 66),
+                border: Color::Rgb(0, 130, 160),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1693,7 +1693,7 @@ impl Theme {
                 surface2: Color::Rgb(40, 40, 40),
                 surface1: Color::Rgb(60, 60, 60),
                 surface0: Color::Rgb(16, 16, 16),
-                border: Color::Rgb(50, 50, 50),
+                border: Color::Rgb(120, 120, 120),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1772,7 +1772,7 @@ impl Theme {
                 surface2: Color::Rgb(25, 27, 41),
                 surface1: Color::Rgb(45, 50, 75),
                 surface0: Color::Rgb(15, 17, 26),
-                border: Color::Rgb(53, 57, 74),
+                border: Color::Rgb(100, 110, 140),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1900,7 +1900,7 @@ impl Theme {
                 surface2: Color::Rgb(57, 57, 57),
                 surface1: Color::Rgb(50, 55, 65),
                 surface0: Color::Rgb(22, 22, 22),
-                border: Color::Rgb(57, 57, 57),
+                border: Color::Rgb(110, 110, 110),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1962,12 +1962,12 @@ impl Theme {
             },
             semantic: ThemeSemantic {
                 text: Color::White,
-                subtext1: Color::Rgb(200, 200, 200),
-                subtext0: Color::Rgb(150, 150, 150),
-                overlay0: Color::Rgb(100, 100, 100),
-                surface2: Color::Rgb(50, 50, 50),
-                surface1: Color::Rgb(55, 55, 55),
-                surface0: Color::Rgb(0, 0, 0),
+                subtext1: Color::Rgb(255, 255, 255),
+                subtext0: Color::Rgb(255, 255, 255),
+                overlay0: Color::Rgb(255, 255, 255),
+                surface2: Color::Rgb(255, 255, 255),
+                surface1: Color::Rgb(255, 255, 0),
+                surface0: Color::Rgb(0, 255, 255),
                 border: Color::Rgb(255, 255, 255),
                 white: Color::White,
             },
