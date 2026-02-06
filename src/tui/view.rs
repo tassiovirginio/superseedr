@@ -323,16 +323,16 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
                                 }
                                 ColumnId::DownSpeed => {
                                     Cell::from(format_speed(torrent.smoothed_download_speed_bps))
-                                        .style(speed_to_style(
+                                        .style(apply_theme_effects(
+                                            speed_to_style(theme, torrent.smoothed_download_speed_bps),
                                             theme,
-                                            torrent.smoothed_download_speed_bps,
                                         ))
                                 }
                                 ColumnId::UpSpeed => {
                                     Cell::from(format_speed(torrent.smoothed_upload_speed_bps))
-                                        .style(speed_to_style(
+                                        .style(apply_theme_effects(
+                                            speed_to_style(theme, torrent.smoothed_upload_speed_bps),
                                             theme,
-                                            torrent.smoothed_upload_speed_bps,
                                         ))
                                 }
                             }
@@ -355,14 +355,17 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
         title_spans.push(Span::raw("Search: /"));
         title_spans.push(Span::styled(
             &app_state.search_query,
-            Style::default().fg(theme.scale.categorical.yellow),
+            apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow), theme),
         ));
     } else if !app_state.search_query.is_empty() {
         title_spans.push(Span::styled(
             format!("[{}] ", app_state.search_query),
-            Style::default()
-                .fg(theme.semantic.subtext1)
-                .add_modifier(Modifier::ITALIC),
+            apply_theme_effects(
+                Style::default()
+                    .fg(theme.semantic.subtext1)
+                    .add_modifier(Modifier::ITALIC),
+                theme,
+            ),
         ));
     }
 
@@ -390,7 +393,7 @@ fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect) {
 
                 title_spans.push(Span::styled(
                     display_name,
-                    Style::default().fg(theme.scale.categorical.yellow),
+                    apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow), theme),
                 ));
             }
         }
@@ -1240,7 +1243,10 @@ fn draw_details_panel(f: &mut Frame, app_state: &AppState, details_text_chunk: R
             .ratio(progress_ratio)
             .label(progress_label_text)
             .line_set(custom_line_set)
-            .filled_style(Style::default().fg(theme.scale.categorical.green));
+            .filled_style(apply_theme_effects(
+                Style::default().fg(theme.scale.categorical.green),
+                theme,
+            ));
         f.render_widget(line_gauge, progress_chunks[1]);
 
         let status_text = if state.activity_message.is_empty() {
@@ -1287,12 +1293,12 @@ fn draw_details_panel(f: &mut Frame, app_state: &AppState, details_text_chunk: R
                 )),
                 Span::styled(
                     format!("{}", seeds),
-                    Style::default().fg(theme.scale.categorical.green),
+                    apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
                 ),
                 Span::raw(" / "),
                 Span::styled(
                     format!("{}", leeches),
-                    Style::default().fg(theme.scale.categorical.red),
+                    apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme),
                 ),
                 Span::raw(")"),
             ])),
@@ -1601,11 +1607,20 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     // Priority 4 (Lowest): Aux tools
     if width > 110 {
         spans.extend(vec![
-            Span::styled("[t]", Style::default().fg(theme.scale.categorical.sapphire)),
+            Span::styled(
+                "[t]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.sapphire), theme),
+            ),
             Span::raw("ime | "),
-            Span::styled("[/]", Style::default().fg(theme.scale.categorical.yellow)),
+            Span::styled(
+                "[/]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow), theme),
+            ),
             Span::raw("search | "),
-            Span::styled("[c]", Style::default().fg(theme.scale.categorical.lavender)),
+            Span::styled(
+                "[c]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.lavender), theme),
+            ),
             Span::raw("onfig | "),
         ]);
     }
@@ -1613,11 +1628,20 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     // Priority 3: Management
     if width > 90 {
         spans.extend(vec![
-            Span::styled("[a]", Style::default().fg(theme.scale.categorical.green)),
+            Span::styled(
+                "[a]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("dd | "),
-            Span::styled("[d]", Style::default().fg(theme.scale.categorical.yellow)),
+            Span::styled(
+                "[d]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow), theme),
+            ),
             Span::raw("elete | "),
-            Span::styled("[s]", Style::default().fg(theme.scale.categorical.mauve)),
+            Span::styled(
+                "[s]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.mauve), theme),
+            ),
             Span::raw("ort | "),
         ]);
     }
@@ -1625,9 +1649,15 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     // Priority 2: Actions
     if width > 65 {
         spans.extend(vec![
-            Span::styled("[v]", Style::default().fg(theme.scale.categorical.teal)),
+            Span::styled(
+                "[v]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.teal), theme),
+            ),
             Span::raw("paste | "),
-            Span::styled("[p]", Style::default().fg(theme.scale.categorical.green)),
+            Span::styled(
+                "[p]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("ause | "),
         ]);
     }
@@ -1635,9 +1665,15 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     // Priority 1: Navigation & Quit
     if width > 45 {
         spans.extend(vec![
-            Span::styled("Arrows", Style::default().fg(theme.scale.categorical.blue)),
+            Span::styled(
+                "Arrows",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.blue), theme),
+            ),
             Span::raw(" nav | "),
-            Span::styled("[Q]", Style::default().fg(theme.scale.categorical.red)),
+            Span::styled(
+                "[Q]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme),
+            ),
             Span::raw("uit | "),
         ]);
     }
@@ -1645,15 +1681,21 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     // Priority 0: Help (Always Shown)
     if app_state.system_warning.is_some() {
         spans.extend(vec![
-            Span::styled("[m]", Style::default().fg(theme.scale.categorical.teal)),
+            Span::styled(
+                "[m]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.teal), theme),
+            ),
             Span::styled(
                 "anual (warning)",
-                Style::default().fg(theme.scale.categorical.yellow),
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow), theme),
             ),
         ]);
     } else {
         spans.extend(vec![
-            Span::styled("[m]", Style::default().fg(theme.scale.categorical.teal)),
+            Span::styled(
+                "[m]",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.teal), theme),
+            ),
             Span::raw("anual"),
         ]);
     }
@@ -1665,9 +1707,9 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
 
     // --- RIGHT: Port Status ---
     let port_style = if app_state.externally_accessable_port {
-        Style::default().fg(theme.scale.categorical.green)
+        apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)
     } else {
-        Style::default().fg(theme.scale.categorical.red)
+        apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme)
     };
     let port_text = if app_state.externally_accessable_port {
         "Open"
