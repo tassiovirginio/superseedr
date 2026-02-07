@@ -165,80 +165,25 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     apply_theme_effects_to_frame(f, &ctx);
 }
 
-fn themed_palette_colors(ctx: &ThemeContext) -> Vec<Color> {
-    let t = &ctx.theme;
-    vec![
-        t.semantic.text,
-        t.semantic.subtext0,
-        t.semantic.subtext1,
-        t.semantic.overlay0,
-        t.semantic.surface0,
-        t.semantic.surface1,
-        t.semantic.surface2,
-        t.semantic.border,
-        t.semantic.white,
-        t.scale.heatmap.low,
-        t.scale.heatmap.medium,
-        t.scale.heatmap.high,
-        t.scale.heatmap.empty,
-        t.scale.stream.inflow,
-        t.scale.stream.outflow,
-        t.scale.categorical.rosewater,
-        t.scale.categorical.flamingo,
-        t.scale.categorical.pink,
-        t.scale.categorical.mauve,
-        t.scale.categorical.red,
-        t.scale.categorical.maroon,
-        t.scale.categorical.peach,
-        t.scale.categorical.yellow,
-        t.scale.categorical.green,
-        t.scale.categorical.teal,
-        t.scale.categorical.sky,
-        t.scale.categorical.sapphire,
-        t.scale.categorical.blue,
-        t.scale.categorical.lavender,
-        t.scale.speed[0],
-        t.scale.speed[1],
-        t.scale.speed[2],
-        t.scale.speed[3],
-        t.scale.speed[4],
-        t.scale.speed[5],
-        t.scale.speed[6],
-        t.scale.speed[7],
-        t.scale.ip_hash[0],
-        t.scale.ip_hash[1],
-        t.scale.ip_hash[2],
-        t.scale.ip_hash[3],
-        t.scale.ip_hash[4],
-        t.scale.ip_hash[5],
-        t.scale.ip_hash[6],
-        t.scale.ip_hash[7],
-        t.scale.ip_hash[8],
-        t.scale.ip_hash[9],
-        t.scale.ip_hash[10],
-        t.scale.ip_hash[11],
-        t.scale.ip_hash[12],
-        t.scale.ip_hash[13],
-    ]
-}
-
 fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
-    if !ctx.theme.effects.glow_enabled {
+    if !ctx.theme.effects.enabled() {
         return;
     }
 
-    let palette = themed_palette_colors(ctx);
     let area = f.area();
     let buf = f.buffer_mut();
 
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                if palette.iter().any(|&c| c == cell.fg) {
-                    let style = ctx.apply(Style::default().fg(cell.fg));
-                    if let Some(new_fg) = style.fg {
-                        cell.fg = new_fg;
-                    }
+                if cell.fg != Color::Reset {
+                    cell.fg = ctx.apply_effects_to_color_at(
+                        cell.fg,
+                        x,
+                        y,
+                        area.width,
+                        area.height,
+                    );
                 }
             }
         }
@@ -4512,13 +4457,7 @@ fn draw_peers_table(f: &mut Frame, app_state: &AppState, peers_chunk: Rect, ctx:
                             } else {
                                 ip_to_color(ctx, &peer.address)
                             };
-                        let row_color = if ctx.theme.effects.glow_enabled {
-                            ctx.apply(Style::default().fg(row_color))
-                                .fg
-                                .unwrap_or(row_color)
-                        } else {
-                            row_color
-                        };
+                        let row_color = row_color;
 
                         let cells: Vec<Cell> = visible_indices
                             .iter()

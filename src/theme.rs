@@ -162,11 +162,56 @@ impl<'de> Deserialize<'de> for ThemeName {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ThemeEffects {
-    pub glow_enabled: bool,
+    pub local_enabled: bool,
     pub flicker_hz: f32,
     pub flicker_intensity: f32,
+    pub local_burst_duty: f32,
+    pub local_burst_hz: f32,
+    pub local_idle_intensity: f32,
+    pub local_burst_boost: f32,
+    pub wave_enabled: bool,
+    pub wave_hz: f32,
+    pub wave_intensity: f32,
+    pub wave_wavelength: f32,
+    pub wave_angle_degrees: f32,
+    pub wave_mode: WaveMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveMode {
+    Linear,
+    RadialOut,
+    #[allow(dead_code)]
+    RadialIn,
+}
+
+impl Default for ThemeEffects {
+    fn default() -> Self {
+        Self {
+            local_enabled: false,
+            flicker_hz: 0.0,
+            flicker_intensity: 0.0,
+            // Preserve pre-burst behavior by default: always in burst window, normal intensity.
+            local_burst_duty: 1.0,
+            local_burst_hz: 0.0,
+            local_idle_intensity: 1.0,
+            local_burst_boost: 1.0,
+            wave_enabled: false,
+            wave_hz: 0.0,
+            wave_intensity: 0.0,
+            wave_wavelength: 0.0,
+            wave_angle_degrees: 0.0,
+            wave_mode: WaveMode::Linear,
+        }
+    }
+}
+
+impl ThemeEffects {
+    pub fn enabled(&self) -> bool {
+        self.local_enabled || self.wave_enabled
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,9 +271,24 @@ pub struct ThemeScale {
 pub fn color_to_rgb(color: Color) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),
+        Color::Reset => (255, 255, 255),
+        Color::DarkGray => (128, 128, 128),
+        Color::Red => (255, 0, 0),
+        Color::LightRed => (255, 102, 102),
+        Color::Green => (0, 255, 0),
+        Color::LightGreen => (102, 255, 102),
+        Color::Yellow => (255, 255, 0),
+        Color::LightYellow => (255, 255, 153),
+        Color::Blue => (0, 0, 255),
+        Color::LightBlue => (102, 102, 255),
+        Color::Magenta => (255, 0, 255),
+        Color::LightMagenta => (255, 102, 255),
+        Color::Cyan => (0, 255, 255),
+        Color::LightCyan => (102, 255, 255),
+        Color::Gray => (192, 192, 192),
         Color::White => (255, 255, 255),
         Color::Black => (0, 0, 0),
-        _ => (255, 255, 255),
+        Color::Indexed(i) => (i, i, i),
     }
 }
 
@@ -251,45 +311,107 @@ impl ThemeContext {
     }
 
     pub fn apply(&self, style: Style) -> Style {
-        if !self.theme.effects.glow_enabled {
-            return style;
+        // Style construction stays deterministic; effects are applied once in the frame pass.
+        style
+    }
+
+    pub fn apply_effects_to_color_at(
+        &self,
+        color: Color,
+        x: u16,
+        y: u16,
+        frame_width: u16,
+        frame_height: u16,
+    ) -> Color {
+        if !self.theme.effects.enabled() {
+            return color;
         }
 
-        let freq = self.theme.effects.flicker_hz as f64;
-        let intensity = self.theme.effects.flicker_intensity as f64;
+        let mut out = color;
+        let (r, g, b) = color_to_rgb(color);
 
-        if intensity <= 0.001 {
-            return style;
+        if self.theme.effects.local_enabled {
+            let freq = self.theme.effects.flicker_hz as f64;
+            let intensity = self.theme.effects.flicker_intensity as f64;
+            if intensity > 0.001 {
+                let phase_offset = (r as f64 * 3.0 + g as f64 * 5.0 + b as f64 * 7.0) * 0.01;
+                // Burst gate controls how often a color enters an active "neon flicker" phase.
+                // duty=1.0 preserves old always-on behavior.
+                let duty = self.theme.effects.local_burst_duty.clamp(0.0, 1.0) as f64;
+                let burst_hz = if self.theme.effects.local_burst_hz <= 0.0 {
+                    freq * 0.35
+                } else {
+                    self.theme.effects.local_burst_hz as f64
+                };
+                let idle_intensity = self.theme.effects.local_idle_intensity.clamp(0.0, 1.0) as f64;
+                let burst_boost = self.theme.effects.local_burst_boost.max(0.0) as f64;
+                let burst_gate =
+                    (((self.frame_time * burst_hz) + (phase_offset * 0.75)).sin() + 1.0) / 2.0;
+                let in_burst = burst_gate <= duty;
+                let effective_intensity = if in_burst {
+                    intensity * burst_boost
+                } else {
+                    intensity * idle_intensity
+                };
+                if effective_intensity <= 0.001 {
+                    return out;
+                }
+
+                let base_wave = (self.frame_time * freq).sin();
+                let drift_wave = ((self.frame_time * freq * 1.4) + phase_offset).sin();
+                let wave = (base_wave + drift_wave) / 2.0;
+                out = if wave > 0.0 {
+                    let factor = wave * effective_intensity;
+                    blend_colors((r, g, b), (255, 255, 255), factor)
+                } else {
+                    let factor = wave.abs() * (effective_intensity * 0.8);
+                    blend_colors((r, g, b), (0, 0, 0), factor)
+                };
+            }
         }
 
-        if let Some(fg) = style.fg {
-            let (r, g, b) = color_to_rgb(fg);
-
-            // Interference Pattern Algorithm:
-            // 1. Global Rhythm: A steady pulse shared by everyone (sync anchor)
-            // 2. Local Drift: A faster, phase-shifted pulse unique to the color (chaos)
-
-            let phase_offset = (r as f64 * 3.0 + g as f64 * 5.0 + b as f64 * 7.0) * 0.01;
-
-            let base_wave = (self.frame_time * freq).sin();
-
-            // Offset wave (Local drift) - 1.4x speed creates a polyrhythm
-            let drift_wave = ((self.frame_time * freq * 1.4) + phase_offset).sin();
-
-            let wave = (base_wave + drift_wave) / 2.0;
-
-            let final_color = if wave > 0.0 {
-                let factor = wave * intensity;
-                blend_colors((r, g, b), (255, 255, 255), factor)
-            } else {
-                let factor = wave.abs() * (intensity * 0.8);
-                blend_colors((r, g, b), (0, 0, 0), factor)
+        if self.theme.effects.wave_enabled {
+            let wave_hz = self.theme.effects.wave_hz as f64;
+            let intensity = self.theme.effects.wave_intensity as f64;
+            let wavelength = self.theme.effects.wave_wavelength.max(1.0) as f64;
+            let phase = match self.theme.effects.wave_mode {
+                WaveMode::Linear => {
+                    let angle = (self.theme.effects.wave_angle_degrees as f64).to_radians();
+                    let dir_x = angle.cos();
+                    let dir_y = angle.sin();
+                    let pos = (x as f64 * dir_x + y as f64 * dir_y) / wavelength;
+                    (self.frame_time * wave_hz * std::f64::consts::TAU) + pos
+                }
+                WaveMode::RadialOut => {
+                    let cx = (frame_width.saturating_sub(1) as f64) * 0.5;
+                    let cy = (frame_height.saturating_sub(1) as f64) * 0.5;
+                    let dx = x as f64 - cx;
+                    let dy = y as f64 - cy;
+                    let dist = (dx * dx + dy * dy).sqrt() / wavelength;
+                    (self.frame_time * wave_hz * std::f64::consts::TAU) - dist
+                }
+                WaveMode::RadialIn => {
+                    let cx = (frame_width.saturating_sub(1) as f64) * 0.5;
+                    let cy = (frame_height.saturating_sub(1) as f64) * 0.5;
+                    let dx = x as f64 - cx;
+                    let dy = y as f64 - cy;
+                    let dist = (dx * dx + dy * dy).sqrt() / wavelength;
+                    (self.frame_time * wave_hz * std::f64::consts::TAU) + dist
+                }
             };
+            let wave = phase.sin();
 
-            style.fg(final_color)
-        } else {
-            style
+            let (rr, gg, bb) = color_to_rgb(out);
+            out = if wave > 0.0 {
+                let factor = wave * intensity;
+                blend_colors((rr, gg, bb), (255, 255, 255), factor)
+            } else {
+                let factor = wave.abs() * intensity;
+                blend_colors((rr, gg, bb), (0, 0, 0), factor)
+            };
         }
+
+        out
     }
 }
 
@@ -418,9 +540,14 @@ impl Theme {
         Self {
             name: ThemeName::Neon,
             effects: ThemeEffects {
-                glow_enabled: true,
-                flicker_hz: 3.0,
+                local_enabled: true,
+                flicker_hz: 14.0,
                 flicker_intensity: 0.6,
+                local_burst_duty: 0.10,
+                local_burst_hz: 0.8,
+                local_idle_intensity: 0.06,
+                local_burst_boost: 1.35,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(230, 255, 255),
@@ -481,7 +608,14 @@ impl Theme {
 
         Self {
             name: ThemeName::Bubblegum,
-            effects: ThemeEffects::default(),
+            effects: ThemeEffects {
+                wave_enabled: true,
+                wave_hz: 0.45,
+                wave_intensity: 0.12,
+                wave_wavelength: 26.0,
+                wave_mode: WaveMode::RadialOut,
+                ..ThemeEffects::default()
+            },
             semantic: ThemeSemantic {
                 text: Color::Rgb(255, 240, 250),
                 subtext1: Color::Rgb(255, 220, 240),
@@ -1206,9 +1340,10 @@ impl Theme {
         Self {
             name: ThemeName::Matrix,
             effects: ThemeEffects {
-                glow_enabled: true,
+                local_enabled: true,
                 flicker_hz: 5.0,
                 flicker_intensity: 0.2,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(0, 255, 65),
@@ -1343,9 +1478,10 @@ impl Theme {
         Self {
             name: ThemeName::Cyberpunk,
             effects: ThemeEffects {
-                glow_enabled: true,
+                local_enabled: true,
                 flicker_hz: 12.0,
                 flicker_intensity: 0.4,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(253, 245, 0),
@@ -1524,9 +1660,12 @@ impl Theme {
         Self {
             name: ThemeName::Synthwave84,
             effects: ThemeEffects {
-                glow_enabled: true,
-                flicker_hz: 8.0,
-                flicker_intensity: 0.3,
+                wave_enabled: true,
+                wave_hz: 0.85,
+                wave_intensity: 0.16,
+                wave_wavelength: 30.0,
+                wave_mode: WaveMode::RadialOut,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(249, 126, 114),
@@ -1897,9 +2036,10 @@ impl Theme {
         Self {
             name: ThemeName::Rainbow,
             effects: ThemeEffects {
-                glow_enabled: true,
+                local_enabled: true,
                 flicker_hz: 2.0,
                 flicker_intensity: 0.1,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::White,
@@ -1960,9 +2100,10 @@ impl Theme {
         Self {
             name: ThemeName::Inferno,
             effects: ThemeEffects {
-                glow_enabled: true,
+                local_enabled: true,
                 flicker_hz: 15.0,
                 flicker_intensity: 0.5,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(255, 200, 0),
@@ -2023,9 +2164,15 @@ impl Theme {
         Self {
             name: ThemeName::Aurora,
             effects: ThemeEffects {
-                glow_enabled: true,
+                local_enabled: true,
                 flicker_hz: 3.0,
                 flicker_intensity: 0.40,
+                wave_enabled: true,
+                wave_hz: 0.9,
+                wave_intensity: 0.16,
+                wave_wavelength: 34.0,
+                wave_angle_degrees: 45.0,
+                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(150, 255, 200),
