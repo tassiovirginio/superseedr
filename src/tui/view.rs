@@ -1340,42 +1340,24 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let theme = &app_state.theme;
     let show_branding = footer_chunk.width >= 80;
 
-    // 1. DETERMINE CONTENT WIDTHS
-    // Calculate how much space the Left Side (Branding/Update) actually needs.
     let is_update = app_state.update_available.is_some();
-    let left_content_width = if is_update {
-        68 // "UPDATE AVAILABLE: v0.9.32 -> v0.9.33 | 1 FPS | ThemeName"
-    } else {
-        48 // "superseedr v0.9.32 | 1 FPS | ThemeName"
-    };
+    let left_content_width = if is_update { 68 } else { 48 };
 
-    // 2. CALCULATE SYMMETRY
-    // To keep the middle commands centered on the *screen*, the Left and Right columns
-    // must have the same width. The Right column content is small (21 chars),
-    // but we pad it to match the Left.
     let (left_constraint, right_constraint) = if show_branding {
-        // Check if we have enough room to be symmetric without crushing the middle commands.
-        // We want at least ~40 chars for the middle commands.
         let required_width_for_symmetry = (left_content_width * 2) + 40;
 
         if footer_chunk.width >= required_width_for_symmetry {
-            // Case A: Wide Screen -> Force Perfect Symmetry
-            // We give the Right side the same width as the Left, so the Middle is perfectly centered.
             (
                 Constraint::Length(left_content_width),
                 Constraint::Length(left_content_width),
             )
         } else {
-            // Case B: Narrow Screen -> Prioritize Content Fitting
-            // If space is tight, we give the Right side only what it needs (21).
-            // The middle won't be perfectly screen-centered, but it won't be crushed.
             (
                 Constraint::Length(left_content_width),
                 Constraint::Length(21),
             )
         }
     } else {
-        // Case C: Mobile/Tiny Screen -> Hide Left completely
         (Constraint::Length(0), Constraint::Length(21))
     };
 
@@ -1412,7 +1394,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
                         .fg(theme.semantic.surface2)
                         .add_modifier(Modifier::CROSSED_OUT),
                 ),
-                Span::styled(" \u{2192} ", Style::default().fg(theme.semantic.surface2)), // Arrow ->
+                Span::styled(" \u{2192} ", Style::default().fg(theme.semantic.surface2)),
                 Span::styled(
                     format!("v{}", new_version),
                     apply_theme_effects(
@@ -1683,7 +1665,7 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         if selected_torrent.is_some() && count > 0 {
             Style::default().fg(color)
         } else {
-            Style::default().fg(theme.semantic.surface1) // Greyed out
+            Style::default().fg(theme.semantic.surface1)
         }
     };
 
@@ -1844,7 +1826,10 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
                 )
                 .title_top(legend_line.alignment(Alignment::Right))
                 .borders(Borders::ALL)
-                .border_style(apply_theme_effects(Style::default().fg(color_border), theme)),
+                .border_style(apply_theme_effects(
+                    Style::default().fg(color_border),
+                    theme,
+                )),
         )
         .x_axis(Axis::default().bounds([0.0, x_bound]))
         .y_axis(Axis::default().bounds([0.5, 3.5]));
@@ -1904,7 +1889,10 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let block = Block::default()
         .title(Line::from(title_spans))
         .borders(Borders::ALL)
-        .border_style(apply_theme_effects(Style::default().fg(color_border), theme));
+        .border_style(apply_theme_effects(
+            Style::default().fg(color_border),
+            theme,
+        ));
 
     let Some(torrent) = selected_torrent else {
         f.render_widget(block, area);
@@ -3384,15 +3372,24 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
     let text_lines = vec![
         Line::from(Span::styled(
             "How to Get Started:",
-            apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow).bold(), theme),
+            apply_theme_effects(
+                Style::default().fg(theme.scale.categorical.yellow).bold(),
+                theme,
+            ),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" ★ ", apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)),
+            Span::styled(
+                " ★ ",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("Paste ("),
             Span::styled(
                 "Ctrl+V",
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.sky).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.sky).bold(),
+                    theme,
+                ),
             ),
             Span::raw(") a "),
             Span::styled(
@@ -3411,11 +3408,17 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
             ),
         ]),
         Line::from(vec![
-            Span::styled(" ★ ", apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)),
+            Span::styled(
+                " ★ ",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("Press "),
             Span::styled(
                 "[a]",
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.mauve).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.mauve).bold(),
+                    theme,
+                ),
             ),
             Span::raw(" to open the file picker and select a "),
             Span::styled(
@@ -3425,11 +3428,17 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
             Span::raw(" file."),
         ]),
         Line::from(vec![
-            Span::styled(" ★ ", apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)),
+            Span::styled(
+                " ★ ",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("Use the "),
             Span::styled(
                 "CLI",
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.sky).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.sky).bold(),
+                    theme,
+                ),
             ),
             Span::raw(" from another terminal:"),
         ]),
@@ -3448,20 +3457,32 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
             ),
         ]),
         Line::from(vec![
-            Span::styled(" ★ ", apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)),
+            Span::styled(
+                " ★ ",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("Drop files into your "),
             Span::styled(
                 "Watch Folder",
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.sky).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.sky).bold(),
+                    theme,
+                ),
             ),
             Span::raw(" to add them automatically."),
         ]),
         Line::from(vec![
-            Span::styled(" ★ ", apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme)),
+            Span::styled(
+                " ★ ",
+                apply_theme_effects(Style::default().fg(theme.scale.categorical.green), theme),
+            ),
             Span::raw("Download Location: "),
             Span::styled(
                 download_path_str,
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.sky).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.sky).bold(),
+                    theme,
+                ),
             ),
         ]),
         Line::from(vec![
@@ -3475,7 +3496,10 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
         Line::from(vec![
             Span::styled(
                 "Browser Support: ",
-                apply_theme_effects(Style::default().fg(theme.scale.categorical.yellow).bold(), theme),
+                apply_theme_effects(
+                    Style::default().fg(theme.scale.categorical.yellow).bold(),
+                    theme,
+                ),
             ),
             Span::raw("To open magnet links directly from your browser,"),
         ]),
@@ -3491,17 +3515,41 @@ fn draw_welcome_screen(f: &mut Frame, settings: &Settings, theme: &crate::theme:
     ];
 
     let footer_line = Line::from(vec![
-        Span::styled(" [m] ", apply_theme_effects(Style::default().fg(theme.scale.categorical.teal), theme)),
-        Span::styled("Manual/Help", apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme)),
+        Span::styled(
+            " [m] ",
+            apply_theme_effects(Style::default().fg(theme.scale.categorical.teal), theme),
+        ),
+        Span::styled(
+            "Manual/Help",
+            apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme),
+        ),
         Span::styled(" | ", Style::default().fg(theme.semantic.surface2)),
-        Span::styled(" [c] ", apply_theme_effects(Style::default().fg(theme.scale.categorical.mauve), theme)),
-        Span::styled("Config", apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme)),
+        Span::styled(
+            " [c] ",
+            apply_theme_effects(Style::default().fg(theme.scale.categorical.mauve), theme),
+        ),
+        Span::styled(
+            "Config",
+            apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme),
+        ),
         Span::styled(" | ", Style::default().fg(theme.semantic.surface2)),
-        Span::styled(" [Q] ", apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme)),
-        Span::styled("Quit", apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme)),
+        Span::styled(
+            " [Q] ",
+            apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme),
+        ),
+        Span::styled(
+            "Quit",
+            apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme),
+        ),
         Span::styled(" | ", Style::default().fg(theme.semantic.surface2)),
-        Span::styled(" [Esc] ", apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme)),
-        Span::styled("Dismiss", apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme)),
+        Span::styled(
+            " [Esc] ",
+            apply_theme_effects(Style::default().fg(theme.scale.categorical.red), theme),
+        ),
+        Span::styled(
+            "Dismiss",
+            apply_theme_effects(Style::default().fg(theme.semantic.subtext1), theme),
+        ),
     ]);
 
     let text_content_height = text_lines.len() as u16;
@@ -3936,11 +3984,11 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect) {
                     Cell::from(Line::from(vec![
                         // Legend pairing: DL/UL status
                         Span::raw("DL: (You "),
-                        Span::styled("■", Style::default().fg(theme.scale.categorical.sapphire)), // Toned-Down Interested
-                        Span::styled("■", Style::default().fg(theme.scale.categorical.maroon)), // Toned-Down Choked
+                        Span::styled("■", Style::default().fg(theme.scale.categorical.sapphire)),
+                        Span::styled("■", Style::default().fg(theme.scale.categorical.maroon)),
                         Span::raw(") | UL: (Peer "),
-                        Span::styled("■", Style::default().fg(theme.scale.categorical.teal)), // Toned-Down Interested
-                        Span::styled("■", Style::default().fg(theme.scale.categorical.peach)), // Toned-Down Choking
+                        Span::styled("■", Style::default().fg(theme.scale.categorical.teal)),
+                        Span::styled("■", Style::default().fg(theme.scale.categorical.peach)),
                         Span::raw(")"),
                     ])),
                 ]),
@@ -4161,7 +4209,10 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect) {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(apply_theme_effects(Style::default().fg(theme.semantic.border), theme))
+            .border_style(apply_theme_effects(
+                Style::default().fg(theme.semantic.border),
+                theme,
+            ))
             .padding(Padding::new(2, 2, 1, 1)),
     );
 
@@ -4185,7 +4236,10 @@ fn draw_config_screen(
             Style::default().fg(theme.scale.categorical.mauve),
         ))
         .borders(Borders::ALL)
-        .border_style(apply_theme_effects(Style::default().fg(theme.semantic.border), theme));
+        .border_style(apply_theme_effects(
+            Style::default().fg(theme.semantic.border),
+            theme,
+        ));
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -4435,7 +4489,6 @@ fn draw_peers_table(f: &mut Frame, app_state: &AppState, peers_chunk: Rect) {
                                 ip_to_color(theme, &peer.address)
                             };
                         let row_color = if theme.effects.glow_enabled {
-                            // Apply effects if enabled
                             apply_theme_effects(Style::default().fg(row_color), theme)
                                 .fg
                                 .unwrap_or(row_color)
@@ -4671,7 +4724,10 @@ fn draw_swarm_heatmap(
         .title(title)
         .borders(Borders::NONE)
         .padding(Padding::new(1, 1, 0, 1))
-        .border_style(apply_theme_effects(Style::default().fg(theme.semantic.border), theme));
+        .border_style(apply_theme_effects(
+            Style::default().fg(theme.semantic.border),
+            theme,
+        ));
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -4902,7 +4958,7 @@ fn draw_background_dust(f: &mut Frame, area: Rect, theme: &crate::theme::Theme) 
             if noise_2 > 0.95 {
                 spans.push(Span::styled(
                     "·",
-                    Style::default().fg(theme.scale.categorical.blue), // Standard Dim Blue
+                    Style::default().fg(theme.scale.categorical.blue),
                 ));
                 continue;
             }

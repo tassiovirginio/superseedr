@@ -168,19 +168,14 @@ pub fn speed_to_style(theme: &Theme, speed_bps: u64) -> Style {
     if speed_bps == 0 {
         Style::default() // Let the main row style handle the color for zero speed
     } else if speed_bps < 50_000 {
-        // < 50 KB/s
         Style::default().fg(theme.scale.speed[0])
     } else if speed_bps < 500_000 {
-        // < 500 KB/s
         Style::default().fg(theme.scale.speed[1])
     } else if speed_bps < 2_000_000 {
-        // < 2 MB/s
         Style::default().fg(theme.scale.speed[2])
     } else if speed_bps < 10_000_000 {
-        // < 10 Mbps
         Style::default().fg(theme.scale.speed[3])
     } else if speed_bps < 20_000_000 {
-        // < 20 Mbps
         Style::default().fg(theme.scale.speed[4])
     } else if speed_bps < 50_000_000 {
         // < 50 Mbps
@@ -420,7 +415,7 @@ pub fn format_iops(iops: u32) -> String {
     format!("{} ops/s", iops)
 }
 
-    pub fn format_limit_delta(theme: &Theme, current: usize, last: usize) -> Span<'static> {
+pub fn format_limit_delta(theme: &Theme, current: usize, last: usize) -> Span<'static> {
     let delta = current as isize - last as isize;
     if delta == 0 {
         return Span::raw("");

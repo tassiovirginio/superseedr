@@ -66,7 +66,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 return;
             }
 
-            // Otherwise, update the timestamp and let the event proceed
             GLOBAL_ESC_TIMESTAMP.store(now, Ordering::Relaxed);
         }
     }
@@ -216,7 +215,10 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         KeyCode::Char('<') => {
                             use strum::IntoEnumIterator;
                             let themes: Vec<_> = crate::theme::ThemeName::iter().collect();
-                            let current_idx = themes.iter().position(|&t| t == app.client_configs.ui_theme).unwrap_or(0);
+                            let current_idx = themes
+                                .iter()
+                                .position(|&t| t == app.client_configs.ui_theme)
+                                .unwrap_or(0);
                             let new_idx = if current_idx == 0 {
                                 themes.len() - 1
                             } else {
@@ -228,7 +230,10 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         KeyCode::Char('>') => {
                             use strum::IntoEnumIterator;
                             let themes: Vec<_> = crate::theme::ThemeName::iter().collect();
-                            let current_idx = themes.iter().position(|&t| t == app.client_configs.ui_theme).unwrap_or(0);
+                            let current_idx = themes
+                                .iter()
+                                .position(|&t| t == app.client_configs.ui_theme)
+                                .unwrap_or(0);
                             let new_idx = (current_idx + 1) % themes.len();
                             app.client_configs.ui_theme = themes[new_idx];
                             app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);

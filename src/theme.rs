@@ -249,7 +249,6 @@ pub fn apply_theme_effects(style: Style, theme: &Theme) -> Style {
         .unwrap_or_default()
         .as_secs_f64();
 
-    // frequency and intensity from theme
     let freq = theme.effects.flicker_hz as f64;
     let intensity = theme.effects.flicker_intensity as f64;
 
@@ -264,25 +263,19 @@ pub fn apply_theme_effects(style: Style, theme: &Theme) -> Style {
         // 1. Global Rhythm: A steady pulse shared by everyone (sync anchor)
         // 2. Local Drift: A faster, phase-shifted pulse unique to the color (chaos)
 
-        // Color-based phase shift
         let phase_offset = (r as f64 * 3.0 + g as f64 * 5.0 + b as f64 * 7.0) * 0.01;
 
-        // Base wave (Global sync)
         let base_wave = (time * freq).sin();
 
         // Offset wave (Local drift) - 1.4x speed creates a polyrhythm
         let drift_wave = ((time * freq * 1.4) + phase_offset).sin();
 
-        // Combined wave [-1.0, 1.0]
         let wave = (base_wave + drift_wave) / 2.0;
 
         let final_color = if wave > 0.0 {
-            // Positive cycle: Glow (mix with White)
             let factor = wave * intensity;
             blend_colors((r, g, b), (255, 255, 255), factor)
         } else {
-            // Negative cycle: Dim (mix with Black)
-            // We use a slightly reduced intensity for dimming to preserve legibility
             let factor = wave.abs() * (intensity * 0.8);
             blend_colors((r, g, b), (0, 0, 0), factor)
         };
@@ -1010,34 +1003,34 @@ impl Theme {
 
     pub fn kanagawa() -> Self {
         let categorical = ThemeCategorical {
-            rosewater: Color::Rgb(220, 215, 186), // oldPaper
-            flamingo: Color::Rgb(210, 126, 154),  // sakuraPink
-            pink: Color::Rgb(210, 126, 154),      // sakuraPink
-            mauve: Color::Rgb(149, 127, 184),     // oniViolet
-            red: Color::Rgb(195, 64, 67),         // autumnRed
-            maroon: Color::Rgb(195, 64, 67),      // autumnRed
-            peach: Color::Rgb(255, 160, 102),     // surimiOrange
-            yellow: Color::Rgb(192, 163, 110),    // boatmansYellow
-            green: Color::Rgb(118, 148, 106),     // autumnGreen
-            teal: Color::Rgb(106, 149, 137),      // waveAqua
-            sky: Color::Rgb(126, 156, 216),       // crystalBlue
-            sapphire: Color::Rgb(101, 133, 153),  // dragonBlue
-            blue: Color::Rgb(126, 156, 216),      // crystalBlue
-            lavender: Color::Rgb(149, 127, 184),  // oniViolet
+            rosewater: Color::Rgb(220, 215, 186),
+            flamingo: Color::Rgb(210, 126, 154),
+            pink: Color::Rgb(210, 126, 154),
+            mauve: Color::Rgb(149, 127, 184),
+            red: Color::Rgb(195, 64, 67),
+            maroon: Color::Rgb(195, 64, 67),
+            peach: Color::Rgb(255, 160, 102),
+            yellow: Color::Rgb(192, 163, 110),
+            green: Color::Rgb(118, 148, 106),
+            teal: Color::Rgb(106, 149, 137),
+            sky: Color::Rgb(126, 156, 216),
+            sapphire: Color::Rgb(101, 133, 153),
+            blue: Color::Rgb(126, 156, 216),
+            lavender: Color::Rgb(149, 127, 184),
         };
 
         Self {
             name: ThemeName::Kanagawa,
             effects: ThemeEffects::default(),
             semantic: ThemeSemantic {
-                text: Color::Rgb(220, 215, 186),     // oldPaper
-                subtext1: Color::Rgb(166, 173, 200), // subtext1
-                subtext0: Color::Rgb(114, 113, 133), // fujiGray
-                overlay0: Color::Rgb(84, 84, 111),   // sumiInk4
-                surface2: Color::Rgb(54, 54, 75),    // sumiInk3
-                surface1: Color::Rgb(42, 42, 62),    // sumiInk2
-                surface0: Color::Rgb(31, 31, 40),    // sumiInk1
-                border: Color::Rgb(84, 84, 111),     // sumiInk4
+                text: Color::Rgb(220, 215, 186),
+                subtext1: Color::Rgb(166, 173, 200),
+                subtext0: Color::Rgb(114, 113, 133),
+                overlay0: Color::Rgb(84, 84, 111),
+                surface2: Color::Rgb(54, 54, 75),
+                surface1: Color::Rgb(42, 42, 62),
+                surface0: Color::Rgb(31, 31, 40),
+                border: Color::Rgb(84, 84, 111),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1128,35 +1121,35 @@ impl Theme {
 
     pub fn solarized_light() -> Self {
         let categorical = ThemeCategorical {
-            rosewater: Color::Rgb(101, 123, 131), // base00
-            flamingo: Color::Rgb(203, 75, 22),    // orange
-            pink: Color::Rgb(211, 54, 130),       // magenta
-            mauve: Color::Rgb(108, 113, 196),     // violet
-            red: Color::Rgb(220, 50, 47),         // red
-            maroon: Color::Rgb(203, 75, 22),      // orange
-            peach: Color::Rgb(203, 75, 22),       // orange
-            yellow: Color::Rgb(181, 137, 0),      // yellow
-            green: Color::Rgb(133, 153, 0),       // green
-            teal: Color::Rgb(42, 161, 152),       // cyan
-            sky: Color::Rgb(38, 139, 210),        // blue
-            sapphire: Color::Rgb(38, 139, 210),   // blue
-            blue: Color::Rgb(38, 139, 210),       // blue
-            lavender: Color::Rgb(108, 113, 196),  // violet
+            rosewater: Color::Rgb(101, 123, 131),
+            flamingo: Color::Rgb(203, 75, 22),
+            pink: Color::Rgb(211, 54, 130),
+            mauve: Color::Rgb(108, 113, 196),
+            red: Color::Rgb(220, 50, 47),
+            maroon: Color::Rgb(203, 75, 22),
+            peach: Color::Rgb(203, 75, 22),
+            yellow: Color::Rgb(181, 137, 0),
+            green: Color::Rgb(133, 153, 0),
+            teal: Color::Rgb(42, 161, 152),
+            sky: Color::Rgb(38, 139, 210),
+            sapphire: Color::Rgb(38, 139, 210),
+            blue: Color::Rgb(38, 139, 210),
+            lavender: Color::Rgb(108, 113, 196),
         };
 
         Self {
             name: ThemeName::SolarizedLight,
             effects: ThemeEffects::default(),
             semantic: ThemeSemantic {
-                text: Color::Rgb(101, 123, 131),     // base00
-                subtext1: Color::Rgb(88, 110, 117),  // base01
-                subtext0: Color::Rgb(131, 148, 150), // base0
-                overlay0: Color::Rgb(147, 161, 161), // base1
-                surface2: Color::Rgb(238, 232, 213), // base2
-                surface1: Color::Rgb(253, 246, 227), // base3
-                surface0: Color::Rgb(255, 255, 240), // extra light
-                border: Color::Rgb(222, 214, 193),   // custom border
-                white: Color::Black,                 // Inverted for light theme
+                text: Color::Rgb(101, 123, 131),
+                subtext1: Color::Rgb(88, 110, 117),
+                subtext0: Color::Rgb(131, 148, 150),
+                overlay0: Color::Rgb(147, 161, 161),
+                surface2: Color::Rgb(238, 232, 213),
+                surface1: Color::Rgb(253, 246, 227),
+                surface0: Color::Rgb(255, 255, 240),
+                border: Color::Rgb(222, 214, 193),
+                white: Color::Black,
             },
             scale: ThemeScale {
                 speed: [
