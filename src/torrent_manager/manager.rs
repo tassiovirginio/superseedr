@@ -96,6 +96,7 @@ use std::sync::Arc;
 #[cfg(feature = "dht")]
 use std::net::SocketAddrV4;
 
+use crate::telemetry::manager_telemetry::ManagerTelemetry;
 use crate::torrent_manager::TorrentParameters;
 
 const HASH_LENGTH: usize = 20;
@@ -155,6 +156,7 @@ pub struct TorrentManager {
 
     global_dl_bucket: Arc<TokenBucket>,
     global_ul_bucket: Arc<TokenBucket>,
+    telemetry: ManagerTelemetry,
 }
 
 impl TorrentManager {
@@ -233,6 +235,7 @@ impl TorrentManager {
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
+            telemetry: ManagerTelemetry::default(),
         }
     }
 
@@ -2093,11 +2096,13 @@ impl TorrentManager {
                 file_priorities: self.state.file_priorities.clone(),
                 ..Default::default()
             };
-            tokio::spawn(async move {
-                if let Err(e) = metrics_tx_clone.send(torrent_state) {
-                    tracing::event!(Level::ERROR, "Failed to send metrics to TUI: {}", e);
-                }
-            });
+            if self.telemetry.should_emit(&torrent_state) {
+                tokio::spawn(async move {
+                    if let Err(e) = metrics_tx_clone.send(torrent_state) {
+                        tracing::event!(Level::ERROR, "Failed to send metrics to TUI: {}", e);
+                    }
+                });
+            }
         }
     }
 
