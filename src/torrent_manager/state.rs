@@ -1060,6 +1060,10 @@ impl TorrentState {
                     let mut peer_state = PeerState::new(peer_id.clone(), tx, self.now);
                     peer_state.peer_id = peer_id.as_bytes().to_vec();
                     self.peers.insert(peer_id, peer_state);
+                    // Admission pressure should react to discovered/registered peers immediately,
+                    // not only after handshake success.
+                    self.number_of_successfully_connected_peers = self.peers.len();
+                    self.refresh_peer_admission_guard();
                 }
                 vec![Effect::DoNothing]
             }
@@ -1073,6 +1077,7 @@ impl TorrentState {
                 }
 
                 self.number_of_successfully_connected_peers = self.peers.len();
+                self.refresh_peer_admission_guard();
 
                 vec![Effect::EmitManagerEvent(ManagerEvent::PeerConnected {
                     info_hash: self.info_hash.clone(),
@@ -1114,6 +1119,7 @@ impl TorrentState {
                 }
 
                 self.number_of_successfully_connected_peers = self.peers.len();
+                self.refresh_peer_admission_guard();
                 self.piece_manager
                     .update_rarity(self.peers.values().map(|p| &p.bitfield));
 
@@ -2612,6 +2618,46 @@ mod tests {
         assert!(
             state.accepting_new_peers,
             "expected admission guard to reopen at 75 percent of threshold"
+        );
+    }
+
+    #[test]
+    fn test_peer_admission_guard_closes_immediately_on_successful_connection() {
+        let mut state = create_empty_state();
+        state.torrent_status = TorrentStatus::Standard;
+        state.accepting_new_peers = true;
+
+        for i in 0..PEER_ADMISSION_QUALITY_THRESHOLD {
+            add_peer(&mut state, &format!("peer_{}", i));
+        }
+
+        let _ = state.update(Action::PeerSuccessfullyConnected {
+            peer_id: "peer_0".to_string(),
+        });
+
+        assert!(
+            !state.accepting_new_peers,
+            "expected admission guard to close immediately when threshold is reached"
+        );
+    }
+
+    #[test]
+    fn test_peer_admission_guard_closes_immediately_on_peer_discovery() {
+        let mut state = create_empty_state();
+        state.torrent_status = TorrentStatus::Standard;
+        state.accepting_new_peers = true;
+
+        for i in 0..PEER_ADMISSION_QUALITY_THRESHOLD {
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = state.update(Action::RegisterPeer {
+                peer_id: format!("peer_{}", i),
+                tx,
+            });
+        }
+
+        assert!(
+            !state.accepting_new_peers,
+            "expected admission guard to close immediately when discovery reaches threshold"
         );
     }
 

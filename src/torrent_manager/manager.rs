@@ -101,6 +101,7 @@ const HASH_LENGTH: usize = 20;
 
 const MAX_UPLOAD_REQUEST_ATTEMPTS: u32 = 7;
 const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
+const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
@@ -1885,16 +1886,53 @@ impl TorrentManager {
             return "Paused".to_string();
         }
 
+        let connected_peers = self.state.peers.len();
+        let useful_peers = self
+            .state
+            .peers
+            .values()
+            .filter(|p| p.am_interested)
+            .count();
+        let peers_sending_data = self
+            .state
+            .peers
+            .values()
+            .filter(|p| p.peer_choking == ChokeStatus::Unchoke)
+            .count();
+        let need_count = self.state.piece_manager.need_queue.len();
+        let total_pieces = self.state.piece_manager.bitfield.len() as u32;
+        let completed_pieces =
+            total_pieces.saturating_sub(self.state.piece_manager.pieces_remaining as u32);
+        let completion_pct = if total_pieces > 0 {
+            (completed_pieces * 100) / total_pieces
+        } else {
+            0
+        };
+
         if let TorrentActivity::ProcessingPeers(count) = &self.state.last_activity {
-            return format!("Processing peers ({})", count);
+            return Self::cap_activity_message(format!("Processing peer ({})", count));
         }
 
         if self.state.torrent_status == TorrentStatus::AwaitingMetadata {
-            return "Retrieving Metadata...".to_string();
+            let message = if self.state.torrent_metadata_length.is_some() {
+                format!("Metadata ({} peers)", connected_peers)
+            } else {
+                format!("Metadata from peers ({})", connected_peers)
+            };
+            return Self::cap_activity_message(message);
         }
 
         if self.state.torrent_status == TorrentStatus::Validating {
-            return "Validating...".to_string();
+            let message = if total_pieces > 0 {
+                let validation_pct = (self.state.validation_pieces_found * 100) / total_pieces;
+                format!(
+                    "Validating {}% ({}/{})",
+                    validation_pct, self.state.validation_pieces_found, total_pieces
+                )
+            } else {
+                "Validating".to_string()
+            };
+            return Self::cap_activity_message(message);
         }
 
         if self.state.torrent_status == TorrentStatus::Done {
@@ -1923,34 +1961,47 @@ impl TorrentManager {
 
         // 2. Handle specific non-transfer activities
         match &self.state.last_activity {
-            TorrentActivity::RequestingPieces => return "Requesting pieces...".to_string(),
-            TorrentActivity::AnnouncingToTracker => return "Contacting tracker...".to_string(),
+            TorrentActivity::RequestingPieces => {
+                return Self::cap_activity_message(format!(
+                    "Request {} ({}/{})",
+                    need_count, useful_peers, connected_peers
+                ));
+            }
+            TorrentActivity::AnnouncingToTracker => {
+                return Self::cap_activity_message(format!("Tracker ({} peers)", connected_peers));
+            }
             #[cfg(feature = "dht")]
-            TorrentActivity::SearchingDht => return "Searching DHT for peers...".to_string(),
+            TorrentActivity::SearchingDht => {
+                return Self::cap_activity_message(format!("DHT search ({})", connected_peers));
+            }
             _ => {}
         }
 
         // 3. Refined "Stalled" vs "Connecting" Logic
-        let connected_peers = self.state.peers.len();
         if connected_peers == 0 {
-            return "Connecting to peers...".to_string();
+            return Self::cap_activity_message(format!("Connecting ({}%)", completion_pct));
         }
 
-        // If we have peers but no download speed:
-        let is_interested_in_anyone = self.state.peers.values().any(|p| p.am_interested);
-        let need_pieces = !self.state.piece_manager.need_queue.is_empty();
-
-        if need_pieces {
-            if is_interested_in_anyone {
-                // We want data, we have peers, but no one is giving it to us (Choked or Slow)
-                return "Stalled (Waiting for unchoke)".to_string();
-            } else {
-                // We have peers, but none of them have the pieces we need
-                return "Stalled (No peers have required pieces)".to_string();
+        if need_count > 0 {
+            if useful_peers > 0 {
+                return Self::cap_activity_message(format!(
+                    "Waiting data ({}/{})",
+                    peers_sending_data, connected_peers
+                ));
             }
+            return Self::cap_activity_message(format!("Need pieces ({})", connected_peers));
         }
 
-        "Idle".to_string()
+        Self::cap_activity_message(format!("Idle ({}, {}%)", connected_peers, completion_pct))
+    }
+
+    fn cap_activity_message(message: String) -> String {
+        if message.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN {
+            return message;
+        }
+        let keep = ACTIVITY_MESSAGE_MAX_LEN.saturating_sub(3);
+        let truncated: String = message.chars().take(keep).collect();
+        format!("{}...", truncated)
     }
 
     fn send_metrics(&mut self, bytes_dl: u64, bytes_ul: u64) {
@@ -2886,6 +2937,103 @@ mod resource_tests {
         let torrent_tx = manager.torrent_manager_tx.clone();
 
         (manager, torrent_tx, cmd_tx, shutdown_tx, resource_manager)
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn add_peer(
+        manager: &mut TorrentManager,
+        id: &str,
+        am_interested: bool,
+        peer_choking: ChokeStatus,
+    ) {
+        let (peer_tx, _peer_rx) = mpsc::channel(4);
+        let mut peer =
+            crate::torrent_manager::state::PeerState::new(id.to_string(), peer_tx, Instant::now());
+        peer.am_interested = am_interested;
+        peer.peer_choking = peer_choking;
+        manager.state.peers.insert(id.to_string(), peer);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    #[test]
+    fn test_activity_message_metadata_and_peer_count() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+
+        manager.state.torrent_status = TorrentStatus::AwaitingMetadata;
+        manager.state.torrent_metadata_length = Some(2048);
+        add_peer(&mut manager, "p1", false, ChokeStatus::Choke);
+        add_peer(&mut manager, "p2", false, ChokeStatus::Choke);
+        add_peer(&mut manager, "p3", false, ChokeStatus::Choke);
+
+        let msg = manager.generate_activity_message(0, 0);
+        assert_eq!(msg, "Metadata (3 peers)");
+        assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    #[test]
+    fn test_activity_message_validation_shows_progress_percentage() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+
+        manager.state.torrent_status = TorrentStatus::Validating;
+        manager.state.validation_pieces_found = 4;
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Need; 10];
+
+        let msg = manager.generate_activity_message(0, 0);
+        assert_eq!(msg, "Validating 40% (4/10)");
+        assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    #[test]
+    fn test_activity_message_requesting_pieces_shows_quantifiers() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+
+        manager.state.torrent_status = TorrentStatus::Standard;
+        manager.state.last_activity = TorrentActivity::RequestingPieces;
+        manager.state.piece_manager.need_queue = vec![1, 2, 3, 4];
+        add_peer(&mut manager, "p1", true, ChokeStatus::Unchoke);
+        add_peer(&mut manager, "p2", false, ChokeStatus::Choke);
+
+        let msg = manager.generate_activity_message(0, 0);
+        assert_eq!(msg, "Request 4 (1/2)");
+        assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    #[test]
+    fn test_activity_message_waiting_for_data_is_plain_language() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+
+        manager.state.torrent_status = TorrentStatus::Standard;
+        manager.state.last_activity = TorrentActivity::Initializing;
+        manager.state.piece_manager.need_queue = vec![1];
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Need; 5];
+        manager.state.piece_manager.pieces_remaining = 3;
+
+        add_peer(&mut manager, "p1", true, ChokeStatus::Unchoke);
+        add_peer(&mut manager, "p2", true, ChokeStatus::Choke);
+        add_peer(&mut manager, "p3", false, ChokeStatus::Choke);
+
+        let msg = manager.generate_activity_message(0, 0);
+        assert_eq!(msg, "Waiting data (1/3)");
+        assert!(!msg.to_lowercase().contains("unchoke"));
+        assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    #[test]
+    fn test_activity_message_done_strings_preserved() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+        manager.state.torrent_status = TorrentStatus::Done;
+
+        assert_eq!(manager.generate_activity_message(0, 10), "Seeding");
+        assert_eq!(manager.generate_activity_message(0, 0), "Finished");
     }
 
     #[tokio::test]
