@@ -4366,7 +4366,6 @@ fn draw_peers_table(f: &mut Frame, app_state: &AppState, peers_chunk: Rect, ctx:
                             } else {
                                 ip_to_color(ctx, &peer.address)
                             };
-                        let row_color = row_color;
 
                         let cells: Vec<Cell> = visible_indices
                             .iter()

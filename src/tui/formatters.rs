@@ -319,10 +319,18 @@ pub fn generate_x_axis_labels(
     // Convert the strings to styled Spans, replacing the last label with "Now".
     let mut x_labels: Vec<Span> = labels_str
         .into_iter()
-        .map(|s| Span::styled(s, ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))))
+        .map(|s| {
+            Span::styled(
+                s,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            )
+        })
         .collect();
     if let Some(last) = x_labels.last_mut() {
-        *last = Span::styled("Now", ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)));
+        *last = Span::styled(
+            "Now",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        );
     }
     x_labels
 }

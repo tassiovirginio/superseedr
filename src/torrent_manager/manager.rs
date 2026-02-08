@@ -1214,7 +1214,9 @@ impl TorrentManager {
             }
 
             let _ = manager_tx
-                .send(TorrentCommand::ValidationProgress(completed_pieces.len() as u32))
+                .send(TorrentCommand::ValidationProgress(
+                    completed_pieces.len() as u32
+                ))
                 .await;
 
             return Ok(completed_pieces);
@@ -4513,9 +4515,7 @@ mod resource_tests {
 
         let (progress_tx, mut progress_rx) = mpsc::channel(64);
         let (event_tx, _event_rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            while progress_rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),

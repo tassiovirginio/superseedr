@@ -1032,7 +1032,6 @@ impl Theme {
                 wave_wavelength: 34.0,
                 wave_angle_degrees: 22.0,
                 wave_mode: WaveMode::Linear,
-                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(255, 236, 175),
@@ -2884,7 +2883,6 @@ impl Theme {
                 wave_wavelength: 72.0,
                 wave_angle_degrees: -40.0,
                 wave_mode: WaveMode::Linear,
-                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(222, 230, 255),
@@ -3027,7 +3025,6 @@ impl Theme {
                 wave_wavelength: 64.0,
                 wave_angle_degrees: -35.0,
                 wave_mode: WaveMode::Linear,
-                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(34, 56, 88),
@@ -3102,7 +3099,6 @@ impl Theme {
                 // 90deg gives a vertical sweep (up/down axis).
                 wave_angle_degrees: 90.0,
                 wave_mode: WaveMode::Linear,
-                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(228, 240, 255),
@@ -3176,7 +3172,6 @@ impl Theme {
                 wave_wavelength: 46.0,
                 wave_angle_degrees: -55.0,
                 wave_mode: WaveMode::Linear,
-                ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(213, 245, 239),
