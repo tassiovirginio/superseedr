@@ -363,8 +363,7 @@ fn normalize_theme_name_key(input: &str) -> String {
         .trim()
         .to_lowercase()
         .replace('\'', "")
-        .replace('-', "_")
-        .replace(' ', "_")
+        .replace(['-', ' '], "_")
 }
 
 #[derive(Debug, Clone, Copy)]

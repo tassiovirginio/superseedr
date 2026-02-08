@@ -217,7 +217,11 @@ fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
     }
 }
 
-fn truncate_theme_label_preserving_fx(theme_name: &str, fx_enabled: bool, max_len: usize) -> String {
+fn truncate_theme_label_preserving_fx(
+    theme_name: &str,
+    fx_enabled: bool,
+    max_len: usize,
+) -> String {
     if max_len == 0 {
         return String::new();
     }
@@ -5302,7 +5306,10 @@ mod tests {
     fn test_footer_left_width_expands_with_terminal_width() {
         let small = compute_footer_left_width(90, false);
         let large = compute_footer_left_width(180, false);
-        assert!(large > small, "left footer width should expand on wider terminals");
+        assert!(
+            large > small,
+            "left footer width should expand on wider terminals"
+        );
     }
 
     #[test]

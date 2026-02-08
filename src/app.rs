@@ -3179,9 +3179,15 @@ mod tests {
 
     #[test]
     fn persisted_validation_status_is_true_only_when_complete() {
-        assert!(!persisted_validation_status_from_piece_completion(0, 0, false));
-        assert!(!persisted_validation_status_from_piece_completion(10, 9, false));
-        assert!(persisted_validation_status_from_piece_completion(10, 10, false));
+        assert!(!persisted_validation_status_from_piece_completion(
+            0, 0, false
+        ));
+        assert!(!persisted_validation_status_from_piece_completion(
+            10, 9, false
+        ));
+        assert!(persisted_validation_status_from_piece_completion(
+            10, 10, false
+        ));
     }
 
     #[test]
