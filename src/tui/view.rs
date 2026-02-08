@@ -1449,6 +1449,12 @@ fn draw_footer(
     if show_branding {
         let _current_dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
         let _current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
+        let fx_enabled = ctx.theme.effects.enabled();
+        let theme_label = if fx_enabled {
+            format!("{} [FX]", ctx.theme.name)
+        } else {
+            ctx.theme.name.to_string()
+        };
 
         let client_display_line = if let Some(new_version) = &app_state.update_available {
             Line::from(vec![
@@ -1485,7 +1491,7 @@ fn draw_footer(
                 ),
                 Span::styled(" | ", ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))),
                 Span::styled(
-                    ctx.theme.name.to_string(),
+                    theme_label.clone(),
                     ctx.apply(Style::default().fg(ctx.state_selected())),
                 ),
             ])
@@ -1521,7 +1527,7 @@ fn draw_footer(
                     ),
                     Span::styled(" | ", ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))),
                     Span::styled(
-                        ctx.theme.name.to_string(),
+                        theme_label.clone(),
                         ctx.apply(Style::default().fg(ctx.state_selected())),
                     ),
                 ])
@@ -1555,7 +1561,7 @@ fn draw_footer(
                     ),
                     Span::styled(" | ", ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))),
                     Span::styled(
-                        ctx.theme.name.to_string(),
+                        theme_label,
                         ctx.apply(Style::default().fg(ctx.state_selected())),
                     ),
                 ])

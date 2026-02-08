@@ -27,6 +27,8 @@ pub enum ThemeName {
     DeepOcean,
     #[strum(serialize = "Deep Sky")]
     DeepSky,
+    #[strum(serialize = "Diamond")]
+    Diamond,
     #[strum(serialize = "Gold")]
     Gold,
     #[strum(serialize = "Dracula")]
@@ -59,8 +61,12 @@ pub enum ThemeName {
     Nord,
     #[strum(serialize = "One Dark")]
     OneDark,
+    #[strum(serialize = "Obsidian Forge")]
+    ObsidianForge,
     #[strum(serialize = "Oxocarbon")]
     Oxocarbon,
+    #[strum(serialize = "Arctic Whiteout")]
+    ArcticWhiteout,
     #[strum(serialize = "PaperColor Light")]
     PaperColorLight,
     #[strum(serialize = "Bioluminescent Reef")]
@@ -114,6 +120,7 @@ impl Serialize for ThemeName {
             ThemeName::Cyberpunk => "cyberpunk",
             ThemeName::DeepOcean => "deep_ocean",
             ThemeName::DeepSky => "deep_sky",
+            ThemeName::Diamond => "diamond",
             ThemeName::Gold => "gold",
             ThemeName::Dracula => "dracula",
             ThemeName::EverforestDark => "everforest_dark",
@@ -130,7 +137,9 @@ impl Serialize for ThemeName {
             ThemeName::Nightfox => "nightfox",
             ThemeName::Nord => "nord",
             ThemeName::OneDark => "one_dark",
+            ThemeName::ObsidianForge => "obsidian_forge",
             ThemeName::Oxocarbon => "oxocarbon",
+            ThemeName::ArcticWhiteout => "arctic_whiteout",
             ThemeName::PaperColorLight => "papercolor_light",
             ThemeName::BlackHole => "black_hole",
             ThemeName::BioluminescentReef => "bioluminescent_reef",
@@ -163,6 +172,7 @@ impl<'de> Deserialize<'de> for ThemeName {
             "cyberpunk" | "Cyberpunk" => Ok(ThemeName::Cyberpunk),
             "deep_ocean" | "Deep Ocean" => Ok(ThemeName::DeepOcean),
             "deep_sky" | "Deep Sky" => Ok(ThemeName::DeepSky),
+            "diamond" | "Diamond" => Ok(ThemeName::Diamond),
             "gold" | "Gold" => Ok(ThemeName::Gold),
             "dracula" | "Dracula" => Ok(ThemeName::Dracula),
             "everforest_dark" | "Everforest Dark" => Ok(ThemeName::EverforestDark),
@@ -179,7 +189,9 @@ impl<'de> Deserialize<'de> for ThemeName {
             "nightfox" | "Nightfox" => Ok(ThemeName::Nightfox),
             "nord" | "Nord" => Ok(ThemeName::Nord),
             "one_dark" | "One Dark" => Ok(ThemeName::OneDark),
+            "obsidian_forge" | "Obsidian Forge" => Ok(ThemeName::ObsidianForge),
             "oxocarbon" | "Oxocarbon" => Ok(ThemeName::Oxocarbon),
+            "arctic_whiteout" | "Arctic Whiteout" => Ok(ThemeName::ArcticWhiteout),
             "papercolor_light" | "PaperColor Light" => Ok(ThemeName::PaperColorLight),
             "black_hole" | "Black Hole" => Ok(ThemeName::BlackHole),
             "bioluminescent_reef" | "Bioluminescent Reef" => Ok(ThemeName::BioluminescentReef),
@@ -611,6 +623,7 @@ impl Theme {
             ThemeName::Cyberpunk => Self::cyberpunk(),
             ThemeName::DeepOcean => Self::deep_ocean(),
             ThemeName::DeepSky => Self::deep_sky(),
+            ThemeName::Diamond => Self::diamond(),
             ThemeName::Gold => Self::gold(),
             ThemeName::Dracula => Self::dracula(),
             ThemeName::EverforestDark => Self::everforest_dark(),
@@ -627,7 +640,9 @@ impl Theme {
             ThemeName::Nightfox => Self::nightfox(),
             ThemeName::Nord => Self::nord(),
             ThemeName::OneDark => Self::one_dark(),
+            ThemeName::ObsidianForge => Self::obsidian_forge(),
             ThemeName::Oxocarbon => Self::oxocarbon(),
+            ThemeName::ArcticWhiteout => Self::arctic_whiteout(),
             ThemeName::PaperColorLight => Self::papercolor_light(),
             ThemeName::BlackHole => Self::black_hole(),
             ThemeName::BioluminescentReef => Self::bioluminescent_reef(),
@@ -2913,6 +2928,224 @@ impl Theme {
         }
     }
 
+    pub fn obsidian_forge() -> Self {
+        let categorical = ThemeCategorical {
+            rosewater: Color::Rgb(248, 238, 226),
+            flamingo: Color::Rgb(255, 171, 130),
+            pink: Color::Rgb(230, 165, 145),
+            mauve: Color::Rgb(183, 152, 216),
+            red: Color::Rgb(255, 108, 92),
+            maroon: Color::Rgb(214, 92, 78),
+            peach: Color::Rgb(255, 165, 88),
+            yellow: Color::Rgb(244, 204, 120),
+            green: Color::Rgb(154, 209, 126),
+            teal: Color::Rgb(121, 198, 176),
+            sky: Color::Rgb(128, 188, 226),
+            sapphire: Color::Rgb(103, 163, 214),
+            blue: Color::Rgb(84, 136, 196),
+            lavender: Color::Rgb(193, 176, 224),
+        };
+
+        Self {
+            name: ThemeName::ObsidianForge,
+            effects: ThemeEffects {
+                local_enabled: true,
+                flicker_hz: 5.8,
+                flicker_intensity: 0.11,
+                local_burst_duty: 0.12,
+                local_burst_hz: 0.7,
+                local_idle_intensity: 0.05,
+                local_burst_boost: 1.16,
+                wave_enabled: false,
+                ..ThemeEffects::default()
+            },
+            semantic: ThemeSemantic {
+                text: Color::Rgb(230, 220, 206),
+                subtext1: Color::Rgb(191, 176, 156),
+                subtext0: Color::Rgb(156, 137, 114),
+                overlay0: Color::Rgb(108, 91, 74),
+                surface2: Color::Rgb(74, 62, 52),
+                surface1: Color::Rgb(48, 40, 34),
+                surface0: Color::Rgb(22, 18, 16),
+                border: Color::Rgb(135, 110, 88),
+                white: Color::White,
+            },
+            scale: ThemeScale {
+                speed: [
+                    categorical.sapphire,
+                    categorical.sky,
+                    categorical.teal,
+                    categorical.green,
+                    categorical.yellow,
+                    categorical.peach,
+                    categorical.red,
+                    categorical.maroon,
+                ],
+                ip_hash: categorical_ip_hash(categorical),
+                heatmap: ThemeHeatmap {
+                    low: categorical.blue,
+                    medium: categorical.peach,
+                    high: categorical.red,
+                    empty: Color::Rgb(40, 32, 28),
+                },
+                stream: ThemeStream {
+                    inflow: categorical.sky,
+                    outflow: categorical.peach,
+                },
+                categorical,
+            },
+        }
+    }
+
+    pub fn arctic_whiteout() -> Self {
+        let categorical = ThemeCategorical {
+            rosewater: Color::Rgb(243, 248, 255),
+            flamingo: Color::Rgb(222, 236, 252),
+            pink: Color::Rgb(206, 228, 252),
+            mauve: Color::Rgb(177, 206, 244),
+            red: Color::Rgb(226, 112, 126),
+            maroon: Color::Rgb(197, 95, 108),
+            peach: Color::Rgb(235, 170, 120),
+            yellow: Color::Rgb(229, 205, 126),
+            green: Color::Rgb(132, 194, 152),
+            teal: Color::Rgb(103, 188, 192),
+            sky: Color::Rgb(116, 190, 236),
+            sapphire: Color::Rgb(94, 167, 219),
+            blue: Color::Rgb(84, 142, 206),
+            lavender: Color::Rgb(171, 188, 236),
+        };
+
+        Self {
+            name: ThemeName::ArcticWhiteout,
+            effects: ThemeEffects {
+                local_enabled: true,
+                flicker_hz: 4.6,
+                flicker_intensity: 0.08,
+                local_burst_duty: 0.16,
+                local_burst_hz: 0.6,
+                local_idle_intensity: 0.04,
+                local_burst_boost: 1.12,
+                wave_enabled: true,
+                wave_hz: 0.32,
+                wave_intensity: 0.08,
+                wave_wavelength: 64.0,
+                wave_angle_degrees: -35.0,
+                wave_mode: WaveMode::Linear,
+                ..ThemeEffects::default()
+            },
+            semantic: ThemeSemantic {
+                text: Color::Rgb(34, 56, 88),
+                subtext1: Color::Rgb(58, 84, 120),
+                subtext0: Color::Rgb(87, 111, 146),
+                overlay0: Color::Rgb(134, 156, 186),
+                surface2: Color::Rgb(214, 226, 242),
+                surface1: Color::Rgb(244, 248, 253),
+                surface0: Color::Rgb(252, 254, 255),
+                border: Color::Rgb(124, 146, 178),
+                white: Color::Black,
+            },
+            scale: ThemeScale {
+                speed: [
+                    categorical.sky,
+                    categorical.sapphire,
+                    categorical.teal,
+                    categorical.green,
+                    categorical.yellow,
+                    categorical.peach,
+                    categorical.mauve,
+                    categorical.lavender,
+                ],
+                ip_hash: categorical_ip_hash(categorical),
+                heatmap: ThemeHeatmap {
+                    low: categorical.blue,
+                    medium: categorical.sky,
+                    high: categorical.mauve,
+                    empty: Color::Rgb(222, 232, 245),
+                },
+                stream: ThemeStream {
+                    inflow: categorical.sapphire,
+                    outflow: categorical.teal,
+                },
+                categorical,
+            },
+        }
+    }
+
+    pub fn diamond() -> Self {
+        let categorical = ThemeCategorical {
+            rosewater: Color::Rgb(235, 245, 255),
+            flamingo: Color::Rgb(208, 229, 255),
+            pink: Color::Rgb(199, 221, 255),
+            mauve: Color::Rgb(170, 197, 245),
+            red: Color::Rgb(255, 120, 140),
+            maroon: Color::Rgb(214, 101, 126),
+            peach: Color::Rgb(255, 192, 145),
+            yellow: Color::Rgb(245, 220, 140),
+            green: Color::Rgb(144, 224, 187),
+            teal: Color::Rgb(124, 220, 224),
+            sky: Color::Rgb(150, 215, 255),
+            sapphire: Color::Rgb(122, 191, 245),
+            blue: Color::Rgb(100, 160, 235),
+            lavender: Color::Rgb(188, 205, 255),
+        };
+
+        Self {
+            name: ThemeName::Diamond,
+            effects: ThemeEffects {
+                local_enabled: true,
+                flicker_hz: 6.0,
+                flicker_intensity: 0.12,
+                local_burst_duty: 0.14,
+                local_burst_hz: 0.8,
+                local_idle_intensity: 0.05,
+                local_burst_boost: 1.18,
+                wave_enabled: true,
+                wave_hz: 0.34,
+                wave_intensity: 0.09,
+                wave_wavelength: 58.0,
+                // 90deg gives a vertical sweep (up/down axis).
+                wave_angle_degrees: 90.0,
+                wave_mode: WaveMode::Linear,
+                ..ThemeEffects::default()
+            },
+            semantic: ThemeSemantic {
+                text: Color::Rgb(228, 240, 255),
+                subtext1: Color::Rgb(184, 205, 232),
+                subtext0: Color::Rgb(146, 170, 202),
+                overlay0: Color::Rgb(93, 114, 145),
+                surface2: Color::Rgb(44, 60, 86),
+                surface1: Color::Rgb(28, 41, 64),
+                surface0: Color::Rgb(12, 20, 36),
+                border: Color::Rgb(108, 136, 176),
+                white: Color::White,
+            },
+            scale: ThemeScale {
+                speed: [
+                    categorical.sky,
+                    categorical.sapphire,
+                    categorical.teal,
+                    categorical.green,
+                    categorical.yellow,
+                    categorical.peach,
+                    categorical.mauve,
+                    categorical.lavender,
+                ],
+                ip_hash: categorical_ip_hash(categorical),
+                heatmap: ThemeHeatmap {
+                    low: categorical.blue,
+                    medium: categorical.sky,
+                    high: categorical.mauve,
+                    empty: Color::Rgb(28, 41, 64),
+                },
+                stream: ThemeStream {
+                    inflow: categorical.sky,
+                    outflow: categorical.teal,
+                },
+                categorical,
+            },
+        }
+    }
+
     pub fn bioluminescent_reef() -> Self {
         let categorical = ThemeCategorical {
             rosewater: Color::Rgb(222, 249, 242),
@@ -3028,6 +3261,7 @@ mod tests {
             ThemeName::Cyberpunk,
             ThemeName::DeepOcean,
             ThemeName::DeepSky,
+            ThemeName::Diamond,
             ThemeName::Gold,
             ThemeName::Dracula,
             ThemeName::EverforestDark,
@@ -3044,7 +3278,9 @@ mod tests {
             ThemeName::Nightfox,
             ThemeName::Nord,
             ThemeName::OneDark,
+            ThemeName::ObsidianForge,
             ThemeName::Oxocarbon,
+            ThemeName::ArcticWhiteout,
             ThemeName::PaperColorLight,
             ThemeName::BioluminescentReef,
             ThemeName::BlackHole,
@@ -3104,6 +3340,7 @@ mod tests {
             ("cyberpunk", ThemeName::Cyberpunk),
             ("deep_ocean", ThemeName::DeepOcean),
             ("deep_sky", ThemeName::DeepSky),
+            ("diamond", ThemeName::Diamond),
             ("gold", ThemeName::Gold),
             ("dracula", ThemeName::Dracula),
             ("everforest_dark", ThemeName::EverforestDark),
@@ -3120,7 +3357,9 @@ mod tests {
             ("nightfox", ThemeName::Nightfox),
             ("nord", ThemeName::Nord),
             ("one_dark", ThemeName::OneDark),
+            ("obsidian_forge", ThemeName::ObsidianForge),
             ("oxocarbon", ThemeName::Oxocarbon),
+            ("arctic_whiteout", ThemeName::ArcticWhiteout),
             ("papercolor_light", ThemeName::PaperColorLight),
             ("black_hole", ThemeName::BlackHole),
             ("bioluminescent_reef", ThemeName::BioluminescentReef),
@@ -3153,6 +3392,7 @@ mod tests {
             ("Cyberpunk", ThemeName::Cyberpunk),
             ("Deep Ocean", ThemeName::DeepOcean),
             ("Deep Sky", ThemeName::DeepSky),
+            ("Diamond", ThemeName::Diamond),
             ("Gold", ThemeName::Gold),
             ("Dracula", ThemeName::Dracula),
             ("Everforest Dark", ThemeName::EverforestDark),
@@ -3169,7 +3409,9 @@ mod tests {
             ("Nightfox", ThemeName::Nightfox),
             ("Nord", ThemeName::Nord),
             ("One Dark", ThemeName::OneDark),
+            ("Obsidian Forge", ThemeName::ObsidianForge),
             ("Oxocarbon", ThemeName::Oxocarbon),
+            ("Arctic Whiteout", ThemeName::ArcticWhiteout),
             ("PaperColor Light", ThemeName::PaperColorLight),
             ("Black Hole", ThemeName::BlackHole),
             ("Bioluminescent Reef", ThemeName::BioluminescentReef),
@@ -3314,5 +3556,20 @@ mod tests {
                 effects.wave_intensity
             );
         }
+    }
+
+    #[test]
+    fn test_theme_effects_enabled_flag_tracks_presence_of_effects() {
+        let static_theme = Theme::builtin(ThemeName::Nord);
+        let effect_theme = Theme::builtin(ThemeName::Diamond);
+
+        assert!(
+            !static_theme.effects.enabled(),
+            "Nord should report effects disabled"
+        );
+        assert!(
+            effect_theme.effects.enabled(),
+            "Diamond should report effects enabled"
+        );
     }
 }
