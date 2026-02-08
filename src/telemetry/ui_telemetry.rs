@@ -21,11 +21,11 @@ impl UiTelemetry {
                 app_state.read_op_start_times.push_front(Instant::now());
                 app_state
                     .global_disk_read_history_log
-                    .push_front(op.clone());
+                    .push_front(*op);
                 app_state.global_disk_read_history_log.truncate(100);
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.bytes_read_this_tick += op.length as u64;
-                    torrent.disk_read_history_log.push_front(op.clone());
+                    torrent.disk_read_history_log.push_front(*op);
                     torrent.disk_read_history_log.truncate(50);
                 }
                 true
@@ -53,11 +53,11 @@ impl UiTelemetry {
                 app_state.write_op_start_times.push_front(Instant::now());
                 app_state
                     .global_disk_write_history_log
-                    .push_front(op.clone());
+                    .push_front(*op);
                 app_state.global_disk_write_history_log.truncate(100);
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.bytes_written_this_tick += op.length as u64;
-                    torrent.disk_write_history_log.push_front(op.clone());
+                    torrent.disk_write_history_log.push_front(*op);
                     torrent.disk_write_history_log.truncate(50);
                 }
                 true
