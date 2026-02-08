@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::AppState;
+use crate::app::FilePriority;
 use crate::config::{PeerSortColumn, TorrentSortColumn};
 use ratatui::prelude::*;
 
@@ -149,6 +150,90 @@ pub fn get_torrent_columns() -> Vec<ColumnDefinition> {
     ]
 }
 
+pub fn torrent_has_download_activity(app_state: &AppState) -> bool {
+    app_state
+        .torrents
+        .values()
+        .any(|t| t.smoothed_download_speed_bps > 0)
+}
+
+pub fn torrent_has_upload_activity(app_state: &AppState) -> bool {
+    app_state
+        .torrents
+        .values()
+        .any(|t| t.smoothed_upload_speed_bps > 0)
+}
+
+pub fn has_incomplete_torrents(app_state: &AppState) -> bool {
+    app_state.torrents.values().any(|t| {
+        let s = &t.latest_state;
+        if s.activity_message.contains("Seeding") || s.activity_message.contains("Finished") {
+            return false;
+        }
+
+        let skipped_count = s
+            .file_priorities
+            .values()
+            .filter(|&&p| p == FilePriority::Skip)
+            .count() as u32;
+        let effective_total = s.number_of_pieces_total.saturating_sub(skipped_count);
+
+        if effective_total == 0 {
+            return false;
+        }
+        s.number_of_pieces_completed < effective_total
+    })
+}
+
+pub fn active_torrent_column_indices(app_state: &AppState) -> Vec<usize> {
+    let has_dl_activity = torrent_has_download_activity(app_state);
+    let has_ul_activity = torrent_has_upload_activity(app_state);
+    let has_incomplete = has_incomplete_torrents(app_state);
+
+    get_torrent_columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| {
+            let is_active = match col.id {
+                ColumnId::DownSpeed => has_dl_activity,
+                ColumnId::UpSpeed => has_ul_activity,
+                ColumnId::Status => has_incomplete,
+                ColumnId::Name => true,
+            };
+            is_active.then_some(idx)
+        })
+        .collect()
+}
+
+pub fn compute_visible_torrent_columns(
+    app_state: &AppState,
+    available_width: u16,
+) -> (Vec<Constraint>, Vec<usize>) {
+    let all_cols = get_torrent_columns();
+    let active_indices = active_torrent_column_indices(app_state);
+
+    let smart_cols: Vec<SmartCol> = active_indices
+        .iter()
+        .map(|&idx| {
+            let c = &all_cols[idx];
+            SmartCol {
+                min_width: c.min_width,
+                priority: c.priority,
+                constraint: c.default_constraint,
+            }
+        })
+        .collect();
+
+    let (constraints, visible_active_indices) =
+        compute_smart_table_layout(&smart_cols, available_width, 1);
+    let visible_real_indices: Vec<usize> = visible_active_indices
+        .into_iter()
+        .filter_map(|idx| active_indices.get(idx).copied())
+        .collect();
+
+    (constraints, visible_real_indices)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PeerColumnId {
     Flags,
@@ -228,6 +313,20 @@ pub fn get_peer_columns() -> Vec<PeerColumnDefinition> {
             sort_enum: Some(PeerSortColumn::Action),
         },
     ]
+}
+
+pub fn compute_visible_peer_columns(available_width: u16) -> (Vec<Constraint>, Vec<usize>) {
+    let peer_cols = get_peer_columns();
+    let smart_peer_cols: Vec<SmartCol> = peer_cols
+        .iter()
+        .map(|c| SmartCol {
+            min_width: c.min_width,
+            priority: c.priority,
+            constraint: c.default_constraint,
+        })
+        .collect();
+
+    compute_smart_table_layout(&smart_peer_cols, available_width, 1)
 }
 
 #[derive(Clone, Debug)]

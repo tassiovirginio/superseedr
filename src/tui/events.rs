@@ -4,7 +4,7 @@
 use crate::app::AppCommand;
 use crate::app::AppState;
 use crate::app::FileBrowserMode;
-use crate::app::{App, AppMode, ConfigItem, FilePriority, SelectedHeader, TorrentControlState};
+use crate::app::{App, AppMode, ConfigItem, SelectedHeader, TorrentControlState};
 use crate::app::{BrowserPane, TorrentPreviewPayload};
 use crate::torrent_manager::ManagerCommand;
 
@@ -15,11 +15,11 @@ use crate::config::SortDirection;
 use crate::tui::formatters::centered_rect;
 use crate::tui::layout::calculate_file_browser_layout;
 use crate::tui::layout::calculate_layout;
-use crate::tui::layout::compute_smart_table_layout;
+use crate::tui::layout::compute_visible_peer_columns;
+use crate::tui::layout::compute_visible_torrent_columns;
 use crate::tui::layout::get_peer_columns;
 use crate::tui::layout::get_torrent_columns;
 use crate::tui::layout::LayoutContext;
-use crate::tui::layout::SmartCol;
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
 use crate::tui::tree::{TreeAction, TreeFilter, TreeMathHelper};
@@ -310,13 +310,21 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         }
 
                         KeyCode::Char('s') => {
-                            let visible_columns = visible_header_column_indices(&app.app_state);
+                            let layout_ctx =
+                                LayoutContext::new(app.app_state.screen_area, &app.app_state, 35);
+                            let layout_plan =
+                                calculate_layout(app.app_state.screen_area, &layout_ctx);
+                            let (_, visible_torrent_columns) = compute_visible_torrent_columns(
+                                &app.app_state,
+                                layout_plan.list.width,
+                            );
+                            let (_, visible_peer_columns) =
+                                compute_visible_peer_columns(layout_plan.peers.width);
                             match app.app_state.selected_header {
                                 SelectedHeader::Torrent(i) => {
                                     let cols = get_torrent_columns();
 
-                                    if let Some(def) = visible_columns
-                                        .torrent
+                                    if let Some(def) = visible_torrent_columns
                                         .get(i)
                                         .and_then(|&real_idx| cols.get(real_idx))
                                     {
@@ -342,8 +350,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 SelectedHeader::Peer(i) => {
                                     let cols = get_peer_columns();
 
-                                    if let Some(def) = visible_columns
-                                        .peer
+                                    if let Some(def) = visible_peer_columns
                                         .get(i)
                                         .and_then(|&real_idx| cols.get(real_idx))
                                     {
@@ -1168,105 +1175,6 @@ fn apply_priority_action(
     false
 }
 
-struct VisibleHeaderColumns {
-    torrent: Vec<usize>,
-    peer: Vec<usize>,
-}
-
-fn torrent_has_download_activity(app_state: &AppState) -> bool {
-    app_state
-        .torrents
-        .values()
-        .any(|t| t.smoothed_download_speed_bps > 0)
-}
-
-fn torrent_has_upload_activity(app_state: &AppState) -> bool {
-    app_state
-        .torrents
-        .values()
-        .any(|t| t.smoothed_upload_speed_bps > 0)
-}
-
-fn has_incomplete_torrents(app_state: &AppState) -> bool {
-    app_state.torrents.values().any(|t| {
-        let s = &t.latest_state;
-        if s.activity_message.contains("Seeding") || s.activity_message.contains("Finished") {
-            return false;
-        }
-
-        let skipped_count = s
-            .file_priorities
-            .values()
-            .filter(|&&p| p == FilePriority::Skip)
-            .count() as u32;
-        let effective_total = s.number_of_pieces_total.saturating_sub(skipped_count);
-
-        if effective_total == 0 {
-            return false;
-        }
-        s.number_of_pieces_completed < effective_total
-    })
-}
-
-fn visible_header_column_indices(app_state: &AppState) -> VisibleHeaderColumns {
-    let ctx = LayoutContext::new(app_state.screen_area, app_state, 35);
-    let layout_plan = calculate_layout(app_state.screen_area, &ctx);
-
-    let has_dl_activity = torrent_has_download_activity(app_state);
-    let has_ul_activity = torrent_has_upload_activity(app_state);
-    let has_incomplete = has_incomplete_torrents(app_state);
-
-    let t_cols = get_torrent_columns();
-    let active_t_indices: Vec<usize> = t_cols
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, col)| {
-            let is_active = match col.id {
-                crate::tui::layout::ColumnId::DownSpeed => has_dl_activity,
-                crate::tui::layout::ColumnId::UpSpeed => has_ul_activity,
-                crate::tui::layout::ColumnId::Status => has_incomplete,
-                crate::tui::layout::ColumnId::Name => true,
-            };
-            is_active.then_some(idx)
-        })
-        .collect();
-
-    let smart_t_cols: Vec<SmartCol> = active_t_indices
-        .iter()
-        .map(|&idx| {
-            let c = &t_cols[idx];
-            SmartCol {
-                min_width: c.min_width,
-                priority: c.priority,
-                constraint: c.default_constraint,
-            }
-        })
-        .collect();
-    let (_, visible_t_active_indices) =
-        compute_smart_table_layout(&smart_t_cols, layout_plan.list.width, 1);
-    let visible_t_indices: Vec<usize> = visible_t_active_indices
-        .into_iter()
-        .filter_map(|idx| active_t_indices.get(idx).copied())
-        .collect();
-
-    let p_cols = get_peer_columns();
-    let smart_p_cols: Vec<SmartCol> = p_cols
-        .iter()
-        .map(|c| SmartCol {
-            min_width: c.min_width,
-            priority: c.priority,
-            constraint: c.default_constraint,
-        })
-        .collect();
-    let (_, visible_p_indices) =
-        compute_smart_table_layout(&smart_p_cols, layout_plan.peers.width, 1);
-
-    VisibleHeaderColumns {
-        torrent: visible_t_indices,
-        peer: visible_p_indices,
-    }
-}
-
 fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
     let selected_torrent = app_state
         .torrent_list_order
@@ -1279,9 +1187,13 @@ fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
     let selected_torrent_peer_count =
         selected_torrent.map_or(0, |torrent| torrent.latest_state.peers.len());
 
-    let visible_columns = visible_header_column_indices(app_state);
-    let torrent_col_count = visible_columns.torrent.len();
-    let peer_col_count = visible_columns.peer.len();
+    let layout_ctx = LayoutContext::new(app_state.screen_area, app_state, 35);
+    let layout_plan = calculate_layout(app_state.screen_area, &layout_ctx);
+    let (_, visible_torrent_columns) =
+        compute_visible_torrent_columns(app_state, layout_plan.list.width);
+    let (_, visible_peer_columns) = compute_visible_peer_columns(layout_plan.peers.width);
+    let torrent_col_count = visible_torrent_columns.len();
+    let peer_col_count = visible_peer_columns.len();
 
     app_state.selected_header = match app_state.selected_header {
         SelectedHeader::Torrent(i) => {
