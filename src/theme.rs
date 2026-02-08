@@ -9,7 +9,7 @@ use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
 use tracing::warn;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display, Default)]
 pub enum ThemeName {
     #[strum(serialize = "Andromeda")]
     Andromeda,
@@ -22,6 +22,7 @@ pub enum ThemeName {
     #[strum(serialize = "Catppuccin Latte")]
     CatppuccinLatte,
     #[strum(serialize = "Catppuccin Mocha")]
+    #[default]
     CatppuccinMocha,
     #[strum(serialize = "Cyberpunk")]
     Cyberpunk,
@@ -91,12 +92,6 @@ pub enum ThemeName {
     Vesper,
     #[strum(serialize = "Zenburn")]
     Zenburn,
-}
-
-impl Default for ThemeName {
-    fn default() -> Self {
-        Self::CatppuccinMocha
-    }
 }
 
 impl ThemeName {
