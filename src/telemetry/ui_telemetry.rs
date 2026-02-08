@@ -19,9 +19,7 @@ impl UiTelemetry {
         match event {
             ManagerEvent::DiskReadStarted { info_hash, op } => {
                 app_state.read_op_start_times.push_front(Instant::now());
-                app_state
-                    .global_disk_read_history_log
-                    .push_front(*op);
+                app_state.global_disk_read_history_log.push_front(*op);
                 app_state.global_disk_read_history_log.truncate(100);
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.bytes_read_this_tick += op.length as u64;
@@ -51,9 +49,7 @@ impl UiTelemetry {
             }
             ManagerEvent::DiskWriteStarted { info_hash, op } => {
                 app_state.write_op_start_times.push_front(Instant::now());
-                app_state
-                    .global_disk_write_history_log
-                    .push_front(*op);
+                app_state.global_disk_write_history_log.push_front(*op);
                 app_state.global_disk_write_history_log.truncate(100);
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.bytes_written_this_tick += op.length as u64;
