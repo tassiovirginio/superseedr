@@ -36,6 +36,9 @@ static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const SECONDS_HISTORY_MAX: usize = 3600;
 pub const MINUTES_HISTORY_MAX: usize = 48 * 60;
+const ASCII_TREE_DIR_ICON: &str = "> ";
+const ASCII_TREE_FILE_ICON: &str = "  ";
+const ASCII_TREE_ROOT_ICON: &str = "> ";
 
 const LOGO_LARGE: &str = r#"
                                                              __          
@@ -3024,11 +3027,11 @@ pub fn draw_file_browser(
             let indent_str = "  ".repeat(item.depth);
             let indent_len = indent_str.len();
             let icon_str = if item.node.is_dir {
-                "  "
+                ASCII_TREE_DIR_ICON
             } else {
-                "   "
+                ASCII_TREE_FILE_ICON
             };
-            let icon_len = 4;
+            let icon_len = ASCII_TREE_DIR_ICON.len();
 
             // 2. Prepare Date String
             let (meta_str, meta_len) = if !item.node.is_dir {
@@ -3187,7 +3190,7 @@ fn draw_torrent_preview_panel(
         };
 
         list_items.push(ListItem::new(Line::from(vec![
-            Span::styled("▼  ", root_style),
+            Span::styled(ASCII_TREE_ROOT_ICON, root_style),
             Span::styled(path_display, root_style),
         ])));
 
@@ -3203,7 +3206,10 @@ fn draw_torrent_preview_panel(
                     .add_modifier(Modifier::BOLD)
             };
 
-            let mut spans = vec![Span::raw("  "), Span::styled("▼  ", container_style)];
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(ASCII_TREE_ROOT_ICON, container_style),
+            ];
 
             if *is_editing_name {
                 let (before, after) = container_name.split_at(*cursor_pos);
@@ -3241,9 +3247,9 @@ fn draw_torrent_preview_panel(
                 let indent_str = " ".repeat((base_indent_level + item.depth) * indent_multiplier);
 
                 let icon = if item.node.is_dir {
-                    "  "
+                    ASCII_TREE_DIR_ICON
                 } else {
-                    "   "
+                    ASCII_TREE_FILE_ICON
                 };
 
                 let (base_content_style, tag) = match item.node.payload.priority {
@@ -3427,9 +3433,9 @@ fn draw_torrent_preview_panel(
                     "  ".repeat(item.depth)
                 };
                 let icon = if item.node.is_dir {
-                    "  "
+                    ASCII_TREE_DIR_ICON
                 } else {
-                    "   "
+                    ASCII_TREE_FILE_ICON
                 };
                 let style = if item.node.is_dir {
                     ctx.apply(Style::default().fg(ctx.state_info()))
