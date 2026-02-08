@@ -217,6 +217,114 @@ fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
     }
 }
 
+fn truncate_theme_label_preserving_fx(theme_name: &str, fx_enabled: bool, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
+
+    if !fx_enabled {
+        return truncate_with_ellipsis(theme_name, max_len);
+    }
+
+    let suffix = "[FX]";
+    let suffix_len = suffix.chars().count();
+    let full = format!("{theme_name} {suffix}");
+    if full.chars().count() <= max_len {
+        return full;
+    }
+
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+
+    if max_len <= suffix_len + 3 {
+        return truncate_with_ellipsis(&full, max_len);
+    }
+
+    let name_len = max_len.saturating_sub(3 + suffix_len);
+    let name_prefix: String = theme_name.chars().take(name_len).collect();
+    format!("{name_prefix}...{suffix}")
+}
+
+fn compute_footer_left_width(footer_width: u16, is_update: bool) -> u16 {
+    let min_left = if is_update { 68u16 } else { 48u16 };
+    let max_left = if is_update { 110u16 } else { 90u16 };
+    let right_status = 21u16;
+    let min_commands = 18u16;
+    let reserved = right_status + min_commands;
+
+    let available_for_left = footer_width.saturating_sub(reserved);
+    available_for_left.clamp(min_left, max_left)
+}
+
+fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
+    let fx_enabled = ctx.theme.effects.enabled();
+    let theme_label = if fx_enabled {
+        format!("{} [FX]", ctx.theme.name)
+    } else {
+        ctx.theme.name.to_string()
+    };
+
+    let content = if let Some(new_version) = &app_state.update_available {
+        format!(
+            "UPDATE AVAILABLE: v{} -> v{} | {} | {}",
+            APP_VERSION,
+            new_version,
+            app_state.data_rate.to_string(),
+            theme_label
+        )
+    } else {
+        #[cfg(all(feature = "dht", feature = "pex"))]
+        {
+            format!(
+                "superseedr v{} | {} | {}",
+                APP_VERSION,
+                app_state.data_rate.to_string(),
+                theme_label
+            )
+        }
+        #[cfg(not(all(feature = "dht", feature = "pex")))]
+        {
+            format!(
+                "superseedr [PRIVATE] v{} | {} | {}",
+                APP_VERSION,
+                app_state.data_rate.to_string(),
+                theme_label
+            )
+        }
+    };
+
+    // Small breathing room to avoid edge clipping with styled spans.
+    (content.chars().count() as u16).saturating_add(2)
+}
+
+fn footer_command_len(key: &str, suffix: &str) -> usize {
+    key.chars().count() + suffix.chars().count()
+}
+
+fn try_push_footer_command(
+    spans: &mut Vec<Span<'static>>,
+    used_width: &mut usize,
+    max_width: usize,
+    key: &'static str,
+    suffix: &'static str,
+    key_style: Style,
+) -> bool {
+    let item_width = footer_command_len(key, suffix);
+    let separator_width = if *used_width == 0 { 0 } else { 3 };
+    if *used_width + separator_width + item_width > max_width {
+        return false;
+    }
+
+    if separator_width > 0 {
+        spans.push(Span::raw(" | "));
+    }
+    spans.push(Span::styled(key, key_style));
+    spans.push(Span::raw(suffix));
+    *used_width += separator_width + item_width;
+    true
+}
+
 fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     let mut table_state = TableState::default();
     if matches!(app_state.selected_header, SelectedHeader::Torrent(_)) {
@@ -1330,21 +1438,22 @@ fn draw_footer(
     let show_branding = footer_chunk.width >= 80;
 
     let is_update = app_state.update_available.is_some();
-    let left_content_width = if is_update { 68 } else { 48 };
-
     let (left_constraint, right_constraint) = if show_branding {
-        let required_width_for_symmetry = (left_content_width * 2) + 40;
+        let min_left = if is_update { 52u16 } else { 40u16 };
+        let min_commands = 18u16;
+        let desired_left = compute_footer_left_width(footer_chunk.width, is_update);
+        let content_left = estimate_footer_left_content_width(app_state, ctx);
+        let left_target = desired_left.min(content_left.max(min_left));
+        let symmetric_left_cap = footer_chunk.width.saturating_sub(min_commands) / 2;
 
-        if footer_chunk.width >= required_width_for_symmetry {
+        if symmetric_left_cap >= min_left {
+            let symmetric_left = left_target.min(symmetric_left_cap);
             (
-                Constraint::Length(left_content_width),
-                Constraint::Length(left_content_width),
+                Constraint::Length(symmetric_left),
+                Constraint::Length(symmetric_left),
             )
         } else {
-            (
-                Constraint::Length(left_content_width),
-                Constraint::Length(21),
-            )
+            (Constraint::Length(left_target), Constraint::Length(21))
         }
     } else {
         (Constraint::Length(0), Constraint::Length(21))
@@ -1368,19 +1477,16 @@ fn draw_footer(
         let _current_dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
         let _current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
         let fx_enabled = ctx.theme.effects.enabled();
-        let theme_label = if fx_enabled {
-            format!("{} [FX]", ctx.theme.name)
-        } else {
-            ctx.theme.name.to_string()
-        };
+        let theme_name = ctx.theme.name.to_string();
         let fit_theme_label = |prefix: &str| -> String {
-            let max_theme_width = (client_id_chunk.width as usize).saturating_sub(prefix.chars().count());
+            let max_theme_width =
+                (client_id_chunk.width as usize).saturating_sub(prefix.chars().count());
             if max_theme_width == 0 {
                 String::new()
             } else if max_theme_width <= 3 {
                 ".".repeat(max_theme_width)
             } else {
-                truncate_with_ellipsis(&theme_label, max_theme_width)
+                truncate_theme_label_preserving_fx(&theme_name, fx_enabled, max_theme_width)
             }
         };
 
@@ -1518,73 +1624,154 @@ fn draw_footer(
         f.render_widget(client_id_paragraph, client_id_chunk);
     }
 
-    // --- CENTER: Size-Aware Commands ---
-    let width = commands_chunk.width;
-    let mut spans = Vec::new();
+    // --- CENTER: Width-Packed Commands ---
+    let max_width = commands_chunk.width as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used_width = 0usize;
 
-    // Priority 4 (Lowest): Aux tools
-    if width > 110 {
-        spans.extend(vec![
-            Span::styled("[t]", ctx.apply(Style::default().fg(ctx.accent_sapphire()))),
-            Span::raw("ime | "),
-            Span::styled(
-                "[<]theme[>]",
-                ctx.apply(Style::default().fg(ctx.state_selected())),
-            ),
-            Span::raw(" | "),
-            Span::styled("[/]", ctx.apply(Style::default().fg(ctx.state_warning()))),
-            Span::raw("search | "),
-            Span::styled("[c]", ctx.apply(Style::default().fg(ctx.state_complete()))),
-            Span::raw("onfig | "),
-        ]);
-    }
-
-    // Priority 3: Management
-    if width > 90 {
-        spans.extend(vec![
-            Span::styled("[a]", ctx.apply(Style::default().fg(ctx.state_success()))),
-            Span::raw("dd | "),
-            Span::styled("[d]", ctx.apply(Style::default().fg(ctx.state_warning()))),
-            Span::raw("elete | "),
-            Span::styled("[s]", ctx.apply(Style::default().fg(ctx.state_selected()))),
-            Span::raw("ort | "),
-        ]);
-    }
-
-    // Priority 2: Actions
-    if width > 65 {
-        spans.extend(vec![
-            Span::styled("[v]", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::raw("paste | "),
-            Span::styled("[p]", ctx.apply(Style::default().fg(ctx.state_success()))),
-            Span::raw("ause | "),
-        ]);
-    }
-
-    // Priority 1: Navigation & Quit
-    if width > 45 {
-        spans.extend(vec![
-            Span::styled("Arrows", ctx.apply(Style::default().fg(ctx.state_info()))),
-            Span::raw(" nav | "),
-            Span::styled("[Q]", ctx.apply(Style::default().fg(ctx.state_error()))),
-            Span::raw("uit | "),
-        ]);
-    }
-
-    // Priority 0: Help (Always Shown)
-    if app_state.system_warning.is_some() {
-        spans.extend(vec![
-            Span::styled("[m]", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::styled(
-                "anual (warning)",
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            ),
-        ]);
+    let manual_key = "[m]";
+    let manual_suffix = if app_state.system_warning.is_some() {
+        "anual (warning)"
     } else {
-        spans.extend(vec![
-            Span::styled("[m]", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::raw("anual"),
-        ]);
+        "anual"
+    };
+    let manual_min_width = footer_command_len(manual_key, "");
+
+    let mut push_if_fits = |key: &'static str, suffix: &'static str, key_style: Style| {
+        let separator_width = if used_width == 0 { 0 } else { 3 };
+        let candidate_width = footer_command_len(key, suffix);
+        // Be aggressive: reserve only enough room for the minimal "[m]" fallback.
+        let required_for_manual = if used_width + separator_width + candidate_width == 0 {
+            manual_min_width
+        } else {
+            3 + manual_min_width
+        };
+        if used_width + separator_width + candidate_width + required_for_manual <= max_width {
+            let _ = try_push_footer_command(
+                &mut spans,
+                &mut used_width,
+                max_width,
+                key,
+                suffix,
+                key_style,
+            );
+        }
+    };
+
+    // Fill by exact fit instead of coarse width buckets.
+    push_if_fits(
+        "Arrows",
+        " nav",
+        ctx.apply(Style::default().fg(ctx.state_info())),
+    );
+    push_if_fits(
+        "[Q]",
+        "uit",
+        ctx.apply(Style::default().fg(ctx.state_error())),
+    );
+    push_if_fits(
+        "[v]",
+        "paste",
+        ctx.apply(Style::default().fg(ctx.accent_teal())),
+    );
+    push_if_fits(
+        "[p]",
+        "ause",
+        ctx.apply(Style::default().fg(ctx.state_success())),
+    );
+    push_if_fits(
+        "[a]",
+        "dd",
+        ctx.apply(Style::default().fg(ctx.state_success())),
+    );
+    push_if_fits(
+        "[d]",
+        "elete",
+        ctx.apply(Style::default().fg(ctx.state_warning())),
+    );
+    push_if_fits(
+        "[s]",
+        "ort",
+        ctx.apply(Style::default().fg(ctx.state_selected())),
+    );
+    push_if_fits(
+        "[t]",
+        "ime",
+        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+    );
+    push_if_fits(
+        "[<]theme[>]",
+        "",
+        ctx.apply(Style::default().fg(ctx.state_selected())),
+    );
+    push_if_fits(
+        "[/]",
+        "search",
+        ctx.apply(Style::default().fg(ctx.state_warning())),
+    );
+    push_if_fits(
+        "[c]",
+        "onfig",
+        ctx.apply(Style::default().fg(ctx.state_complete())),
+    );
+    push_if_fits(
+        "[D]",
+        "elete+data",
+        ctx.apply(Style::default().fg(ctx.state_error())),
+    );
+    push_if_fits(
+        "[x]",
+        "anon",
+        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+    );
+    push_if_fits(
+        "[z]",
+        "power",
+        ctx.apply(Style::default().fg(ctx.state_warning())),
+    );
+    push_if_fits(
+        "[T]",
+        "time++",
+        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+    );
+    push_if_fits(
+        "[[]",
+        "slower",
+        ctx.apply(Style::default().fg(ctx.state_info())),
+    );
+    push_if_fits(
+        "[]]",
+        "faster",
+        ctx.apply(Style::default().fg(ctx.state_success())),
+    );
+
+    // Always try to include manual; degrade to key-only if very tight.
+    if !try_push_footer_command(
+        &mut spans,
+        &mut used_width,
+        max_width,
+        manual_key,
+        manual_suffix,
+        ctx.apply(Style::default().fg(ctx.accent_teal())),
+    ) {
+        let _ = try_push_footer_command(
+            &mut spans,
+            &mut used_width,
+            max_width,
+            manual_key,
+            "anual",
+            ctx.apply(Style::default().fg(ctx.accent_teal())),
+        );
+    }
+    if !spans.iter().any(|s| matches!(s.content.as_ref(), "[m]")) {
+        let _ = try_push_footer_command(
+            &mut spans,
+            &mut used_width,
+            max_width,
+            manual_key,
+            "",
+            ctx.apply(Style::default().fg(ctx.accent_teal())),
+        );
     }
 
     let footer_paragraph = Paragraph::new(Line::from(spans))
@@ -5097,5 +5284,31 @@ mod tests {
         // 3. Wide: all fit
         let (_constraints, indices) = compute_smart_table_layout(&cols, 200, 0);
         assert_eq!(indices.len(), 3, "All columns should fit in 200 width");
+    }
+
+    #[test]
+    fn test_truncate_theme_label_preserves_fx_suffix_when_truncated() {
+        let out = truncate_theme_label_preserving_fx("Bioluminescent Reef", true, 13);
+        assert_eq!(out, "Biolum...[FX]");
+    }
+
+    #[test]
+    fn test_truncate_theme_label_shows_full_fx_label_when_space_allows() {
+        let out = truncate_theme_label_preserving_fx("Bioluminescent Reef", true, 25);
+        assert_eq!(out, "Bioluminescent Reef [FX]");
+    }
+
+    #[test]
+    fn test_footer_left_width_expands_with_terminal_width() {
+        let small = compute_footer_left_width(90, false);
+        let large = compute_footer_left_width(180, false);
+        assert!(large > small, "left footer width should expand on wider terminals");
+    }
+
+    #[test]
+    fn test_footer_left_width_respects_bounds() {
+        assert_eq!(compute_footer_left_width(90, false), 51);
+        assert_eq!(compute_footer_left_width(200, false), 90);
+        assert_eq!(compute_footer_left_width(200, true), 110);
     }
 }

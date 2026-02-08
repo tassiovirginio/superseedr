@@ -2276,6 +2276,12 @@ impl App {
         self.client_configs.torrent_sort_direction = self.app_state.torrent_sort.1;
         self.client_configs.peer_sort_column = self.app_state.peer_sort.0;
         self.client_configs.peer_sort_direction = self.app_state.peer_sort.1;
+        let old_validation_statuses: HashMap<String, bool> = self
+            .client_configs
+            .torrents
+            .iter()
+            .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
+            .collect();
 
         self.client_configs.torrents = self
             .app_state
@@ -2283,10 +2289,15 @@ impl App {
             .values()
             .map(|torrent| {
                 let torrent_state = &torrent.latest_state;
+                let previous_validation_status = old_validation_statuses
+                    .get(&torrent_state.torrent_or_magnet)
+                    .copied()
+                    .unwrap_or(false);
 
                 let final_validation_status = persisted_validation_status_from_piece_completion(
                     torrent_state.number_of_pieces_total,
                     torrent_state.number_of_pieces_completed,
+                    previous_validation_status,
                 );
 
                 TorrentSettings {
@@ -2896,7 +2907,13 @@ impl App {
 fn persisted_validation_status_from_piece_completion(
     total_pieces: u32,
     completed_pieces: u32,
+    previous_validation_status: bool,
 ) -> bool {
+    // Metadata may not be available yet for magnet sessions; preserve prior validation
+    // only for the unknown 0/0 snapshot.
+    if total_pieces == 0 && completed_pieces == 0 {
+        return previous_validation_status;
+    }
     total_pieces > 0 && completed_pieces == total_pieces
 }
 
@@ -3162,16 +3179,24 @@ mod tests {
 
     #[test]
     fn persisted_validation_status_is_true_only_when_complete() {
-        assert!(!persisted_validation_status_from_piece_completion(0, 0));
-        assert!(!persisted_validation_status_from_piece_completion(10, 9));
-        assert!(persisted_validation_status_from_piece_completion(10, 10));
+        assert!(!persisted_validation_status_from_piece_completion(0, 0, false));
+        assert!(!persisted_validation_status_from_piece_completion(10, 9, false));
+        assert!(persisted_validation_status_from_piece_completion(10, 10, false));
     }
 
     #[test]
     fn persisted_validation_status_downgrades_when_incomplete() {
         assert!(
-            !persisted_validation_status_from_piece_completion(10, 8),
+            !persisted_validation_status_from_piece_completion(10, 8, true),
             "Validation status must not stay true once piece completion regresses"
+        );
+    }
+
+    #[test]
+    fn persisted_validation_status_preserves_prior_true_for_metadata_unavailable_snapshot() {
+        assert!(
+            persisted_validation_status_from_piece_completion(0, 0, true),
+            "0/0 snapshot should preserve prior validated status (magnet metadata pending)"
         );
     }
 }
