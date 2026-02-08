@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v0.9.38
+### 🚀 New Features
+- **Expanded Theme Library**: Added a wide set of new built-in themes (including dark and light variants) so users can personalize the TUI much more deeply.
+- **Instant Theme Switching**: You can now cycle themes directly from the keyboard, making visual customization fast and interruption-free.
+- **Enhanced Visual Effects Engine**: Theme effects now animate more dynamically and react more naturally to activity for a more polished live UI feel.
+
+### ✨ Improvements
+- **Footer and Command Bar Clarity**: Footer content now scales and truncates intelligently, keeping update/version/rate/theme info readable on tighter terminal widths.
+- **Swarm/Table Navigation Consistency**: Column visibility, sorting, and header navigation are now synchronized, improving predictability when working with adaptive layouts.
+- **Keyboard Input Flexibility**: Data-rate controls now also accept shifted bracket keys (`{` / `}`), reducing friction across keyboard layouts.
+
+### 🐛 Bug Fixes
+- **Validation Accuracy for Skip-Hashing**: Torrents are no longer marked validated when expected data is missing on disk during skip-hashing flows.
+- **Validation State Persistence**: Magnet/metadata transition edge cases now preserve or downgrade validation state correctly instead of flipping incorrectly.
+- **Theme Config Resilience**: Invalid `ui_theme` config values now safely fall back to defaults instead of causing settings parsing failures.
+
 ## Release v0.9.37
 
 - **Version bump:** fixing github with new macOS flow.
