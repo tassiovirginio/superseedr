@@ -22,6 +22,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::torrent_file::{Torrent, V2RootInfo};
+use crate::torrent_manager::block_manager::BLOCK_SIZE;
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
 use crate::torrent_manager::piece_manager::PieceManager;
 use crate::torrent_manager::piece_manager::PieceStatus;
@@ -555,6 +556,37 @@ impl TorrentState {
                     peer.bytes_uploaded_in_tick = 0;
                 }
 
+                let completed_pieces = self
+                    .piece_manager
+                    .bitfield
+                    .len()
+                    .saturating_sub(self.piece_manager.pieces_remaining);
+                let made_piece_progress = completed_pieces > self.last_completed_pieces_snapshot;
+                if made_piece_progress {
+                    self.last_completed_pieces_snapshot = completed_pieces;
+                    self.last_no_piece_progress_log = self.now;
+                } else if dl_tick > 0
+                    && self.torrent_status != TorrentStatus::Done
+                    && self.now.duration_since(self.last_no_piece_progress_log)
+                        >= Duration::from_secs(15)
+                {
+                    event!(
+                        Level::INFO,
+                        dl_tick_bytes = dl_tick,
+                        connected_peers = self.peers.len(),
+                        completed_pieces = completed_pieces,
+                        total_pieces = self.piece_manager.bitfield.len(),
+                        need_queue_len = self.piece_manager.need_queue.len(),
+                        pending_piece_len = self.piece_manager.pending_queue.len(),
+                        verifying_piece_len = self.verifying_pieces.len(),
+                        pending_blocks_len = self.piece_manager.block_manager.pending_blocks.len(),
+                        v1_assemblers = self.piece_manager.block_manager.legacy_buffers.len(),
+                        bytes_downloaded = self.session_total_downloaded,
+                        "No piece progress despite incoming data"
+                    );
+                    self.last_no_piece_progress_log = self.now;
+                }
+
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: dl_tick,
                     bytes_ul: ul_tick,
@@ -1027,11 +1059,51 @@ impl TorrentState {
                         self.last_activity = TorrentActivity::RequestingPieces;
                     }
 
+                    if self.now.duration_since(self.last_no_piece_progress_log)
+                        >= Duration::from_secs(5)
+                    {
+                        let sample: Vec<String> = request_batch
+                            .iter()
+                            .take(5)
+                            .map(|(p, o, l)| format!("{p}@{o}+{l}"))
+                            .collect();
+                        event!(
+                            Level::INFO,
+                            peer = %peer_id,
+                            req_count = request_batch.len(),
+                            inflight_before = peer.inflight_requests,
+                            available_slots = available_slots,
+                            need_queue_len = self.piece_manager.need_queue.len(),
+                            pending_piece_len = self.piece_manager.pending_queue.len(),
+                            verifying_piece_len = self.verifying_pieces.len(),
+                            sample = %sample.join(","),
+                            "AssignWork issued block requests"
+                        );
+                        self.last_no_piece_progress_log = self.now;
+                    }
+
                     peer.inflight_requests += request_batch.len();
                     effects.push(Effect::SendToPeer {
                         peer_id: peer_id.clone(),
                         cmd: Box::new(TorrentCommand::BulkRequest(request_batch)),
                     });
+                } else if available_slots > 0
+                    && self.now.duration_since(self.last_no_piece_progress_log)
+                        >= Duration::from_secs(5)
+                {
+                    event!(
+                        Level::INFO,
+                        peer = %peer_id,
+                        available_slots = available_slots,
+                        inflight = peer.inflight_requests,
+                        need_queue_len = self.piece_manager.need_queue.len(),
+                        pending_piece_len = self.piece_manager.pending_queue.len(),
+                        verifying_piece_len = self.verifying_pieces.len(),
+                        pending_blocks_len = self.piece_manager.block_manager.pending_blocks.len(),
+                        v1_assemblers = self.piece_manager.block_manager.legacy_buffers.len(),
+                        "AssignWork found no requestable blocks"
+                    );
+                    self.last_no_piece_progress_log = self.now;
                 }
 
                 effects
@@ -1269,6 +1341,14 @@ impl TorrentState {
                     self.piece_manager
                         .handle_block(piece_index, block_offset, &data, piece_size)
                 {
+                    event!(
+                        Level::INFO,
+                        piece = piece_index,
+                        assembled_len = complete_data.len(),
+                        piece_size = piece_size,
+                        peer = %peer_id,
+                        "Piece fully assembled; starting verification"
+                    );
                     // Mark as verifying
                     self.verifying_pieces.insert(piece_index);
 
@@ -1494,6 +1574,13 @@ impl TorrentState {
                 self.v2_pending_data.remove(&piece_index);
 
                 if valid {
+                    event!(
+                        Level::INFO,
+                        piece = piece_index,
+                        peer = %peer_id,
+                        payload_len = data.len(),
+                        "Piece verified OK"
+                    );
                     if self.piece_manager.bitfield.get(piece_index as usize)
                         == Some(&PieceStatus::Done)
                     {
@@ -1513,6 +1600,12 @@ impl TorrentState {
                         });
                     }
                 } else {
+                    event!(
+                        Level::INFO,
+                        piece = piece_index,
+                        peer = %peer_id,
+                        "Piece verification FAILED; resetting assembly and disconnecting peer"
+                    );
                     self.piece_manager.reset_piece_assembly(piece_index);
                     effects.push(Effect::DisconnectPeer { peer_id });
                 }
@@ -1546,8 +1639,21 @@ impl TorrentState {
 
                 // ACTUAL STATE CHANGE
                 let peers_to_cancel = self.piece_manager.mark_as_complete(piece_index);
+                self.piece_write_failures.remove(&piece_index);
 
                 effects.push(Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished));
+                event!(
+                    Level::INFO,
+                    piece = piece_index,
+                    peers_cancelled = peers_to_cancel.len(),
+                    completed = self
+                        .piece_manager
+                        .bitfield
+                        .len()
+                        .saturating_sub(self.piece_manager.pieces_remaining),
+                    total = self.piece_manager.bitfield.len(),
+                    "Piece write committed to disk"
+                );
 
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.pending_requests.remove(&piece_index);
@@ -1602,6 +1708,19 @@ impl TorrentState {
                 if piece_index as usize >= self.piece_manager.bitfield.len() {
                     return vec![Effect::DoNothing];
                 }
+                let failure_count = self
+                    .piece_write_failures
+                    .entry(piece_index)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+                event!(
+                    Level::INFO,
+                    piece = piece_index,
+                    failures = *failure_count,
+                    connected_peers = self.peers.len(),
+                    verifying = self.verifying_pieces.contains(&piece_index),
+                    "Piece write failed; requeueing piece"
+                );
                 self.piece_manager.requeue_pending_to_need(piece_index);
                 vec![Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished)]
             }
@@ -1757,6 +1876,15 @@ impl TorrentState {
                     total_len,
                     piece_overrides,
                     self.torrent_validation_status,
+                );
+                event!(
+                    Level::INFO,
+                    piece_length = torrent.info.piece_length,
+                    block_size = BLOCK_SIZE,
+                    modulo = (torrent.info.piece_length as i64).rem_euclid(BLOCK_SIZE as i64),
+                    total_pieces = num_pieces,
+                    total_len = total_len,
+                    "Metadata geometry loaded"
                 );
                 if !self.file_priorities.is_empty() {
                     let priorities = self.calculate_piece_priorities(&self.file_priorities);
@@ -3427,6 +3555,585 @@ mod tests {
         } else {
             panic!("No request sent for partial piece");
         }
+    }
+
+    #[test]
+    fn test_assign_work_non_aligned_boundary_piece_identity() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        assert!(!requests.is_empty(), "Expected at least one boundary request");
+        assert!(
+            requests.iter().all(|(idx, _, _)| *idx == 1),
+            "All requests must target piece 1, got {:?}",
+            requests
+        );
+    }
+
+    #[test]
+    fn test_assign_work_non_aligned_boundary_offsets_for_piece() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        let mut piece_1_offsets: Vec<(u32, u32)> = requests
+            .iter()
+            .filter(|(idx, _, _)| *idx == 1)
+            .map(|(_, begin, len)| (*begin, *len))
+            .collect();
+        piece_1_offsets.sort_unstable();
+
+        assert_eq!(
+            piece_1_offsets,
+            vec![(0, 16_384), (16_384, 3_616)],
+            "Piece-1 requests must follow piece-local geometry exactly"
+        );
+    }
+
+    #[test]
+    fn test_incoming_block_non_aligned_updates_correct_piece_assembler() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        for (piece_index, block_offset, length) in requests {
+            let _ = state.update(Action::IncomingBlock {
+                peer_id: "target_peer".to_string(),
+                piece_index,
+                block_offset,
+                data: vec![0u8; length as usize],
+            });
+        }
+
+        assert!(
+            !state.piece_manager.block_manager.legacy_buffers.contains_key(&0),
+            "Assembler for piece 0 should remain untouched while downloading piece 1"
+        );
+        assert!(
+            state.piece_manager.block_manager.legacy_buffers.contains_key(&1),
+            "Assembler for piece 1 must exist after receiving piece-1 requests"
+        );
+    }
+
+    #[test]
+    fn test_restart_resume_non_aligned_requests_only_missing_blocks() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        // Receive one valid piece-1 block before "restart".
+        let _ = state.update(Action::IncomingBlock {
+            peer_id: "target_peer".to_string(),
+            piece_index: 1,
+            block_offset: 0,
+            data: vec![0u8; 16_384],
+        });
+
+        // Simulate restart/re-assign cycle while keeping assembled state.
+        let effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            requests,
+            vec![(1, 16_384, 3_616)],
+            "Resume must request only the remaining piece-1 boundary block"
+        );
+    }
+
+    #[test]
+    fn test_non_aligned_verify_fail_requeue_clears_exact_piece_state() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state
+            .piece_manager
+            .block_manager
+            .commit_v1_piece(0);
+        state.piece_manager.mark_as_pending(1, "target_peer".to_string());
+
+        let _ = state.update(Action::PieceVerified {
+            peer_id: "target_peer".to_string(),
+            piece_index: 1,
+            valid: false,
+            data: vec![],
+        });
+
+        assert!(
+            state.piece_manager.block_manager.is_piece_complete(0),
+            "Piece 0 completion state must remain unchanged"
+        );
+        assert!(
+            !state.piece_manager.block_manager.is_piece_complete(1),
+            "Piece 1 must be requeued and incomplete after verification failure"
+        );
+    }
+
+    #[test]
+    fn test_assign_work_non_aligned_no_zero_or_oversize_block_requests() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        assert!(!requests.is_empty(), "Expected request batch");
+        for (piece_index, begin, len) in requests {
+            assert!(len > 0, "Zero-length request is invalid");
+            assert_eq!(
+                piece_index, 1,
+                "Boundary request must remain in target piece namespace"
+            );
+            assert!(
+                begin + len <= 20_000,
+                "Request exceeds piece boundary: begin={} len={}",
+                begin,
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_aligned_full_piece_download_emits_verify_for_target_piece() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "target_peer");
+        let peer = state.peers.get_mut("target_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "target_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let mut effects = state.update(Action::AssignWork {
+            peer_id: "target_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        for (piece_index, block_offset, length) in requests {
+            effects = state.update(Action::IncomingBlock {
+                peer_id: "target_peer".to_string(),
+                piece_index,
+                block_offset,
+                data: vec![0u8; length as usize],
+            });
+        }
+
+        let verify_piece_1 = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::VerifyPiece {
+                    piece_index: 1,
+                    ..
+                }
+            )
+        });
+        assert!(
+            verify_piece_1,
+            "Completing target non-aligned piece should emit VerifyPiece for piece 1"
+        );
+    }
+
+    #[test]
+    fn test_assign_work_tiny_piece_keeps_target_piece_identity() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 1_024;
+        torrent.info.length = 2_048;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            1_024,
+            2_048,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        state.piece_manager.need_queue.clear();
+        state.piece_manager.pending_queue.clear();
+
+        add_peer(&mut state, "tiny_peer");
+        let peer = state.peers.get_mut("tiny_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.am_interested = true;
+
+        state
+            .piece_manager
+            .mark_as_pending(1, "tiny_peer".to_string());
+        peer.pending_requests.insert(1);
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "tiny_peer".to_string(),
+        });
+
+        let requests: Vec<(u32, u32, u32)> = effects
+            .iter()
+            .filter_map(|e| {
+                if let Effect::SendToPeer { cmd, .. } = e {
+                    if let TorrentCommand::BulkRequest(reqs) = &**cmd {
+                        return Some(reqs.clone());
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            requests,
+            vec![(1, 0, 1_024)],
+            "Tiny-piece request should stay in piece-local namespace"
+        );
+    }
+
+    #[test]
+    fn test_multi_file_non_aligned_priority_boundary_mixed_piece_not_skipped() {
+        let mut state = create_empty_state();
+        let piece_len = 20_000;
+
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = piece_len;
+        torrent.info.length = 40_000;
+        torrent.info.files = vec![
+            crate::torrent_file::InfoFile {
+                length: 18_000, // Entirely in piece 0
+                path: vec!["A.bin".into()],
+                md5sum: None,
+                attr: None,
+            },
+            crate::torrent_file::InfoFile {
+                length: 22_000, // Crosses piece boundary into piece 1
+                path: vec!["B.bin".into()],
+                md5sum: None,
+                attr: None,
+            },
+        ];
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+
+        let mut priorities = HashMap::new();
+        priorities.insert(0, FilePriority::Skip); // Skip file A only.
+
+        let p = state.calculate_piece_priorities(&priorities);
+
+        assert_eq!(
+            p[0],
+            EffectivePiecePriority::Normal,
+            "Piece 0 spans skipped and non-skipped files and must not be skipped"
+        );
+        assert_eq!(
+            p[1],
+            EffectivePiecePriority::Normal,
+            "Piece 1 belongs to non-skipped file and must remain normal"
+        );
+    }
+
+    #[test]
+    fn test_non_aligned_choke_disconnect_requeues_without_ghost_pending() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(2);
+        torrent.info.piece_length = 20_000;
+        torrent.info.length = 40_000;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(2, false);
+        state.piece_manager.block_manager.set_geometry(
+            20_000,
+            40_000,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+
+        add_peer(&mut state, "race_peer");
+        let peer = state.peers.get_mut("race_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true, true];
+        peer.pending_requests.insert(1);
+        state
+            .piece_manager
+            .mark_as_pending(1, "race_peer".to_string());
+
+        let _ = state.update(Action::PeerChoked {
+            peer_id: "race_peer".to_string(),
+        });
+        let _ = state.update(Action::PeerDisconnected {
+            peer_id: "race_peer".to_string(),
+            force: true,
+        });
+
+        assert!(
+            !state.piece_manager.pending_queue.contains_key(&1),
+            "Pending queue should be cleared for disconnected/choked peer"
+        );
+        assert!(
+            state.piece_manager.need_queue.contains(&1),
+            "Piece must be requeued after choke/disconnect race"
+        );
+        assert!(
+            !state.peers.contains_key("race_peer"),
+            "Peer should be removed after disconnect"
+        );
     }
 
     #[test]

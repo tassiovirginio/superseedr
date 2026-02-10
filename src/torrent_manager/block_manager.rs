@@ -580,6 +580,32 @@ mod tests {
     }
 
     #[test]
+    fn test_non_aligned_adjacent_piece_completion_independence() {
+        // This captures the boundary-aliasing risk when piece length is not block-aligned.
+        let piece_len = 20_000;
+        let total_len = 40_000;
+        let mut manager = setup_manager(piece_len, total_len);
+
+        // Mark piece 0 complete first (sets global blocks 0 and 1).
+        manager.commit_v1_piece(0);
+        assert!(
+            !manager.is_piece_complete(1),
+            "Piece 1 must not be complete after only piece 0 has been committed"
+        );
+
+        // Simulate receiving the second global block for piece 1's range.
+        let addr = manager.inflate_address(2);
+        let _ = manager.commit_verified_block(addr);
+
+        // Expected behavior: still incomplete, because the initial bytes of piece 1 were never received
+        // in piece-1-local space.
+        assert!(
+            !manager.is_piece_complete(1),
+            "Piece 1 should not be marked complete via shared global boundary blocks alone"
+        );
+    }
+
+    #[test]
     fn test_decision_routing_v1_only() {
         let mut bm = BlockManager::new();
         // V1 Setup: No V2 file info provided
