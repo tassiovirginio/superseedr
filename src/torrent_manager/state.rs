@@ -871,6 +871,7 @@ impl TorrentState {
 
                 let mut pending_pieces: Vec<u32> = peer.pending_requests.iter().cloned().collect();
                 pending_pieces.sort();
+                let non_aligned_grid = self.piece_manager.block_manager.is_non_aligned_piece_grid();
 
                 for piece_index in pending_pieces {
                     if available_slots == 0 {
@@ -879,10 +880,10 @@ impl TorrentState {
                     if self.verifying_pieces.contains(&piece_index) {
                         continue;
                     }
-                    let (start, end) = self
+                    let block_addrs = self
                         .piece_manager
                         .block_manager
-                        .get_block_range(piece_index);
+                        .piece_block_addresses(piece_index);
                     let assembler_mask = self
                         .piece_manager
                         .block_manager
@@ -890,33 +891,29 @@ impl TorrentState {
                         .get(&piece_index)
                         .map(|a| a.mask.clone());
 
-                    for global_block_idx in start..end {
+                    for addr in block_addrs {
                         if available_slots == 0 {
                             break;
                         }
 
-                        if self
-                            .piece_manager
-                            .block_manager
-                            .block_bitfield
-                            .get(global_block_idx as usize)
-                            == Some(&true)
+                        let global_block_idx = self.piece_manager.block_manager.flatten_address(addr);
+                        if !non_aligned_grid
+                            && self
+                                .piece_manager
+                                .block_manager
+                                .block_bitfield
+                                .get(global_block_idx as usize)
+                                == Some(&true)
                         {
                             continue;
                         }
 
                         // Is it buffered?
-                        let local_block_idx = global_block_idx - start;
                         if let Some(mask) = &assembler_mask {
-                            if mask.get(local_block_idx as usize) == Some(&true) {
+                            if mask.get(addr.block_index as usize) == Some(&true) {
                                 continue;
                             }
                         }
-
-                        let addr = self
-                            .piece_manager
-                            .block_manager
-                            .inflate_address(global_block_idx);
 
                         let final_len = if let Some(limit) = calc_v2_limit(addr.piece_index) {
                             let remaining = limit.saturating_sub(addr.byte_offset);
@@ -1002,10 +999,10 @@ impl TorrentState {
                     }
 
                     // --- B. Generate Block Requests ---
-                    let (start, end) = self
+                    let block_addrs = self
                         .piece_manager
                         .block_manager
-                        .get_block_range(piece_index);
+                        .piece_block_addresses(piece_index);
                     let assembler_mask = self
                         .piece_manager
                         .block_manager
@@ -1013,32 +1010,28 @@ impl TorrentState {
                         .get(&piece_index)
                         .map(|a| a.mask.clone());
 
-                    for global_block_idx in start..end {
+                    for addr in block_addrs {
                         if available_slots == 0 {
                             break;
                         }
 
-                        if self
-                            .piece_manager
-                            .block_manager
-                            .block_bitfield
-                            .get(global_block_idx as usize)
-                            == Some(&true)
+                        let global_block_idx = self.piece_manager.block_manager.flatten_address(addr);
+                        if !non_aligned_grid
+                            && self
+                                .piece_manager
+                                .block_manager
+                                .block_bitfield
+                                .get(global_block_idx as usize)
+                                == Some(&true)
                         {
                             continue;
                         }
 
-                        let local_block_idx = global_block_idx - start;
                         if let Some(mask) = &assembler_mask {
-                            if mask.get(local_block_idx as usize) == Some(&true) {
+                            if mask.get(addr.block_index as usize) == Some(&true) {
                                 continue;
                             }
                         }
-
-                        let addr = self
-                            .piece_manager
-                            .block_manager
-                            .inflate_address(global_block_idx);
 
                         let final_len = if let Some(limit) = calc_v2_limit(addr.piece_index) {
                             let remaining = limit.saturating_sub(addr.byte_offset);
@@ -1687,16 +1680,12 @@ impl TorrentState {
                         if let Some(peer) = self.peers.get_mut(&other_peer) {
                             peer.pending_requests.remove(&piece_index);
                             // ... cancellation construction ...
-                            let (start, end) = self
+                            let block_addrs = self
                                 .piece_manager
                                 .block_manager
-                                .get_block_range(piece_index);
+                                .piece_block_addresses(piece_index);
                             let mut batch = Vec::new();
-                            for global_block_idx in start..end {
-                                let addr = self
-                                    .piece_manager
-                                    .block_manager
-                                    .inflate_address(global_block_idx);
+                            for addr in block_addrs {
                                 batch.push((addr.piece_index, addr.byte_offset, addr.length));
                             }
                             if !batch.is_empty() {
@@ -3879,12 +3868,22 @@ mod tests {
             .flatten()
             .collect();
 
+        let mut saw_verify_piece_1 = false;
         for (piece_index, block_offset, length) in requests {
-            let _ = state.update(Action::IncomingBlock {
+            let effects = state.update(Action::IncomingBlock {
                 peer_id: "target_peer".to_string(),
                 piece_index,
                 block_offset,
                 data: vec![0u8; length as usize],
+            });
+            saw_verify_piece_1 |= effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::VerifyPiece {
+                        piece_index: 1,
+                        ..
+                    }
+                )
             });
         }
 
@@ -3892,9 +3891,11 @@ mod tests {
             !state.piece_manager.block_manager.legacy_buffers.contains_key(&0),
             "Assembler for piece 0 should remain untouched while downloading piece 1"
         );
+        // Piece 1 may either still be buffering or already have emitted verification and cleared buffer.
+        let piece_1_buffering = state.piece_manager.block_manager.legacy_buffers.contains_key(&1);
         assert!(
-            state.piece_manager.block_manager.legacy_buffers.contains_key(&1),
-            "Assembler for piece 1 must exist after receiving piece-1 requests"
+            piece_1_buffering || saw_verify_piece_1,
+            "Piece 1 must either buffer in its own assembler or reach verification"
         );
     }
 
@@ -3938,7 +3939,13 @@ mod tests {
             data: vec![0u8; 16_384],
         });
 
-        // Simulate restart/re-assign cycle while keeping assembled state.
+        // Simulate restart: session-level inflight/active state should be cleared.
+        if let Some(peer_after_restart) = state.peers.get_mut("target_peer") {
+            peer_after_restart.inflight_requests = 0;
+            peer_after_restart.active_blocks.clear();
+        }
+
+        // Re-assign after restart.
         let effects = state.update(Action::AssignWork {
             peer_id: "target_peer".to_string(),
         });
@@ -9701,6 +9708,8 @@ mod integration_tests {
 
                                     let mut rep = vec![6];
                                     rep.extend_from_slice(&index.to_be_bytes());
+                                    rep.extend_from_slice(&begin.to_be_bytes());
+                                    rep.extend_from_slice(&req_len.to_be_bytes());
                                     let _ = tx_events.try_send(rep);
 
                                     if upload_delay.as_millis() > 0 {
@@ -9716,6 +9725,20 @@ mod integration_tests {
                                     resp.extend_from_slice(&begin.to_be_bytes());
                                     resp.extend_from_slice(&data);
                                     let _ = wr.write_all(&resp).await;
+                                }
+                                8 => {
+                                    // Cancel
+                                    let index =
+                                        u32::from_be_bytes(msg_frame[1..5].try_into().unwrap());
+                                    let begin =
+                                        u32::from_be_bytes(msg_frame[5..9].try_into().unwrap());
+                                    let req_len =
+                                        u32::from_be_bytes(msg_frame[9..13].try_into().unwrap());
+                                    let mut rep = vec![8];
+                                    rep.extend_from_slice(&index.to_be_bytes());
+                                    rep.extend_from_slice(&begin.to_be_bytes());
+                                    rep.extend_from_slice(&req_len.to_be_bytes());
+                                    let _ = tx_events.try_send(rep);
                                 }
                                 _ => {}
                             }
@@ -10018,6 +10041,224 @@ mod integration_tests {
         assert!(
             success,
             "Tiny piece-length torrent failed to complete in bounded time"
+        );
+    }
+
+    fn decode_triplet_event(msg: &[u8], expected_kind: u8) -> Option<(u32, u32, u32)> {
+        if msg.len() < 13 || msg[0] != expected_kind {
+            return None;
+        }
+        let idx = u32::from_be_bytes(msg[1..5].try_into().ok()?);
+        let begin = u32::from_be_bytes(msg[5..9].try_into().ok()?);
+        let len = u32::from_be_bytes(msg[9..13].try_into().ok()?);
+        Some((idx, begin, len))
+    }
+
+    #[tokio::test]
+    async fn test_non_aligned_request_identity_emits_piece_local_requests() {
+        let temp_dir = std::env::temp_dir().join("superseedr_req_identity_non_aligned");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let num_pieces = 2;
+        let piece_size = 20_000;
+        let (mut manager, cmd_tx, _res) =
+            create_manager_harness("ReqIdentityNonAligned", num_pieces, piece_size, temp_dir.clone());
+
+        let (mut rx_events, _ctrl) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(0)).await;
+
+        let manager_handle = tokio::spawn(async move {
+            let _ = manager.run(false).await;
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut reqs = Vec::new();
+
+        while start.elapsed() < timeout && reqs.len() < 4 {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx_events.recv()).await
+            {
+                if let Some(t) = decode_triplet_event(&msg, 6) {
+                    reqs.push(t);
+                }
+            }
+        }
+
+        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
+        let _ = manager_handle.await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(!reqs.is_empty(), "Expected request tuples from peer");
+        let piece0: Vec<(u32, u32)> = reqs
+            .iter()
+            .filter(|(idx, _, _)| *idx == 0)
+            .map(|(_, begin, len)| (*begin, *len))
+            .collect();
+        let piece1: Vec<(u32, u32)> = reqs
+            .iter()
+            .filter(|(idx, _, _)| *idx == 1)
+            .map(|(_, begin, len)| (*begin, *len))
+            .collect();
+
+        assert!(
+            !piece0.is_empty() && !piece1.is_empty(),
+            "Expected requests for both pieces, got {:?}",
+            reqs
+        );
+        assert!(
+            piece0.contains(&(0, 16_384)) && piece0.contains(&(16_384, 3_616)),
+            "Piece 0 requests must be piece-local for non-aligned geometry: {:?}",
+            piece0
+        );
+        assert!(
+            piece1.contains(&(0, 16_384)) && piece1.contains(&(16_384, 3_616)),
+            "Piece 1 requests must be piece-local for non-aligned geometry: {:?}",
+            piece1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aligned_request_identity_emits_piece_local_requests() {
+        let temp_dir = std::env::temp_dir().join("superseedr_req_identity_aligned");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let num_pieces = 2;
+        let piece_size = 16_384;
+        let (mut manager, cmd_tx, _res) =
+            create_manager_harness("ReqIdentityAligned", num_pieces, piece_size, temp_dir.clone());
+
+        let (mut rx_events, _ctrl) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(0)).await;
+
+        let manager_handle = tokio::spawn(async move {
+            let _ = manager.run(false).await;
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut reqs = Vec::new();
+
+        while start.elapsed() < timeout && reqs.len() < 2 {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx_events.recv()).await
+            {
+                if let Some(t) = decode_triplet_event(&msg, 6) {
+                    reqs.push(t);
+                }
+            }
+        }
+
+        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
+        let _ = manager_handle.await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(
+            reqs.contains(&(0, 0, 16_384)) && reqs.contains(&(1, 0, 16_384)),
+            "Aligned requests must remain piece-local: {:?}",
+            reqs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_aligned_cancel_identity_emits_piece_local_cancels() {
+        let temp_dir = std::env::temp_dir().join("superseedr_cancel_identity_non_aligned");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let num_pieces = 1;
+        let piece_size = 20_000;
+        let (mut manager, cmd_tx, _res) =
+            create_manager_harness("CancelIdentityNonAligned", num_pieces, piece_size, temp_dir.clone());
+
+        let (_rx_fast, _ctrl_fast) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(0)).await;
+        let (mut rx_slow, _ctrl_slow) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(50)).await;
+
+        let manager_handle = tokio::spawn(async move {
+            let _ = manager.run(false).await;
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(8);
+        let mut cancels = Vec::new();
+
+        while start.elapsed() < timeout {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), rx_slow.recv()).await
+            {
+                if let Some(t) = decode_triplet_event(&msg, 8) {
+                    cancels.push(t);
+                    if cancels.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
+        let _ = manager_handle.await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(!cancels.is_empty(), "Expected at least one cancel tuple");
+        assert!(
+            cancels.iter().all(|(idx, _, _)| *idx == 0),
+            "Cancels must stay in piece-local namespace for non-aligned case: {:?}",
+            cancels
+        );
+        assert!(
+            cancels.contains(&(0, 0, 16_384)) || cancels.contains(&(0, 16_384, 3_616)),
+            "Expected non-aligned piece-local cancel tuples, got {:?}",
+            cancels
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aligned_cancel_identity_emits_piece_local_cancels() {
+        let temp_dir = std::env::temp_dir().join("superseedr_cancel_identity_aligned");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let num_pieces = 1;
+        let piece_size = 16_384;
+        let (mut manager, cmd_tx, _res) =
+            create_manager_harness("CancelIdentityAligned", num_pieces, piece_size, temp_dir.clone());
+
+        let (_rx_fast, _ctrl_fast) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(0)).await;
+        let (mut rx_slow, _ctrl_slow) =
+            spawn_mock_peer(&mut manager, full_bitfield(num_pieces), std::time::Duration::from_millis(50)).await;
+
+        let manager_handle = tokio::spawn(async move {
+            let _ = manager.run(false).await;
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(8);
+        let mut cancels = Vec::new();
+
+        while start.elapsed() < timeout {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), rx_slow.recv()).await
+            {
+                if let Some(t) = decode_triplet_event(&msg, 8) {
+                    cancels.push(t);
+                    break;
+                }
+            }
+        }
+
+        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
+        let _ = manager_handle.await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(
+            cancels.contains(&(0, 0, 16_384)),
+            "Aligned cancel must use exact piece-local tuple: {:?}",
+            cancels
         );
     }
 }
