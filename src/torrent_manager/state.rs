@@ -879,10 +879,10 @@ impl TorrentState {
                     if self.verifying_pieces.contains(&piece_index) {
                         continue;
                     }
-                    let (start, end) = self
+                    let block_addrs = self
                         .piece_manager
                         .block_manager
-                        .get_block_range(piece_index);
+                        .piece_block_addresses(piece_index);
                     let assembler_mask = self
                         .piece_manager
                         .block_manager
@@ -890,11 +890,12 @@ impl TorrentState {
                         .get(&piece_index)
                         .map(|a| a.mask.clone());
 
-                    for global_block_idx in start..end {
+                    for addr in block_addrs {
                         if available_slots == 0 {
                             break;
                         }
 
+                        let global_block_idx = self.piece_manager.block_manager.flatten_address(addr);
                         if self
                             .piece_manager
                             .block_manager
@@ -906,17 +907,11 @@ impl TorrentState {
                         }
 
                         // Is it buffered?
-                        let local_block_idx = global_block_idx - start;
                         if let Some(mask) = &assembler_mask {
-                            if mask.get(local_block_idx as usize) == Some(&true) {
+                            if mask.get(addr.block_index as usize) == Some(&true) {
                                 continue;
                             }
                         }
-
-                        let addr = self
-                            .piece_manager
-                            .block_manager
-                            .inflate_address(global_block_idx);
 
                         let final_len = if let Some(limit) = calc_v2_limit(addr.piece_index) {
                             let remaining = limit.saturating_sub(addr.byte_offset);
@@ -1002,10 +997,10 @@ impl TorrentState {
                     }
 
                     // --- B. Generate Block Requests ---
-                    let (start, end) = self
+                    let block_addrs = self
                         .piece_manager
                         .block_manager
-                        .get_block_range(piece_index);
+                        .piece_block_addresses(piece_index);
                     let assembler_mask = self
                         .piece_manager
                         .block_manager
@@ -1013,11 +1008,12 @@ impl TorrentState {
                         .get(&piece_index)
                         .map(|a| a.mask.clone());
 
-                    for global_block_idx in start..end {
+                    for addr in block_addrs {
                         if available_slots == 0 {
                             break;
                         }
 
+                        let global_block_idx = self.piece_manager.block_manager.flatten_address(addr);
                         if self
                             .piece_manager
                             .block_manager
@@ -1028,17 +1024,11 @@ impl TorrentState {
                             continue;
                         }
 
-                        let local_block_idx = global_block_idx - start;
                         if let Some(mask) = &assembler_mask {
-                            if mask.get(local_block_idx as usize) == Some(&true) {
+                            if mask.get(addr.block_index as usize) == Some(&true) {
                                 continue;
                             }
                         }
-
-                        let addr = self
-                            .piece_manager
-                            .block_manager
-                            .inflate_address(global_block_idx);
 
                         let final_len = if let Some(limit) = calc_v2_limit(addr.piece_index) {
                             let remaining = limit.saturating_sub(addr.byte_offset);
@@ -1687,16 +1677,12 @@ impl TorrentState {
                         if let Some(peer) = self.peers.get_mut(&other_peer) {
                             peer.pending_requests.remove(&piece_index);
                             // ... cancellation construction ...
-                            let (start, end) = self
+                            let block_addrs = self
                                 .piece_manager
                                 .block_manager
-                                .get_block_range(piece_index);
+                                .piece_block_addresses(piece_index);
                             let mut batch = Vec::new();
-                            for global_block_idx in start..end {
-                                let addr = self
-                                    .piece_manager
-                                    .block_manager
-                                    .inflate_address(global_block_idx);
+                            for addr in block_addrs {
                                 batch.push((addr.piece_index, addr.byte_offset, addr.length));
                             }
                             if !batch.is_empty() {
@@ -3999,10 +3985,7 @@ mod tests {
         );
         state.torrent_status = TorrentStatus::Standard;
 
-        state
-            .piece_manager
-            .block_manager
-            .commit_v1_piece(0);
+        state.piece_manager.mark_as_complete(0);
         state.piece_manager.mark_as_pending(1, "target_peer".to_string());
 
         let _ = state.update(Action::PieceVerified {
@@ -4013,11 +3996,11 @@ mod tests {
         });
 
         assert!(
-            state.piece_manager.block_manager.is_piece_complete(0),
+            state.piece_manager.bitfield.get(0) == Some(&PieceStatus::Done),
             "Piece 0 completion state must remain unchanged"
         );
         assert!(
-            !state.piece_manager.block_manager.is_piece_complete(1),
+            state.piece_manager.bitfield.get(1) == Some(&PieceStatus::Need),
             "Piece 1 must be requeued and incomplete after verification failure"
         );
     }

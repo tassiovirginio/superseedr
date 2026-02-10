@@ -245,6 +245,34 @@ impl BlockManager {
         (actual_start_blk, end_blk)
     }
 
+    pub fn is_non_aligned_piece_grid(&self) -> bool {
+        self.piece_length != 0 && self.piece_length % BLOCK_SIZE != 0
+    }
+
+    pub fn piece_block_addresses(&self, piece_index: u32) -> Vec<BlockAddress> {
+        let piece_len = self.calculate_piece_size(piece_index);
+        if piece_len == 0 {
+            return Vec::new();
+        }
+
+        let block_count = self.blocks_in_piece(piece_len);
+        let mut out = Vec::with_capacity(block_count as usize);
+        for block_index in 0..block_count {
+            let byte_offset = block_index * BLOCK_SIZE;
+            let length = std::cmp::min(BLOCK_SIZE, piece_len.saturating_sub(byte_offset));
+            if length == 0 {
+                continue;
+            }
+            if let Some(addr) =
+                self.inflate_address_from_overlay(piece_index, byte_offset, length)
+            {
+                out.push(addr);
+            }
+        }
+
+        out
+    }
+
     fn calculate_piece_size(&self, piece_idx: u32) -> u32 {
         if let Some(&len) = self.piece_lengths.get(&piece_idx) {
             return len;
@@ -279,6 +307,12 @@ impl BlockManager {
     }
 
     pub fn is_piece_complete(&self, piece_index: u32) -> bool {
+        // On non-aligned piece grids, global 16KiB blocks can overlap adjacent pieces,
+        // so block-bitfield-only completion checks are ambiguous.
+        if self.is_non_aligned_piece_grid() {
+            return false;
+        }
+
         let (start, end) = self.get_block_range(piece_index);
         for i in start..end {
             if !self
