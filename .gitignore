@@ -6,6 +6,7 @@
 # --- local temp---
 tmp
 *.tmp
+integration_tests/test_output/
 
 # --- macOS ---
 .DS_Store

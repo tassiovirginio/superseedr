@@ -1,0 +1,204 @@
+client_id = "-SS1000-7bpSAwkTK6kP"
+client_port = 6681
+lifetime_downloaded = 0
+lifetime_uploaded = 0
+private_client = false
+torrent_sort_column = "Up"
+torrent_sort_direction = "Ascending"
+peer_sort_column = "UL"
+peer_sort_direction = "Ascending"
+ui_theme = "catppuccin_mocha"
+default_download_folder = "/Users/jagatranvo/Downloads"
+max_connected_peers = 2000
+bootstrap_nodes = [
+    "router.utorrent.com:6881",
+    "router.bittorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+    "router.cococorp.de:6881",
+]
+global_download_limit_bps = 0
+global_upload_limit_bps = 0
+max_concurrent_validations = 64
+connection_attempt_permits = 50
+upload_slots = 8
+peer_upload_in_flight_limit = 4
+tracker_fallback_interval_secs = 1800
+client_leeching_fallback_interval_secs = 60
+output_status_interval = 0
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/single_4k.bin.torrent"
+name = "single_4k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/single_8k.bin.torrent"
+name = "single_8k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/single_16k.bin.torrent"
+name = "single_16k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/single_25k.bin.torrent"
+name = "single_25k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/multi_file.torrent"
+name = "multi_file"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/multi_file"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v1/nested.torrent"
+name = "nested"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v1/nested"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v2/single_4k.bin.torrent"
+name = "single_4k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v2/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v2/single_8k.bin.torrent"
+name = "single_8k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v2/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v2/single_16k.bin.torrent"
+name = "single_16k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v2/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v2/multi_file.torrent"
+name = "multi_file"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v2/multi_file"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/v2/nested.torrent"
+name = "nested"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/v2/nested"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/hybrid/single_4k.bin.torrent"
+name = "single_4k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/hybrid/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/hybrid/single_8k.bin.torrent"
+name = "single_8k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/hybrid/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/hybrid/single_16k.bin.torrent"
+name = "single_16k.bin"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/hybrid/single"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/hybrid/multi_file.torrent"
+name = "multi_file"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/hybrid/multi_file"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
+
+[[torrents]]
+torrent_or_magnet = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/torrents/hybrid/nested.torrent"
+name = "nested"
+validation_status = false
+download_path = "/Users/jagatranvo/Projects/Rust/superseedr/integration_tests/test_output/hybrid/nested"
+container_name = ""
+torrent_control_state = "Running"
+
+[torrents.file_priorities]
+0 = "Normal"
