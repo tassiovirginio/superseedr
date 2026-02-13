@@ -1,6 +1,9 @@
 name: Integration Interop
 
 on:
+  push:
+    branches:
+      - develop
   workflow_dispatch:
     inputs:
       mode:
@@ -17,7 +20,6 @@ on:
 jobs:
   interop:
     name: Interop (${{ matrix.mode }})
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'all' || github.event.inputs.mode == matrix.mode
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -45,18 +47,24 @@ jobs:
         run: |
           if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "all" ]; then
             echo "mode=${{ matrix.mode }}" >> "$GITHUB_OUTPUT"
-          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$INPUT_MODE" = "${{ matrix.mode }}" ]; then
             echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=${{ matrix.mode }}" >> "$GITHUB_OUTPUT"
+            echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run interop harness
+        if: steps.select_mode.outputs.run == 'true'
         env:
           INTEROP_TIMEOUT_SECS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.timeout_secs || '300' }}
         run: |
           ./integration_tests/run_interop.sh "${{ steps.select_mode.outputs.mode }}"
 
       - name: Upload interop artifacts
-        if: always()
+        if: always() && steps.select_mode.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: interop-artifacts-${{ matrix.mode }}-${{ github.run_id }}
