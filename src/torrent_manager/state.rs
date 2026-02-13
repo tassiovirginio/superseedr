@@ -7926,7 +7926,7 @@ mod prop_tests {
                 let file_piece_count = len.div_ceil(piece_len) as usize;
                 let mut layer_bytes = Vec::with_capacity(file_piece_count.saturating_mul(32));
                 for layer_idx in 0..file_piece_count {
-                    layer_bytes.extend_from_slice(&vec![(layer_idx as u8).wrapping_add(11); 32]);
+                    layer_bytes.extend_from_slice(&[(layer_idx as u8).wrapping_add(11); 32]);
                 }
 
                 layers.insert(root_hash.clone(), Value::Bytes(layer_bytes));
@@ -8147,8 +8147,8 @@ mod prop_tests {
         if cfg.safety_net_peer {
             for (peer_idx, peer_id) in peer_ids.iter().enumerate() {
                 if let Some(bits) = peer_bitfields_bool.get_mut(peer_id) {
-                    for piece_idx in 0..num_pieces {
-                        bits[piece_idx] = peer_idx == 0 || rng.random_bool(0.5);
+                    for has_piece in bits.iter_mut().take(num_pieces) {
+                        *has_piece = peer_idx == 0 || rng.random_bool(0.5);
                     }
                 }
             }
@@ -8159,10 +8159,10 @@ mod prop_tests {
                     .get_mut(&peer_ids[primary])
                     .expect("primary peer must exist")[piece_idx] = true;
 
-                for peer_idx in 0..peer_count {
+                for peer_id in peer_ids.iter().take(peer_count) {
                     if rng.random_bool(0.2) {
                         peer_bitfields_bool
-                            .get_mut(&peer_ids[peer_idx])
+                            .get_mut(peer_id)
                             .expect("peer must exist")[piece_idx] = true;
                     }
                 }
