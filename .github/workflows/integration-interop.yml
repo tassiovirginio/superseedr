@@ -1,23 +1,11 @@
 name: Integration Interop
 
 on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "Mode to run (all|v1|v2|hybrid)"
-        required: false
-        default: "all"
-      timeout_secs:
-        description: "Per-run timeout in seconds"
-        required: false
-        default: "300"
-  schedule:
-    - cron: "15 3 * * *"
+  pull_request:
 
 jobs:
   interop:
     name: Interop (${{ matrix.mode }})
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'all' || github.event.inputs.mode == matrix.mode
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -26,10 +14,10 @@ jobs:
         mode: [v1, v2, hybrid]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -41,22 +29,19 @@ jobs:
       - name: Decide mode for this matrix shard
         id: select_mode
         run: |
-          INPUT_MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "all" ]; then
-            echo "mode=${{ matrix.mode }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
-          fi
+          echo "mode=${{ matrix.mode }}" >> "$GITHUB_OUTPUT"
+          echo "run=true" >> "$GITHUB_OUTPUT"
 
       - name: Run interop harness
+        if: steps.select_mode.outputs.run == 'true'
         env:
-          INTEROP_TIMEOUT_SECS: ${{ github.event.inputs.timeout_secs || '300' }}
+          INTEROP_TIMEOUT_SECS: "300"
         run: |
           ./integration_tests/run_interop.sh "${{ steps.select_mode.outputs.mode }}"
 
       - name: Upload interop artifacts
-        if: always()
-        uses: actions/upload-artifact@v6
+        if: always() && steps.select_mode.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: interop-artifacts-${{ matrix.mode }}-${{ github.run_id }}
           path: integration_tests/artifacts/
