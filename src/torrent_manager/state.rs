@@ -8025,6 +8025,7 @@ mod prop_tests {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_from_effect(
         effect: Effect,
+        state: &TorrentState,
         peer_bitfields_bool: &HashMap<String, Vec<bool>>,
         peer_bitfields_bytes: &HashMap<String, Vec<u8>>,
         pending_actions: &mut Vec<Action>,
@@ -8098,7 +8099,9 @@ mod prop_tests {
                 piece_index,
             }),
             Effect::DisconnectPeer { peer_id } => {
-                pending_manager_commands.push(SimulatedManagerCommand::Disconnect(peer_id));
+                if state.peers.contains_key(&peer_id) {
+                    pending_manager_commands.push(SimulatedManagerCommand::Disconnect(peer_id));
+                }
             }
             _ => {}
         }
@@ -8220,6 +8223,7 @@ mod prop_tests {
             for effect in initial {
                 enqueue_from_effect(
                     effect,
+                    &state,
                     &peer_bitfields_bool,
                     &peer_bitfields_bytes,
                     &mut pending_actions,
@@ -8269,6 +8273,7 @@ mod prop_tests {
                         for effect in effects {
                             enqueue_from_effect(
                                 effect,
+                                &state,
                                 &peer_bitfields_bool,
                                 &peer_bitfields_bytes,
                                 &mut pending_actions,
@@ -8292,6 +8297,7 @@ mod prop_tests {
                 for effect in effects {
                     enqueue_from_effect(
                         effect,
+                        &state,
                         &peer_bitfields_bool,
                         &peer_bitfields_bytes,
                         &mut pending_actions,
@@ -8319,6 +8325,7 @@ mod prop_tests {
                     for effect in follow_up {
                         enqueue_from_effect(
                             effect,
+                            &state,
                             &peer_bitfields_bool,
                             &peer_bitfields_bytes,
                             &mut pending_actions,
@@ -8357,6 +8364,7 @@ mod prop_tests {
                     for effect in follow_up {
                         enqueue_from_effect(
                             effect,
+                            &state,
                             &peer_bitfields_bool,
                             &peer_bitfields_bytes,
                             &mut pending_actions,
@@ -8381,6 +8389,7 @@ mod prop_tests {
                 for effect in cleanup_effects {
                     enqueue_from_effect(
                         effect,
+                        &state,
                         &peer_bitfields_bool,
                         &peer_bitfields_bytes,
                         &mut pending_actions,
@@ -8404,6 +8413,7 @@ mod prop_tests {
                     for effect in unchoke_effects {
                         enqueue_from_effect(
                             effect,
+                            &state,
                             &peer_bitfields_bool,
                             &peer_bitfields_bytes,
                             &mut pending_actions,
@@ -8419,6 +8429,7 @@ mod prop_tests {
                     for effect in effects {
                         enqueue_from_effect(
                             effect,
+                            &state,
                             &peer_bitfields_bool,
                             &peer_bitfields_bytes,
                             &mut pending_actions,
