@@ -2175,6 +2175,54 @@ mod tests {
     }
 
     #[test]
+    fn reducer_dialog_escape_directory_clears_search_and_exits_without_cleanup() {
+        let mode = FileBrowserMode::Directory;
+        let state = TreeViewState::default();
+
+        let out = reduce_browser_dialog_action(BrowserDialogAction::Escape, &state, &mode, true);
+
+        assert!(out.consumed);
+        assert_eq!(out.effects.len(), 2);
+        assert!(matches!(out.effects[0], BrowserDialogEffect::ClearSearch));
+        assert!(matches!(
+            out.effects[1],
+            BrowserDialogEffect::ExitToNormalAndClearPending
+        ));
+    }
+
+    #[test]
+    fn reducer_dialog_escape_download_with_pending_cleans_then_exits() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            torrent_files: vec![],
+            container_name: "x".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 1,
+            original_name_backup: "x".to_string(),
+        };
+        let state = TreeViewState::default();
+
+        let out = reduce_browser_dialog_action(BrowserDialogAction::Escape, &state, &mode, true);
+
+        assert!(out.consumed);
+        assert_eq!(out.effects.len(), 3);
+        assert!(matches!(
+            out.effects[0],
+            BrowserDialogEffect::CleanupPendingLink {
+                async_delete: false
+            }
+        ));
+        assert!(matches!(out.effects[1], BrowserDialogEffect::ClearSearch));
+        assert!(matches!(
+            out.effects[2],
+            BrowserDialogEffect::ExitToNormalAndClearPending
+        ));
+    }
+
+    #[test]
     fn reducer_dialog_cancel_download_emits_async_cleanup_and_exit() {
         let mode = FileBrowserMode::DownloadLocSelection {
             torrent_files: vec![],

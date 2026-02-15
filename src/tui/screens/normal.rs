@@ -3529,6 +3529,20 @@ mod tests {
     }
 
     #[test]
+    fn reducer_start_search_keeps_browser_search_state_intact() {
+        let mut app_state = AppState::default();
+        app_state.ui.file_browser.is_searching = true;
+        app_state.ui.file_browser.search_query = "downloads".to_string();
+
+        let result = reduce_ui_action(&mut app_state, UiAction::StartSearch);
+
+        assert!(result.redraw);
+        assert!(app_state.ui.is_searching);
+        assert!(app_state.ui.file_browser.is_searching);
+        assert_eq!(app_state.ui.file_browser.search_query, "downloads");
+    }
+
+    #[test]
     fn reducer_clear_system_error_clears_error() {
         let mut app_state = AppState::default();
         app_state.system_error = Some("boom".to_string());

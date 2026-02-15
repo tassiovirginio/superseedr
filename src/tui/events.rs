@@ -100,7 +100,7 @@ mod tests {
         TorrentPreviewPayload,
     };
     use crate::tui::tree::RawNode;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
     /// Creates a mock TorrentMetrics with a specific number of peers.
@@ -342,5 +342,21 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(nodes[0].payload.priority, FilePriority::Normal);
+    }
+
+    #[test]
+    fn test_escape_debounce_ignores_non_escape_keys() {
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        let event = CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!should_debounce_escape(&event));
+    }
+
+    #[test]
+    fn test_escape_debounce_blocks_rapid_second_escape() {
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        let event = CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!should_debounce_escape(&event));
+        assert!(should_debounce_escape(&event));
     }
 }
