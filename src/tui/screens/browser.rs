@@ -812,6 +812,27 @@ pub struct BrowserReduceResult {
     pub redraw: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrowserFsAction {
+    StartSearch,
+    Move(TreeAction),
+    EnterDir,
+    GoParent,
+}
+
+pub enum BrowserFsEffect {
+    FetchFileTree {
+        path: PathBuf,
+        browser_mode: FileBrowserMode,
+        highlight_path: Option<PathBuf>,
+    },
+}
+
+pub struct BrowserFsReduceResult {
+    pub consumed: bool,
+    pub effects: Vec<BrowserFsEffect>,
+}
+
 fn map_search_key_to_browser_action(key_code: KeyCode, is_searching: bool) -> Option<BrowserAction> {
     if !is_searching {
         return None;
@@ -852,6 +873,70 @@ pub fn reduce_browser_action(
         consumed: true,
         redraw: true,
     }
+}
+
+fn map_filesystem_key_to_action(key_code: KeyCode) -> Option<BrowserFsAction> {
+    match key_code {
+        KeyCode::Char('/') => Some(BrowserFsAction::StartSearch),
+        KeyCode::Up | KeyCode::Char('k') => Some(BrowserFsAction::Move(TreeAction::Up)),
+        KeyCode::Down | KeyCode::Char('j') => Some(BrowserFsAction::Move(TreeAction::Down)),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(BrowserFsAction::EnterDir),
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('u') => {
+            Some(BrowserFsAction::GoParent)
+        }
+        _ => None,
+    }
+}
+
+pub fn reduce_filesystem_navigation_action(
+    action: BrowserFsAction,
+    state: &mut TreeViewState,
+    data: &[RawNode<FileMetadata>],
+    browser_mode: &FileBrowserMode,
+    is_searching: &mut bool,
+    search_query: &mut String,
+    list_height: usize,
+) -> BrowserFsReduceResult {
+    let filter = build_filter(browser_mode, search_query);
+    let mut result = BrowserFsReduceResult {
+        consumed: true,
+        effects: Vec::new(),
+    };
+
+    match action {
+        BrowserFsAction::StartSearch => {
+            *is_searching = true;
+            search_query.clear();
+        }
+        BrowserFsAction::Move(tree_action) => {
+            TreeMathHelper::apply_action(state, data, tree_action, filter, list_height);
+        }
+        BrowserFsAction::EnterDir => {
+            if let Some(path) = state.cursor_path.clone() {
+                if path.is_dir() {
+                    *is_searching = false;
+                    search_query.clear();
+                    result.effects.push(BrowserFsEffect::FetchFileTree {
+                        path,
+                        browser_mode: browser_mode.clone(),
+                        highlight_path: None,
+                    });
+                }
+            }
+        }
+        BrowserFsAction::GoParent => {
+            let child_to_highlight = state.current_path.clone();
+            if let Some(parent) = state.current_path.parent() {
+                result.effects.push(BrowserFsEffect::FetchFileTree {
+                    path: parent.to_path_buf(),
+                    browser_mode: browser_mode.clone(),
+                    highlight_path: Some(child_to_highlight),
+                });
+            }
+        }
+    }
+
+    result
 }
 
 pub fn handle_search_interceptor(
@@ -1077,48 +1162,34 @@ pub fn handle_filesystem_navigation(
     list_height: usize,
     app_command_tx: &mpsc::Sender<AppCommand>,
 ) -> bool {
-    let filter = build_filter(browser_mode, search_query);
-
-    match key_code {
-        KeyCode::Char('/') => {
-            *is_searching = true;
-            search_query.clear();
-            true
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            TreeMathHelper::apply_action(state, data, TreeAction::Up, filter, list_height);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            TreeMathHelper::apply_action(state, data, TreeAction::Down, filter, list_height);
-            true
-        }
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-            if let Some(path) = state.cursor_path.clone() {
-                if path.is_dir() {
-                    *is_searching = false;
-                    search_query.clear();
+    if let Some(action) = map_filesystem_key_to_action(key_code) {
+        let reduced = reduce_filesystem_navigation_action(
+            action,
+            state,
+            data,
+            browser_mode,
+            is_searching,
+            search_query,
+            list_height,
+        );
+        for effect in reduced.effects {
+            match effect {
+                BrowserFsEffect::FetchFileTree {
+                    path,
+                    browser_mode,
+                    highlight_path,
+                } => {
                     let _ = app_command_tx.try_send(AppCommand::FetchFileTree {
                         path,
-                        browser_mode: browser_mode.clone(),
-                        highlight_path: None,
+                        browser_mode,
+                        highlight_path,
                     });
                 }
             }
-            true
         }
-        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('u') => {
-            let child_to_highlight = state.current_path.clone();
-            if let Some(parent) = state.current_path.parent() {
-                let _ = app_command_tx.try_send(AppCommand::FetchFileTree {
-                    path: parent.to_path_buf(),
-                    browser_mode: browser_mode.clone(),
-                    highlight_path: Some(child_to_highlight),
-                });
-            }
-            true
-        }
-        _ => false,
+        reduced.consumed
+    } else {
+        false
     }
 }
 
@@ -1373,6 +1444,62 @@ mod tests {
         assert!(out.redraw);
         assert!(is_searching);
         assert_eq!(query, "abc");
+    }
+
+    #[test]
+    fn reducer_filesystem_start_search_sets_flag_and_clears_query() {
+        let mut is_searching = false;
+        let mut query = String::from("abc");
+        let mut state = TreeViewState::default();
+        let data: Vec<RawNode<FileMetadata>> = vec![];
+        let mode = FileBrowserMode::Directory;
+
+        let out = reduce_filesystem_navigation_action(
+            BrowserFsAction::StartSearch,
+            &mut state,
+            &data,
+            &mode,
+            &mut is_searching,
+            &mut query,
+            5,
+        );
+
+        assert!(out.consumed);
+        assert!(is_searching);
+        assert!(query.is_empty());
+    }
+
+    #[test]
+    fn reducer_filesystem_enter_dir_emits_fetch_effect() {
+        let mut is_searching = true;
+        let mut query = String::from("abc");
+        let mut state = TreeViewState {
+            current_path: PathBuf::from("."),
+            cursor_path: Some(PathBuf::from(".")),
+            ..Default::default()
+        };
+        let data: Vec<RawNode<FileMetadata>> = vec![];
+        let mode = FileBrowserMode::Directory;
+
+        let out = reduce_filesystem_navigation_action(
+            BrowserFsAction::EnterDir,
+            &mut state,
+            &data,
+            &mode,
+            &mut is_searching,
+            &mut query,
+            5,
+        );
+
+        assert!(out.consumed);
+        assert!(!is_searching);
+        assert!(query.is_empty());
+        assert_eq!(out.effects.len(), 1);
+        assert!(matches!(
+            out.effects[0],
+            BrowserFsEffect::FetchFileTree { ref path, highlight_path: None, .. }
+                if path == &PathBuf::from(".")
+        ));
     }
 
     #[test]
