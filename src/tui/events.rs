@@ -188,17 +188,17 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         app.app_state.ui_needs_redraw = true;
                         return; // INTERCEPTED
                     }
+                    if browser::handle_download_shortcuts(key.code, browser_mode) {
+                        app.app_state.ui_needs_redraw = true;
+                        return;
+                    }
 
                     // 2. Mode-Specific Guard (Download Selection)
                     if let FileBrowserMode::DownloadLocSelection {
-                        container_name,
                         use_container,
-                        is_editing_name,
                         focused_pane,
                         preview_tree,
                         preview_state,
-                        cursor_pos,
-                        original_name_backup,
                         ..
                     } = browser_mode
                     {
@@ -236,27 +236,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 app.app_state.mode = AppMode::Normal;
                                 app.app_state.pending_torrent_path = None;
                                 app.app_state.pending_torrent_link.clear();
-                                app.app_state.ui_needs_redraw = true;
-                                return;
-                            }
-                            KeyCode::Char('x') => {
-                                *use_container = !*use_container;
-                                app.app_state.ui_needs_redraw = true;
-                                return;
-                            }
-                            KeyCode::Char('r') if *use_container => {
-                                *is_editing_name = true;
-                                *original_name_backup = container_name.clone();
-                                *cursor_pos = container_name.len();
-                                *focused_pane = BrowserPane::TorrentPreview;
-                                app.app_state.ui_needs_redraw = true;
-                                return;
-                            }
-                            KeyCode::Tab => {
-                                *focused_pane = match focused_pane {
-                                    BrowserPane::FileSystem => BrowserPane::TorrentPreview,
-                                    BrowserPane::TorrentPreview => BrowserPane::FileSystem,
-                                };
                                 app.app_state.ui_needs_redraw = true;
                                 return;
                             }
@@ -348,68 +327,20 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         }
                     }
 
-                    // 1. Determine Preview Status
-                    let has_preview_content = match browser_mode {
-                        FileBrowserMode::DownloadLocSelection { .. } => {
-                            app.app_state.pending_torrent_path.is_some()
-                                || !app.app_state.pending_torrent_link.is_empty()
-                        }
-                        FileBrowserMode::File(_) => state
-                            .cursor_path
-                            .as_ref()
-                            .is_some_and(|p| p.extension().is_some_and(|ext| ext == "torrent")),
-                        _ => false,
-                    };
-
-                    // 2. Determine Focused Pane
-                    let default_pane = BrowserPane::FileSystem;
-                    let focused_pane =
-                        if let FileBrowserMode::DownloadLocSelection { focused_pane, .. } =
-                            browser_mode
-                        {
-                            focused_pane
-                        } else {
-                            &default_pane
-                        };
-
-                    // 3. Determine Area (Matching view.rs logic exactly)
-                    let screen = app.app_state.screen_area;
-                    let area = if has_preview_content {
-                        if screen.width < 60 {
-                            screen
-                        } else {
-                            centered_rect(90, 80, screen)
-                        }
-                    } else if screen.width < 40 {
-                        screen
-                    } else {
-                        centered_rect(75, 80, screen)
-                    };
-
-                    // 4. Calculate Layout
-                    let layout = calculate_file_browser_layout(
-                        area,
+                    let has_preview_content = browser::has_preview_content(
+                        browser_mode,
+                        app.app_state.pending_torrent_path.is_some(),
+                        !app.app_state.pending_torrent_link.is_empty(),
+                        state.cursor_path.as_ref(),
+                    );
+                    let focused_pane = browser::focused_pane(browser_mode);
+                    let list_height = browser::calculate_list_height(
+                        app.app_state.screen_area,
                         has_preview_content,
                         app.app_state.is_searching,
-                        focused_pane,
+                        &focused_pane,
                     );
-
-                    // 5. Get EXACT List Height (Height - 2 for Borders)
-                    let list_height = layout.list.height.saturating_sub(2) as usize;
-
-                    let filter = match browser_mode {
-                        FileBrowserMode::Directory
-                        | FileBrowserMode::DownloadLocSelection { .. }
-                        | FileBrowserMode::ConfigPathSelection { .. } => {
-                            TreeFilter::from_text(&app.app_state.search_query)
-                        }
-                        FileBrowserMode::File(extensions) => {
-                            let exts = extensions.clone();
-                            TreeFilter::new(&app.app_state.search_query, move |node| {
-                                node.is_dir || exts.iter().any(|ext| node.name.ends_with(ext))
-                            })
-                        }
-                    };
+                    let filter = browser::build_filter(browser_mode, &app.app_state.search_query);
 
                     match key.code {
                         KeyCode::Char('/') => {
