@@ -2005,137 +2005,11 @@ impl App {
 
     // Constantly ensures all table selected indices are in-bounds
     fn clamp_selected_indices(&mut self) {
-        let torrent_count = self.app_state.torrent_list_order.len();
-
-        if torrent_count == 0 {
-            self.app_state.ui.selected_torrent_index = 0;
-        } else if self.app_state.ui.selected_torrent_index >= torrent_count {
-            self.app_state.ui.selected_torrent_index = torrent_count - 1;
-        }
-
-        let peer_count = self
-            .app_state
-            .torrent_list_order
-            .get(self.app_state.ui.selected_torrent_index)
-            .and_then(|info_hash| self.app_state.torrents.get(info_hash))
-            .map_or(0, |torrent| torrent.latest_state.peers.len());
-
-        if peer_count == 0 {
-            self.app_state.ui.selected_peer_index = 0;
-        } else if self.app_state.ui.selected_peer_index >= peer_count {
-            self.app_state.ui.selected_peer_index = peer_count - 1;
-        }
+        clamp_selected_indices_in_state(&mut self.app_state);
     }
 
     pub fn sort_and_filter_torrent_list(&mut self) {
-        let torrents_map = &self.app_state.torrents;
-        let (sort_by, sort_direction) = self.app_state.torrent_sort;
-        let search_query = &self.app_state.ui.search_query;
-
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-
-        let mut torrent_list: Vec<Vec<u8>> = torrents_map.keys().cloned().collect();
-
-        if !search_query.is_empty() {
-            torrent_list.retain(|info_hash| {
-                let torrent_name = torrents_map
-                    .get(info_hash)
-                    .map_or("", |t| &t.latest_state.torrent_name);
-
-                matcher.fuzzy_match(torrent_name, search_query).is_some()
-            });
-        }
-
-        torrent_list.sort_by(|a_info_hash, b_info_hash| {
-            let Some(a_torrent) = torrents_map.get(a_info_hash) else {
-                return std::cmp::Ordering::Equal;
-            };
-            let Some(b_torrent) = torrents_map.get(b_info_hash) else {
-                return std::cmp::Ordering::Equal;
-            };
-
-            let ordering = match sort_by {
-                TorrentSortColumn::Name => a_torrent
-                    .latest_state
-                    .torrent_name
-                    .cmp(&b_torrent.latest_state.torrent_name),
-                TorrentSortColumn::Down => b_torrent
-                    .smoothed_download_speed_bps
-                    .cmp(&a_torrent.smoothed_download_speed_bps),
-                TorrentSortColumn::Up => b_torrent
-                    .smoothed_upload_speed_bps
-                    .cmp(&a_torrent.smoothed_upload_speed_bps),
-                TorrentSortColumn::Progress => {
-                    let calc_progress = |t: &TorrentDisplayState| -> f64 {
-                        if t.latest_state.number_of_pieces_total == 0 {
-                            0.0
-                        } else {
-                            t.latest_state.number_of_pieces_completed as f64
-                                / t.latest_state.number_of_pieces_total as f64
-                        }
-                    };
-
-                    let a_prog = calc_progress(a_torrent);
-                    let b_prog = calc_progress(b_torrent);
-
-                    // Standard float comparison
-                    a_prog.total_cmp(&b_prog)
-                }
-            };
-
-            let default_direction = match sort_by {
-                TorrentSortColumn::Name => SortDirection::Ascending,
-                _ => SortDirection::Descending,
-            };
-
-            let primary_ordering = if sort_direction != default_direction {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-
-            // If primary sort is equal (e.g. both 0 DL), use activity score.
-            primary_ordering.then_with(|| {
-                let calculate_weighted_activity = |t: &TorrentDisplayState| -> u64 {
-                    // Still look at 60s window to break ties if last 5s are quiet
-                    let window = 60;
-                    let mut score = 0;
-
-                    let mut sum_vec = |history: &Vec<u64>| {
-                        // iter().rev() means index 0 is the most recent second
-                        for (i, &count) in history.iter().rev().take(window).enumerate() {
-                            if count > 0 {
-                                // WEIGHTING LOGIC:
-                                // If within the last 5 seconds (indices 0-4), apply heavy weight.
-                                // Otherwise, apply a nominal weight of 1.
-                                let weight = if i < 5 {
-                                    // Example: 0s ago = 50, 1s ago = 40, ... 4s ago = 10
-                                    (5 - i) as u64 * 10
-                                } else {
-                                    1
-                                };
-                                score += count * weight;
-                            }
-                        }
-                    };
-
-                    sum_vec(&t.peer_discovery_history);
-                    sum_vec(&t.peer_connection_history);
-                    sum_vec(&t.peer_disconnect_history);
-
-                    score
-                };
-
-                let a_activity = calculate_weighted_activity(a_torrent);
-                let b_activity = calculate_weighted_activity(b_torrent);
-
-                // Sort Descending
-                b_activity.cmp(&a_activity)
-            })
-        });
-
-        self.app_state.torrent_list_order = torrent_list;
-        self.clamp_selected_indices();
+        sort_and_filter_torrent_list_state(&mut self.app_state);
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
@@ -2829,13 +2703,139 @@ pub fn parse_hybrid_hashes(magnet_link: &str) -> (Option<Vec<u8>>, Option<Vec<u8
     (v1, v2)
 }
 
+pub(crate) fn clamp_selected_indices_in_state(app_state: &mut AppState) {
+    let torrent_count = app_state.torrent_list_order.len();
+
+    if torrent_count == 0 {
+        app_state.ui.selected_torrent_index = 0;
+    } else if app_state.ui.selected_torrent_index >= torrent_count {
+        app_state.ui.selected_torrent_index = torrent_count - 1;
+    }
+
+    let peer_count = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash))
+        .map_or(0, |torrent| torrent.latest_state.peers.len());
+
+    if peer_count == 0 {
+        app_state.ui.selected_peer_index = 0;
+    } else if app_state.ui.selected_peer_index >= peer_count {
+        app_state.ui.selected_peer_index = peer_count - 1;
+    }
+}
+
+pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
+    let torrents_map = &app_state.torrents;
+    let (sort_by, sort_direction) = app_state.torrent_sort;
+    let search_query = &app_state.ui.search_query;
+
+    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+    let mut torrent_list: Vec<Vec<u8>> = torrents_map.keys().cloned().collect();
+
+    if !search_query.is_empty() {
+        torrent_list.retain(|info_hash| {
+            let torrent_name = torrents_map
+                .get(info_hash)
+                .map_or("", |t| &t.latest_state.torrent_name);
+            matcher.fuzzy_match(torrent_name, search_query).is_some()
+        });
+    }
+
+    torrent_list.sort_by(|a_info_hash, b_info_hash| {
+        let Some(a_torrent) = torrents_map.get(a_info_hash) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let Some(b_torrent) = torrents_map.get(b_info_hash) else {
+            return std::cmp::Ordering::Equal;
+        };
+
+        let ordering = match sort_by {
+            TorrentSortColumn::Name => a_torrent
+                .latest_state
+                .torrent_name
+                .cmp(&b_torrent.latest_state.torrent_name),
+            TorrentSortColumn::Down => b_torrent
+                .smoothed_download_speed_bps
+                .cmp(&a_torrent.smoothed_download_speed_bps),
+            TorrentSortColumn::Up => b_torrent
+                .smoothed_upload_speed_bps
+                .cmp(&a_torrent.smoothed_upload_speed_bps),
+            TorrentSortColumn::Progress => {
+                let calc_progress = |t: &TorrentDisplayState| -> f64 {
+                    if t.latest_state.number_of_pieces_total == 0 {
+                        0.0
+                    } else {
+                        t.latest_state.number_of_pieces_completed as f64
+                            / t.latest_state.number_of_pieces_total as f64
+                    }
+                };
+
+                let a_prog = calc_progress(a_torrent);
+                let b_prog = calc_progress(b_torrent);
+                a_prog.total_cmp(&b_prog)
+            }
+        };
+
+        let default_direction = match sort_by {
+            TorrentSortColumn::Name => SortDirection::Ascending,
+            _ => SortDirection::Descending,
+        };
+        let primary_ordering = if sort_direction != default_direction {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+
+        primary_ordering.then_with(|| {
+            let calculate_weighted_activity = |t: &TorrentDisplayState| -> u64 {
+                let window = 60;
+                let mut score = 0;
+                let mut sum_vec = |history: &Vec<u64>| {
+                    for (i, &count) in history.iter().rev().take(window).enumerate() {
+                        if count > 0 {
+                            let weight = if i < 5 { (5 - i) as u64 * 10 } else { 1 };
+                            score += count * weight;
+                        }
+                    }
+                };
+                sum_vec(&t.peer_discovery_history);
+                sum_vec(&t.peer_connection_history);
+                sum_vec(&t.peer_disconnect_history);
+                score
+            };
+
+            let a_activity = calculate_weighted_activity(a_torrent);
+            let b_activity = calculate_weighted_activity(b_torrent);
+            b_activity.cmp(&a_activity)
+        })
+    });
+
+    app_state.torrent_list_order = torrent_list;
+    clamp_selected_indices_in_state(app_state);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        clamp_selected_indices_in_state,
         persisted_validation_status_from_piece_completion, torrent_completion_percent,
-        torrent_is_effectively_incomplete, App, AppMode, FilePriority, TorrentMetrics,
+        sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, App, AppMode,
+        AppState, FilePriority, PeerInfo, SelectedHeader, SortDirection, TorrentDisplayState,
+        TorrentMetrics, TorrentSortColumn,
     };
     use std::collections::HashMap;
+    fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.torrent_name = name.to_string();
+        display.latest_state.peers = (0..peer_count)
+            .map(|i| PeerInfo {
+                address: format!("127.0.0.1:{}", 6000 + i),
+                ..Default::default()
+            })
+            .collect();
+        display
+    }
 
     #[test]
     fn persisted_validation_status_is_true_only_when_complete() {
@@ -2908,5 +2908,49 @@ mod tests {
 
         assert!(torrent_is_effectively_incomplete(&metrics));
         assert_eq!(torrent_completion_percent(&metrics), 25.0);
+    }
+
+    #[test]
+    fn clamp_selected_indices_clamps_torrent_and_peer_to_bounds() {
+        let mut app_state = AppState::default();
+        let hash_a = b"hash_a".to_vec();
+        let hash_b = b"hash_b".to_vec();
+        app_state
+            .torrents
+            .insert(hash_a.clone(), mock_display("alpha", 0));
+        app_state
+            .torrents
+            .insert(hash_b.clone(), mock_display("beta", 2));
+        app_state.torrent_list_order = vec![hash_a, hash_b];
+        app_state.ui.selected_torrent_index = 99;
+        app_state.ui.selected_peer_index = 99;
+
+        clamp_selected_indices_in_state(&mut app_state);
+
+        assert_eq!(app_state.ui.selected_torrent_index, 1);
+        assert_eq!(app_state.ui.selected_peer_index, 1);
+    }
+
+    #[test]
+    fn sort_and_filter_applies_query_and_clamps_selection() {
+        let mut app_state = AppState::default();
+        app_state.torrent_sort = (TorrentSortColumn::Name, SortDirection::Ascending);
+        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_torrent_index = 5;
+        app_state.ui.search_query = "ubn".to_string();
+
+        let hash_a = b"hash_a".to_vec();
+        let hash_b = b"hash_b".to_vec();
+        app_state
+            .torrents
+            .insert(hash_a.clone(), mock_display("ubuntu-24.04.iso", 0));
+        app_state
+            .torrents
+            .insert(hash_b.clone(), mock_display("archlinux.iso", 0));
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(app_state.torrent_list_order, vec![hash_a]);
+        assert_eq!(app_state.ui.selected_torrent_index, 0);
     }
 }

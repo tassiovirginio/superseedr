@@ -98,6 +98,14 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 4. Verify power-saving redraw behavior unchanged.
 
 ## Phase 3: Extract UI State Into `UiState` (Slice by Slice)
+### Status
+- Completed:
+  - `UiState` attached to `AppState`.
+  - Search/selection/redraw/effects moved under `AppState.ui`.
+  - `Config`, `DeleteConfirm`, and `FileBrowser` payloads moved from `AppMode` into `UiState` substates.
+  - State ownership matrix documented in `src/tui/README.md`.
+  - Invariant tests added for selection clamping and search filter/clamp behavior.
+
 ### Steps
 1. Introduce `UiState` and attach to `App`.
 2. Move UI-only fields from `AppState` first:
