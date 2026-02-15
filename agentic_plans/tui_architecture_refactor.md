@@ -132,12 +132,14 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 ## Phase 4: `UiAction` + Reducer + Effects Pipeline
 ### Status
 - In progress, mostly complete for key screens:
-  - Normal screen reducer/effect path covers all normal-screen hotkeys except platform clipboard paste.
+  - Normal screen reducer/effect path now covers normal-screen hotkeys including paste routing via reducer/effects.
   - Config and delete-confirm screens are fully routed through reducer + effect execution.
   - Browser screen now routes search, filesystem navigation, confirm/escape, download edit/shortcuts, and preview-pane keys through reducer paths.
   - Normal and browser event handlers were split into staged dispatch helpers to keep per-screen entrypoints thin.
-  - Root `tui/events.rs` was refactored into explicit pipeline stages (resize -> esc debounce -> global hooks -> mode dispatch).
+  - Root `tui/events.rs` was refactored into explicit pipeline stages (resize -> esc debounce -> mode dispatch).
   - Reducer-focused tests were added/updated for browser dialog/download/preview flows and existing normal/config/delete-confirm reducer coverage remains green.
+  - Help screen now routes through dedicated `AppMode::Help` (no global help overlay hook).
+  - Search handling is localized per screen (`normal`, `browser`) rather than global interception.
 
 ### Implementation Checkpoints (2026-02-15)
 - `713fbd1` `tui: start normal-screen action reducer pipeline`
@@ -159,6 +161,9 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 - `583010b` `tui: split browser key handling into staged dispatch helpers`
 - `b8a057f` `tui: split normal screen key handling into dispatch helpers`
 - `a1c2812` `tui: stage root event pipeline into helper passes`
+- `fa435e3` `tui: move help to AppMode and route paste through reducer effects`
+- `6b4cde2` `tui: remove global help hook and scope help to normal entry`
+- `c011a05` `tui: localize search handling to screen dispatch paths`
 
 ### Steps
 1. Add `UiAction`, `UiEffect`, `ReduceResult`.
@@ -211,7 +216,7 @@ This plan is incremental, parity-driven, and includes manual testing after each 
   - `src/tui/layout/common.rs` holds shared table/column layout helpers.
   - `src/tui/effects.rs` owns theme post-processing and effect-activity speed helpers.
 - Boundary hardening updates:
-  - `events.rs` remains staged (resize -> debounce -> global hooks -> mode dispatch).
+  - `events.rs` remains staged (resize -> debounce -> mode dispatch).
   - `normal` and `browser` screen handlers remain thin staged dispatchers.
   - `view.rs` is now a thin draw dispatcher that calls layout planners/effects modules.
 - Architecture docs updated in `src/tui/README.md` with invariants and extension guide.
@@ -286,3 +291,76 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 - `AppViewModel` is borrow-first; avoid full per-frame clones.
 - Side effects never run inside reducer; reducer is deterministic and testable.
 - Screen modules own input mapping and drawing; shared reducer/effects enforce consistency.
+
+## Final Manual Regression Checklist (Full UI)
+Run this checklist in one session after all automated tests pass.
+
+### Setup
+1. Launch TUI in a terminal that can be resized.
+2. Ensure at least 2 torrents are visible (or mocked) so list/peer navigation is meaningful.
+3. Ensure one `.torrent` file path and one magnet link are available for add-flow checks.
+
+### Core Screen Entry/Exit
+1. `Welcome -> Normal` transition works.
+2. `Normal -> Config` via `c`, and `Config -> Normal` via `Esc` and `Q`.
+3. `Normal -> DeleteConfirm` via `d`/`D`; `Esc` cancels, `Enter` confirms, both return to `Normal`.
+4. `Normal -> PowerSaving` via `z`; `z` returns to `Normal`.
+5. `Normal -> Help` via `m`; help exits back to `Normal` with platform-specific close key:
+   - Windows: `m` press
+   - Non-Windows: `m` release or `Esc`
+6. Verify `m` does not open help from non-normal screens (Config/Browser/DeleteConfirm/PowerSaving).
+
+### Esc Behavior and Debounce Risk Checks
+1. In `Normal` (not searching), press `Esc`: no mode change.
+2. In `Normal` while searching, press `Esc`: exits search and clears query.
+3. In `Config`, press `Esc`: returns to `Normal` and applies expected config behavior.
+4. In `DeleteConfirm`, press `Esc`: cancel and return to `Normal`.
+5. In browser `ConfigPathSelection`, `Esc` returns to `Config`.
+6. In other browser modes, `Esc` returns to `Normal`.
+7. Press `Esc` rapidly in each screen above and verify no incorrect cross-screen jumps.
+
+### Normal Screen Behavior
+1. Navigation: arrows and `hjkl` move selection/header as expected.
+2. Sorting: `s` toggles selected column sort and direction.
+3. Search: `/`, typing, backspace, `Enter`, `Esc` all behave correctly.
+4. Pause/resume: `p` toggles selected torrent state.
+5. Theme: `<` and `>` switch themes immediately.
+6. Data rate: `[`/`]` and `{`/`}` adjust rate without UI glitches.
+7. Anonymize: `x` toggles displayed names.
+8. Quit intent: `Q` triggers quit flow.
+
+### Paste/Add Flows
+1. Non-Windows bracketed paste and Windows `v` paste both add valid magnet links.
+2. Paste valid `.torrent` path and verify add behavior (default path vs no default path cases).
+3. Paste invalid text and verify user-facing error message appears.
+4. `a` opens file browser add flow and remains functional.
+
+### Browser Screen Behavior
+1. File nav: `Enter`/`Right` into dir, `Backspace`/`Left`/`u` to parent.
+2. Browser search: `/`, typing, backspace, `Enter`, `Esc`.
+3. Confirm key `Y` performs expected action per browser mode.
+4. Download-location mode:
+   - `Tab` switches pane focus.
+   - `x` toggles container usage.
+   - `r` enters rename; edit keys work; `Enter` commits rename; `Esc` cancels rename.
+   - Preview pane nav keys move correctly and `Space` cycles priority.
+
+### Config Screen Behavior
+1. Up/down navigation across config items.
+2. Edit entry/commit/cancel flows function.
+3. Rate increase/decrease effects are applied.
+4. Path-selection handoff to browser and back to config works.
+
+### Rendering/Layout/Effects
+1. Resize terminal: narrow, medium, wide, very short heights; verify all screens remain usable.
+2. Verify normal layout regions (list/details/peers/chart/stats/footer) stay aligned.
+3. Verify browser layout adapts with/without preview and with search bar.
+4. Verify theme effects still animate and do not corrupt text readability.
+5. Verify PowerSaving redraw behavior still avoids unnecessary redraws.
+
+### End-to-End Flow
+1. Startup -> Normal -> Add torrent (magnet or file) -> Browser destination selection -> confirm.
+2. Return to Normal, sort/filter/search, pause/resume, open/close help.
+3. Open Config, change a value, return and confirm behavior.
+4. Delete flow (cancel then confirm) works.
+5. Shutdown flow completes cleanly.
