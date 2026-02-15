@@ -131,13 +131,34 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 
 ## Phase 4: `UiAction` + Reducer + Effects Pipeline
 ### Status
-- In progress:
-  - Normal screen has initial `UiAction`/`UiEffect`/`ReduceResult` scaffold.
-  - Reducer path currently handles all normal-screen hotkeys except platform clipboard paste.
-  - Reducer unit tests cover search start, error clear, navigation, anonymize toggle, power-saving transition, quit flag, graph mode cycling, delete-confirm/config/open-browser actions, data-rate actions, theme actions, pause/resume toggles, and sort-by-selected-column behavior.
-  - Config screen now has `ConfigAction` + reducer + effect execution for key handling, with reducer tests for navigation, commit, and save/exit.
-  - Delete-confirm screen now has `DeleteConfirmAction` + reducer + effect execution, with reducer tests for confirm/cancel semantics.
-  - Browser screen migration started: search-interceptor and filesystem-navigation paths now flow through `BrowserAction` reducers with parity tests.
+- In progress, mostly complete for key screens:
+  - Normal screen reducer/effect path covers all normal-screen hotkeys except platform clipboard paste.
+  - Config and delete-confirm screens are fully routed through reducer + effect execution.
+  - Browser screen now routes search, filesystem navigation, confirm/escape, download edit/shortcuts, and preview-pane keys through reducer paths.
+  - Normal and browser event handlers were split into staged dispatch helpers to keep per-screen entrypoints thin.
+  - Root `tui/events.rs` was refactored into explicit pipeline stages (resize -> esc debounce -> global hooks -> mode dispatch).
+  - Reducer-focused tests were added/updated for browser dialog/download/preview flows and existing normal/config/delete-confirm reducer coverage remains green.
+
+### Implementation Checkpoints (2026-02-15)
+- `713fbd1` `tui: start normal-screen action reducer pipeline`
+- `15df32a` `tui: route more normal keys through reducer actions`
+- `0785cb7` `tui: migrate add and delete shortcuts to reducer actions`
+- `50fb930` `tui: move config shortcut into reducer effect path`
+- `788efae` `tui: migrate rate theme and pause shortcuts to reducer effects`
+- `42ed8bd` `tui: migrate sort shortcut into reducer path`
+- `e08ad99` `tui: add action reducer pipeline for config screen`
+- `fb4e326` `tui: add action reducer pipeline for delete confirm screen`
+- `8ab2ae7` `tui: add browser reducer path for search interceptor`
+- `0ae864e` `tui: add browser reducer path for filesystem navigation`
+- `0614845` `tui: route browser confirm and escape keys through dialog reducer`
+- `605b48d` `tui: extract browser download key reducers`
+- `a390816` `tui: route browser download key interception through reducer`
+- `0d1f314` `tui: route browser preview pane keys through reducer`
+- `ae3d43e` `tui: remove redundant browser helper wrappers`
+- `9a60a7e` `tui: remove legacy browser preview helper`
+- `583010b` `tui: split browser key handling into staged dispatch helpers`
+- `b8a057f` `tui: split normal screen key handling into dispatch helpers`
+- `a1c2812` `tui: stage root event pipeline into helper passes`
 
 ### Steps
 1. Add `UiAction`, `UiEffect`, `ReduceResult`.
@@ -182,6 +203,11 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 4. Verify all overlays return to correct previous screen.
 
 ## Phase 6: Layout and Theme/Effects Cleanup + Boundary Hardening
+### Status
+- Not started for layout/theme extraction.
+- Partial boundary hardening complete:
+  - `events.rs` and screen `handle_event` entrypoints are now thin staged dispatchers in `normal` and `browser`.
+
 ### Steps
 1. Split layout into `tui/layout/common.rs` + per-screen planners.
 2. Keep layout pure: `plan(area, ctx) -> LayoutPlan`.
