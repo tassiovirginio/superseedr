@@ -2,24 +2,650 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    App, AppCommand, AppMode, BrowserPane, ConfigItem, FileBrowserMode, FileMetadata,
+    App, AppCommand, AppMode, AppState, BrowserPane, ConfigItem, FileBrowserMode, FileMetadata,
     FilePriority, TorrentControlState, TorrentDisplayState, TorrentPreviewPayload,
 };
+use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
-use crate::tui::formatters::centered_rect;
+use crate::tui::formatters::{centered_rect, format_bytes, truncate_with_ellipsis};
 use crate::tui::layout::calculate_file_browser_layout;
 use crate::tui::tree::{RawNode, TreeAction, TreeFilter, TreeMathHelper, TreeViewState};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::prelude::{Alignment, Frame, Line, Modifier, Span, Style, Stylize};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{self, Sender};
 
+const ASCII_TREE_DIR_ICON: &str = "> ";
+const ASCII_TREE_FILE_ICON: &str = "  ";
+const ASCII_TREE_ROOT_ICON: &str = "> ";
+
 pub struct DownloadConfirmPayload {
     pub base_path: PathBuf,
     pub container_name_to_use: Option<String>,
     pub file_priorities: HashMap<usize, FilePriority>,
+}
+
+pub fn draw(
+    f: &mut Frame,
+    app_state: &AppState,
+    state: &TreeViewState,
+    data: &[RawNode<FileMetadata>],
+    browser_mode: &FileBrowserMode,
+    ctx: &ThemeContext,
+) {
+    let has_preview_content = has_preview_content(
+        browser_mode,
+        app_state.pending_torrent_path.is_some(),
+        !app_state.pending_torrent_link.is_empty(),
+        state.cursor_path.as_ref(),
+    );
+
+    let preview_file_path = match browser_mode {
+        FileBrowserMode::DownloadLocSelection { .. } => app_state.pending_torrent_path.as_ref(),
+        FileBrowserMode::File(_) => state.cursor_path.as_ref(),
+        _ => None,
+    };
+
+    let focused_pane = focused_pane(browser_mode);
+    let max_area = centered_rect(90, 80, f.area());
+    f.render_widget(Clear, max_area);
+
+    let area = calculate_area(f.area(), has_preview_content);
+    let layout =
+        calculate_file_browser_layout(area, has_preview_content, app_state.is_searching, &focused_pane);
+
+    let (files_border_style, preview_border_style) =
+        if let FileBrowserMode::DownloadLocSelection { focused_pane, .. } = browser_mode {
+            match focused_pane {
+                BrowserPane::FileSystem => (
+                    ctx.apply(Style::default().fg(ctx.state_selected())),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                ),
+                BrowserPane::TorrentPreview => (
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                    ctx.apply(Style::default().fg(ctx.state_selected())),
+                ),
+            }
+        } else {
+            (
+                ctx.apply(Style::default().fg(ctx.state_selected())),
+                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+            )
+        };
+
+    if let Some(preview_area) = layout.preview {
+        draw_torrent_preview_panel(
+            f,
+            ctx,
+            preview_area,
+            preview_file_path.map(|p| p.as_path()),
+            browser_mode,
+            preview_border_style,
+            &state.current_path,
+        );
+    }
+    if let Some(search_area) = layout.search {
+        let search_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(ctx.apply(Style::default().fg(ctx.state_warning())))
+            .title(" Search Filter ");
+        let search_text = Line::from(vec![
+            Span::styled(
+                "/",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+            Span::raw(&app_state.search_query),
+            Span::styled(
+                "_",
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_warning())
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(search_text).block(search_block), search_area);
+    }
+
+    let mut footer_spans = Vec::new();
+    match browser_mode {
+        FileBrowserMode::ConfigPathSelection { .. } | FileBrowserMode::Directory => {
+            footer_spans.push(Span::styled(
+                "[Arrows/Vim]",
+                ctx.apply(Style::default().fg(ctx.state_info())),
+            ));
+            footer_spans.push(Span::raw(" Nav | "));
+            footer_spans.push(Span::styled(
+                "[Backspace]",
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ));
+            footer_spans.push(Span::raw(" Up | "));
+            footer_spans.push(Span::styled(
+                "[Enter]",
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ));
+            footer_spans.push(Span::raw(" Down | "));
+            footer_spans.push(Span::styled(
+                "[Shift+Y]",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ));
+            footer_spans.push(Span::raw(" Confirm Selection | "));
+        }
+        FileBrowserMode::DownloadLocSelection {
+            focused_pane,
+            use_container,
+            ..
+        } => {
+            footer_spans.push(Span::styled(
+                "[Tab]",
+                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+            ));
+            footer_spans.push(Span::raw(" Switch Pane | "));
+
+            if matches!(focused_pane, BrowserPane::TorrentPreview) {
+                footer_spans.push(Span::styled(
+                    "[Space]",
+                    ctx.apply(Style::default().fg(ctx.state_warning())),
+                ));
+                footer_spans.push(Span::raw(" Priority | "));
+            }
+
+            footer_spans.push(Span::styled(
+                "[x]",
+                ctx.apply(Style::default().fg(ctx.state_selected())),
+            ));
+            footer_spans.push(Span::raw(" Container Folder | "));
+
+            if *use_container {
+                footer_spans.push(Span::styled(
+                    "[r]",
+                    ctx.apply(Style::default().fg(ctx.accent_sky())),
+                ));
+                footer_spans.push(Span::raw(" Rename | "));
+            }
+
+            footer_spans.push(Span::styled(
+                "[Shift+Y]",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ));
+            footer_spans.push(Span::raw(" Confirm"));
+        }
+        FileBrowserMode::File(_) => {
+            footer_spans.push(Span::styled(
+                "[Shift+Y]",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ));
+            footer_spans.push(Span::raw(" Confirm File | "));
+        }
+    }
+    footer_spans.push(Span::raw(" | "));
+    footer_spans.push(Span::styled(
+        "[Esc]",
+        ctx.apply(Style::default().fg(ctx.state_error())),
+    ));
+    footer_spans.push(Span::raw(" Cancel"));
+
+    let footer = Paragraph::new(Line::from(footer_spans))
+        .alignment(Alignment::Center)
+        .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
+    f.render_widget(footer, layout.footer);
+
+    let inner_height = layout.list.height.saturating_sub(2) as usize;
+    let list_width = layout.list.width.saturating_sub(2) as usize;
+    let filter = build_filter(browser_mode, &app_state.search_query);
+
+    let abs_path = state.current_path.to_string_lossy();
+    let item_count = data.len();
+    let count_label = if item_count == 0 {
+        " (empty)".to_string()
+    } else {
+        format!(" ({} items)", item_count)
+    };
+    let left_title = format!(" {}/{} ", abs_path, count_label);
+    let right_title = match browser_mode {
+        FileBrowserMode::Directory => " Select Directory ".to_string(),
+        FileBrowserMode::DownloadLocSelection { .. } => String::new(),
+        FileBrowserMode::ConfigPathSelection { .. } => " Select Config Path ".to_string(),
+        FileBrowserMode::File(exts) => format!(" Select File [{}] ", exts.join(", ")),
+    };
+
+    let visible_items = TreeMathHelper::get_visible_slice(data, state, filter, inner_height);
+    let mut list_items = Vec::new();
+
+    if data.is_empty() {
+        list_items.push(ListItem::new(Line::from(vec![Span::styled(
+            "   (Directory is empty)",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+                .italic(),
+        )])));
+    } else if visible_items.is_empty() {
+        list_items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!("   (No matching files among {} items)", item_count),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+                .italic(),
+        )])));
+    } else {
+        for item in visible_items {
+            let is_cursor = item.is_cursor;
+            let indent_str = "  ".repeat(item.depth);
+            let indent_len = indent_str.len();
+            let icon_str = if item.node.is_dir {
+                ASCII_TREE_DIR_ICON
+            } else {
+                ASCII_TREE_FILE_ICON
+            };
+            let icon_len = ASCII_TREE_DIR_ICON.len();
+
+            let (meta_str, meta_len) = if !item.node.is_dir {
+                let datetime: chrono::DateTime<chrono::Local> = item.node.payload.modified.into();
+                let size_str = format_bytes(item.node.payload.size);
+                let s = format!(" {} ({})", size_str, datetime.format("%b %d %H:%M"));
+                (s.clone(), s.len())
+            } else {
+                (String::new(), 0)
+            };
+
+            let fixed_used = indent_len + icon_len + meta_len + 1;
+            let available_for_name = list_width.saturating_sub(fixed_used);
+            let clean_name: String = item
+                .node
+                .name
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect();
+            let display_name = truncate_with_ellipsis(&clean_name, available_for_name);
+
+            let (icon_style, text_style) = if is_cursor {
+                (
+                    Style::default()
+                        .fg(ctx.state_warning())
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(ctx.state_warning())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                let i_style = if item.node.is_dir {
+                    ctx.apply(Style::default().fg(ctx.state_info()))
+                } else {
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+                };
+                (
+                    i_style,
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                )
+            };
+
+            let mut line_spans = vec![
+                Span::raw(indent_str),
+                Span::styled(icon_str, icon_style),
+                Span::styled(display_name, text_style),
+            ];
+
+            if !item.node.is_dir {
+                line_spans.push(Span::raw(" "));
+                line_spans.push(Span::styled(
+                    meta_str,
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
+                        .italic(),
+                ));
+            }
+
+            list_items.push(ListItem::new(Line::from(line_spans)));
+        }
+    }
+
+    f.render_widget(
+        List::new(list_items)
+            .block(
+                Block::default()
+                    .title_top(
+                        Line::from(Span::styled(
+                            left_title,
+                            Style::default().fg(ctx.state_selected()).bold(),
+                        ))
+                        .alignment(Alignment::Left),
+                    )
+                    .title_top(
+                        Line::from(Span::styled(
+                            right_title,
+                            Style::default().fg(ctx.state_selected()).italic(),
+                        ))
+                        .alignment(Alignment::Right),
+                    )
+                    .borders(Borders::ALL)
+                    .border_style(files_border_style),
+            )
+            .highlight_symbol("▶ "),
+        layout.list,
+    );
+}
+
+fn draw_torrent_preview_panel(
+    f: &mut Frame,
+    ctx: &ThemeContext,
+    area: Rect,
+    path: Option<&Path>,
+    browser_mode: &FileBrowserMode,
+    border_style: Style,
+    current_fs_path: &Path,
+) {
+    let is_narrow = area.width < 50;
+    let raw_title = "Torrent Preview";
+    let avail_width = area.width.saturating_sub(4) as usize;
+    let title = if is_narrow {
+        truncate_with_ellipsis("Preview", avail_width)
+    } else {
+        truncate_with_ellipsis(raw_title, avail_width)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    if let FileBrowserMode::DownloadLocSelection {
+        preview_tree,
+        preview_state,
+        container_name,
+        use_container,
+        is_editing_name,
+        cursor_pos,
+        ..
+    } = browser_mode
+    {
+        let header_lines = if *use_container { 2 } else { 1 };
+        let list_height = inner_area.height.saturating_sub(header_lines) as usize;
+
+        let visible_rows =
+            TreeMathHelper::get_visible_slice(preview_tree, preview_state, TreeFilter::default(), list_height);
+
+        let mut list_items = Vec::new();
+        let root_style = Style::default()
+            .fg(ctx.state_info())
+            .add_modifier(Modifier::BOLD);
+
+        let path_display = if is_narrow {
+            current_fs_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string())
+        } else {
+            current_fs_path.to_string_lossy().to_string()
+        };
+
+        list_items.push(ListItem::new(Line::from(vec![
+            Span::styled(ASCII_TREE_ROOT_ICON, root_style),
+            Span::styled(path_display, root_style),
+        ])));
+
+        if *use_container {
+            let container_style = if *is_editing_name {
+                Style::default()
+                    .fg(ctx.accent_sky())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(ctx.state_selected())
+                    .add_modifier(Modifier::BOLD)
+            };
+
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(ASCII_TREE_ROOT_ICON, container_style),
+            ];
+
+            if *is_editing_name {
+                let (before, after) = container_name.split_at(*cursor_pos);
+                spans.push(Span::styled(before, container_style));
+                spans.push(Span::styled(
+                    "█",
+                    Style::default()
+                        .fg(ctx.accent_sky())
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ));
+                spans.push(Span::styled(after, container_style));
+            } else {
+                spans.push(Span::styled(container_name.clone(), container_style));
+                if !is_narrow {
+                    spans.push(Span::styled(
+                        " (New)",
+                        Style::default()
+                            .fg(ctx.theme.semantic.surface2)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            }
+            list_items.push(ListItem::new(Line::from(spans)));
+        }
+
+        let tree_items: Vec<ListItem> = visible_rows
+            .iter()
+            .map(|item| {
+                let is_cursor = item.is_cursor;
+                let base_indent_level = if *use_container { 2 } else { 1 };
+                let indent_multiplier = if is_narrow { 1 } else { 2 };
+                let indent_str = " ".repeat((base_indent_level + item.depth) * indent_multiplier);
+
+                let icon = if item.node.is_dir {
+                    ASCII_TREE_DIR_ICON
+                } else {
+                    ASCII_TREE_FILE_ICON
+                };
+
+                let (base_content_style, tag) = match item.node.payload.priority {
+                    FilePriority::Skip => (
+                        Style::default()
+                            .fg(ctx.theme.semantic.surface1)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                        "[S] ",
+                    ),
+                    FilePriority::High => (
+                        Style::default()
+                            .fg(ctx.state_success())
+                            .add_modifier(Modifier::BOLD),
+                        "[H] ",
+                    ),
+                    FilePriority::Mixed => (
+                        Style::default()
+                            .fg(ctx.state_warning())
+                            .add_modifier(Modifier::ITALIC),
+                        "[*] ",
+                    ),
+                    FilePriority::Normal => (
+                        if item.node.is_dir {
+                            ctx.apply(Style::default().fg(ctx.state_info()))
+                        } else {
+                            ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+                        },
+                        "",
+                    ),
+                };
+
+                let final_content_style = if is_cursor {
+                    base_content_style
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::UNDERLINED)
+                } else {
+                    base_content_style
+                };
+
+                let structure_style = final_content_style
+                    .remove_modifier(Modifier::CROSSED_OUT)
+                    .remove_modifier(Modifier::UNDERLINED);
+                let mut spans = vec![
+                    Span::styled(indent_str, structure_style),
+                    Span::styled(icon, structure_style),
+                    Span::styled(&item.node.name, final_content_style),
+                ];
+
+                if !item.node.is_dir {
+                    if !is_narrow {
+                        spans.push(Span::styled(
+                            format!(" ({}) ", format_bytes(item.node.payload.size)),
+                            structure_style,
+                        ));
+                    }
+                    if !tag.is_empty() {
+                        spans.push(Span::styled(tag, structure_style));
+                    }
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        list_items.extend(tree_items);
+        f.render_widget(List::new(list_items), inner_area);
+        return;
+    }
+
+    if let Some(p) = path {
+        let file_bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                f.render_widget(
+                    Paragraph::new(format!("Read Error: {}", e))
+                        .style(ctx.apply(Style::default().fg(ctx.state_error()))),
+                    inner_area,
+                );
+                return;
+            }
+        };
+
+        let torrent = match crate::torrent_file::parser::from_bytes(&file_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                f.render_widget(
+                    Paragraph::new(format!("Invalid Torrent: {}", e))
+                        .style(ctx.apply(Style::default().fg(ctx.state_error()))),
+                    inner_area,
+                );
+                return;
+            }
+        };
+
+        let total_size = torrent.info.total_length();
+        let protocol_version = match torrent.info.meta_version {
+            Some(2) => {
+                if !torrent.info.pieces.is_empty() {
+                    "BitTorrent v2 (Hybrid)"
+                } else {
+                    "BitTorrent v2 (Pure)"
+                }
+            }
+            _ => "BitTorrent v1",
+        };
+        let info_text = vec![
+            Line::from(vec![
+                Span::styled(
+                    "Name: ",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::raw(&torrent.info.name),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Protocol: ",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    protocol_version,
+                    Style::default().fg(ctx.state_selected()).bold(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Size: ",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::raw(format_bytes(total_size as u64)),
+            ]),
+        ];
+
+        let layout = Layout::vertical([
+            Constraint::Length(info_text.len() as u16 + 1),
+            Constraint::Min(0),
+        ])
+        .split(inner_area);
+        f.render_widget(
+            Paragraph::new(info_text).block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border))),
+            ),
+            layout[0],
+        );
+
+        let file_list_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = torrent
+            .file_list()
+            .into_iter()
+            .map(|(path, size)| {
+                (
+                    path,
+                    TorrentPreviewPayload {
+                        file_index: None,
+                        size,
+                        priority: FilePriority::Normal,
+                    },
+                )
+            })
+            .collect();
+
+        let final_nodes = RawNode::from_path_list(None, file_list_payloads);
+        let mut temp_state = TreeViewState::default();
+        for node in &final_nodes {
+            node.expand_all(&mut temp_state);
+        }
+
+        let visible_rows = TreeMathHelper::get_visible_slice(
+            &final_nodes,
+            &temp_state,
+            TreeFilter::default(),
+            layout[1].height as usize,
+        );
+
+        let list_items: Vec<ListItem> = visible_rows
+            .iter()
+            .map(|item| {
+                let indent = if is_narrow {
+                    " ".repeat(item.depth)
+                } else {
+                    "  ".repeat(item.depth)
+                };
+                let icon = if item.node.is_dir {
+                    ASCII_TREE_DIR_ICON
+                } else {
+                    ASCII_TREE_FILE_ICON
+                };
+                let style = if item.node.is_dir {
+                    ctx.apply(Style::default().fg(ctx.state_info()))
+                } else {
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+                };
+                let mut spans = vec![
+                    Span::raw(indent),
+                    Span::styled(icon, style),
+                    Span::styled(&item.node.name, style),
+                ];
+                if !item.node.is_dir && !is_narrow {
+                    spans.push(Span::styled(
+                        format!(" ({})", format_bytes(item.node.payload.size)),
+                        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        f.render_widget(List::new(list_items), layout[1]);
+    }
 }
 
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
