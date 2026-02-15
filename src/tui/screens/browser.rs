@@ -662,11 +662,17 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
     if let CrosstermEvent::Key(key) = event {
         if key.kind == KeyEventKind::Press {
-            if handle_search_interceptor(
-                key.code,
-                &mut app.app_state.ui.is_searching,
-                &mut app.app_state.ui.search_query,
-            ) {
+            if let Some(action) =
+                map_search_key_to_browser_action(key.code, app.app_state.ui.is_searching)
+            {
+                let reduced = reduce_browser_action(
+                    action,
+                    &mut app.app_state.ui.is_searching,
+                    &mut app.app_state.ui.search_query,
+                );
+                if reduced.redraw {
+                    app.app_state.ui.needs_redraw = true;
+                }
                 return;
             }
 
@@ -792,33 +798,73 @@ pub enum ConfirmDecision {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrowserAction {
+    SearchEsc,
+    SearchEnter,
+    SearchBackspace,
+    SearchChar(char),
+    SearchNoop,
+}
+
+pub struct BrowserReduceResult {
+    pub consumed: bool,
+    pub redraw: bool,
+}
+
+fn map_search_key_to_browser_action(key_code: KeyCode, is_searching: bool) -> Option<BrowserAction> {
+    if !is_searching {
+        return None;
+    }
+
+    Some(match key_code {
+        KeyCode::Esc => BrowserAction::SearchEsc,
+        KeyCode::Enter => BrowserAction::SearchEnter,
+        KeyCode::Backspace => BrowserAction::SearchBackspace,
+        KeyCode::Char(c) => BrowserAction::SearchChar(c),
+        _ => BrowserAction::SearchNoop,
+    })
+}
+
+pub fn reduce_browser_action(
+    action: BrowserAction,
+    is_searching: &mut bool,
+    search_query: &mut String,
+) -> BrowserReduceResult {
+    match action {
+        BrowserAction::SearchEsc => {
+            *is_searching = false;
+            search_query.clear();
+        }
+        BrowserAction::SearchEnter => {
+            *is_searching = false;
+        }
+        BrowserAction::SearchBackspace => {
+            search_query.pop();
+        }
+        BrowserAction::SearchChar(c) => {
+            search_query.push(c);
+        }
+        BrowserAction::SearchNoop => {}
+    }
+
+    BrowserReduceResult {
+        consumed: true,
+        redraw: true,
+    }
+}
+
 pub fn handle_search_interceptor(
     key_code: KeyCode,
     is_searching: &mut bool,
     search_query: &mut String,
 ) -> bool {
-    if !*is_searching {
-        return false;
+    if let Some(action) = map_search_key_to_browser_action(key_code, *is_searching) {
+        let reduced = reduce_browser_action(action, is_searching, search_query);
+        reduced.consumed
+    } else {
+        false
     }
-
-    match key_code {
-        KeyCode::Esc => {
-            *is_searching = false;
-            search_query.clear();
-        }
-        KeyCode::Enter => {
-            *is_searching = false;
-        }
-        KeyCode::Backspace => {
-            search_query.pop();
-        }
-        KeyCode::Char(c) => {
-            search_query.push(c);
-        }
-        _ => {}
-    }
-
-    true
 }
 
 pub fn handle_download_name_edit_guard(key_code: KeyCode, browser_mode: &mut FileBrowserMode) -> bool {
@@ -1301,6 +1347,32 @@ mod tests {
         assert!(consumed);
         assert!(!is_searching);
         assert!(query.is_empty());
+    }
+
+    #[test]
+    fn reducer_search_char_appends_and_consumes() {
+        let mut is_searching = true;
+        let mut query = String::from("ab");
+
+        let out = reduce_browser_action(BrowserAction::SearchChar('c'), &mut is_searching, &mut query);
+
+        assert!(out.consumed);
+        assert!(out.redraw);
+        assert!(is_searching);
+        assert_eq!(query, "abc");
+    }
+
+    #[test]
+    fn reducer_search_noop_still_consumes_when_searching() {
+        let mut is_searching = true;
+        let mut query = String::from("abc");
+
+        let out = reduce_browser_action(BrowserAction::SearchNoop, &mut is_searching, &mut query);
+
+        assert!(out.consumed);
+        assert!(out.redraw);
+        assert!(is_searching);
+        assert_eq!(query, "abc");
     }
 
     #[test]
