@@ -64,18 +64,13 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         }
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
-        AppMode::Config {
-            settings_edit,
-            selected_index,
-            items,
-            editing,
-        } => {
+        AppMode::Config => {
             if let config::ConfigOutcome::ToNormal = config::handle_event(
                 event,
-                settings_edit,
-                selected_index,
-                items.as_mut_slice(),
-                editing,
+                &mut app.app_state.ui.config.settings_edit,
+                &mut app.app_state.ui.config.selected_index,
+                app.app_state.ui.config.items.as_mut_slice(),
+                &mut app.app_state.ui.config.editing,
                 &app.app_command_tx,
                 &app.global_dl_bucket,
                 &app.global_ul_bucket,

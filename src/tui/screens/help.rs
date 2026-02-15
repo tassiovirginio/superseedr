@@ -549,7 +549,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                 ]),
             ],
         ),
-        AppMode::Config { .. } => (
+        AppMode::Config => (
             " Help / Config ",
             vec![
                 Row::new(vec![

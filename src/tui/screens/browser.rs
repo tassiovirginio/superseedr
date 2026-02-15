@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    App, AppCommand, AppMode, BrowserPane, ConfigItem, FileBrowserMode, FileMetadata,
+    App, AppCommand, AppMode, BrowserPane, ConfigItem, ConfigUiState, FileBrowserMode, FileMetadata,
     FilePriority, TorrentControlState, TorrentDisplayState, TorrentPreviewPayload,
 };
 use crate::theme::ThemeContext;
@@ -756,8 +756,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                     app.app_state.ui.search_query.clear();
                 }
                 KeyCode::Esc => {
-                    if let Some(mode) = escape_to_config_mode(browser_mode) {
-                        app.app_state.mode = mode;
+                    if let Some(config_ui) = escape_to_config_mode(browser_mode) {
+                        app.app_state.ui.config = config_ui;
+                        app.app_state.mode = AppMode::Config;
                         return;
                     }
 
@@ -786,7 +787,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 }
 
 pub enum ConfirmDecision {
-    ToConfig(AppMode),
+    ToConfig(ConfigUiState),
     Download(DownloadConfirmPayload),
     File(PathBuf),
     None,
@@ -1079,7 +1080,7 @@ pub fn handle_filesystem_navigation(
 pub fn confirm_config_path_selection(
     state: &TreeViewState,
     browser_mode: &FileBrowserMode,
-) -> Option<AppMode> {
+) -> Option<ConfigUiState> {
     if let FileBrowserMode::ConfigPathSelection {
         target_item,
         current_settings,
@@ -1096,7 +1097,7 @@ pub fn confirm_config_path_selection(
             _ => {}
         }
 
-        return Some(AppMode::Config {
+        return Some(ConfigUiState {
             settings_edit: new_settings,
             selected_index: *selected_index,
             items: items.clone(),
@@ -1106,7 +1107,7 @@ pub fn confirm_config_path_selection(
     None
 }
 
-pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<AppMode> {
+pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiState> {
     if let FileBrowserMode::ConfigPathSelection {
         current_settings,
         selected_index,
@@ -1114,7 +1115,7 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<AppMode> 
         ..
     } = browser_mode
     {
-        return Some(AppMode::Config {
+        return Some(ConfigUiState {
             settings_edit: current_settings.clone(),
             selected_index: *selected_index,
             items: items.clone(),
@@ -1140,8 +1141,8 @@ pub fn selected_torrent_file_for_confirm(
 }
 
 pub fn resolve_confirm_decision(state: &TreeViewState, browser_mode: &FileBrowserMode) -> ConfirmDecision {
-    if let Some(mode) = confirm_config_path_selection(state, browser_mode) {
-        return ConfirmDecision::ToConfig(mode);
+    if let Some(config_ui) = confirm_config_path_selection(state, browser_mode) {
+        return ConfirmDecision::ToConfig(config_ui);
     }
     if let Some(payload) = build_download_confirm_payload(state, browser_mode) {
         return ConfirmDecision::Download(payload);
@@ -1154,9 +1155,10 @@ pub fn resolve_confirm_decision(state: &TreeViewState, browser_mode: &FileBrowse
 
 pub async fn execute_confirm_decision(app: &mut App, decision: ConfirmDecision) {
     match decision {
-        ConfirmDecision::ToConfig(mode) => {
+        ConfirmDecision::ToConfig(config_ui) => {
             tracing::info!(target: "superseedr", "Confirming Config Path Selection");
-            app.app_state.mode = mode;
+            app.app_state.ui.config = config_ui;
+            app.app_state.mode = AppMode::Config;
         }
         ConfirmDecision::Download(payload) => {
             if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
@@ -1441,7 +1443,7 @@ mod tests {
             ..Default::default()
         };
         let out = confirm_config_path_selection(&state, &mode);
-        assert!(matches!(out, Some(AppMode::Config { .. })));
+        assert!(matches!(out, Some(ConfigUiState { .. })));
     }
 
     #[test]
@@ -1457,7 +1459,7 @@ mod tests {
             ..Default::default()
         };
         let decision = resolve_confirm_decision(&state, &mode);
-        assert!(matches!(decision, ConfirmDecision::ToConfig(AppMode::Config { .. })));
+        assert!(matches!(decision, ConfirmDecision::ToConfig(ConfigUiState { .. })));
     }
 
     #[test]

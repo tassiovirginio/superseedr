@@ -36,13 +36,15 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             apply_theme_effects_to_frame(f, &ctx);
             return;
         }
-        AppMode::Config {
-            settings_edit,
-            selected_index,
-            items,
-            editing,
-        } => {
-            config::draw(f, &screen, settings_edit, *selected_index, items, editing);
+        AppMode::Config => {
+            config::draw(
+                f,
+                &screen,
+                &app_state.ui.config.settings_edit,
+                app_state.ui.config.selected_index,
+                &app_state.ui.config.items,
+                &app_state.ui.config.editing,
+            );
             apply_theme_effects_to_frame(f, &ctx);
             return;
         }

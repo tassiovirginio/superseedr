@@ -396,12 +396,7 @@ pub enum AppMode {
         info_hash: Vec<u8>,
         with_files: bool,
     },
-    Config {
-        settings_edit: Box<Settings>,
-        selected_index: usize,
-        items: Vec<ConfigItem>,
-        editing: Option<(ConfigItem, String)>,
-    },
+    Config,
     FileBrowser {
         state: TreeViewState,
         data: Vec<RawNode<FileMetadata>>,
@@ -511,6 +506,25 @@ pub struct UiState {
     pub selected_peer_index: usize,
     pub is_searching: bool,
     pub search_query: String,
+    pub config: ConfigUiState,
+}
+
+pub struct ConfigUiState {
+    pub settings_edit: Box<Settings>,
+    pub selected_index: usize,
+    pub items: Vec<ConfigItem>,
+    pub editing: Option<(ConfigItem, String)>,
+}
+
+impl Default for ConfigUiState {
+    fn default() -> Self {
+        Self {
+            settings_edit: Box::default(),
+            selected_index: 0,
+            items: Vec::new(),
+            editing: None,
+        }
+    }
 }
 
 #[derive(Default)]

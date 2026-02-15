@@ -3013,13 +3013,11 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         app.app_state.should_quit = true;
                     }
                     KeyCode::Char('c') => {
-                        let items = ConfigItem::iter().collect::<Vec<_>>();
-                        app.app_state.mode = AppMode::Config {
-                            settings_edit: Box::new(app.client_configs.clone()),
-                            selected_index: 0,
-                            items,
-                            editing: None,
-                        };
+                        app.app_state.ui.config.settings_edit = Box::new(app.client_configs.clone());
+                        app.app_state.ui.config.selected_index = 0;
+                        app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
+                        app.app_state.ui.config.editing = None;
+                        app.app_state.mode = AppMode::Config;
                     }
                     KeyCode::Char('t') => {
                         app.app_state.graph_mode = app.app_state.graph_mode.next();
