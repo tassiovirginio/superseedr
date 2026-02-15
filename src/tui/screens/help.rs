@@ -17,15 +17,21 @@ pub enum HelpKeyResult {
 
 #[cfg(windows)]
 pub fn handle_key(key: KeyEvent, app_state: &mut AppState) -> HelpKeyResult {
-    if key.code == KeyCode::Char('m')
-        && key.kind == KeyEventKind::Press
-        && matches!(app_state.mode, AppMode::Normal)
-    {
-        app_state.show_help = !app_state.show_help;
-        return HelpKeyResult::Consumed { redraw: true };
+    if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Press {
+        match app_state.mode {
+            AppMode::Normal => {
+                app_state.mode = AppMode::Help;
+                return HelpKeyResult::Consumed { redraw: true };
+            }
+            AppMode::Help => {
+                app_state.mode = AppMode::Normal;
+                return HelpKeyResult::Consumed { redraw: true };
+            }
+            _ => {}
+        }
     }
 
-    if app_state.show_help {
+    if matches!(app_state.mode, AppMode::Help) {
         return HelpKeyResult::Consumed { redraw: false };
     }
 
@@ -34,13 +40,11 @@ pub fn handle_key(key: KeyEvent, app_state: &mut AppState) -> HelpKeyResult {
 
 #[cfg(not(windows))]
 pub fn handle_key(key: KeyEvent, app_state: &mut AppState) -> HelpKeyResult {
-    if app_state.show_help {
+    if matches!(app_state.mode, AppMode::Help) {
         if key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('m')
-                && key.kind == KeyEventKind::Release
-                && matches!(app_state.mode, AppMode::Normal))
+            || (key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Release)
         {
-            app_state.show_help = false;
+            app_state.mode = AppMode::Normal;
             return HelpKeyResult::Consumed { redraw: true };
         }
         return HelpKeyResult::Consumed { redraw: false };
@@ -50,7 +54,7 @@ pub fn handle_key(key: KeyEvent, app_state: &mut AppState) -> HelpKeyResult {
         && key.kind == KeyEventKind::Press
         && matches!(app_state.mode, AppMode::Normal)
     {
-        app_state.show_help = true;
+        app_state.mode = AppMode::Help;
         return HelpKeyResult::Consumed { redraw: true };
     }
 
@@ -217,7 +221,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
     let level_text = format!("Level {} ({:.0}%)", lvl, progress * 100.0);
 
     let (title, rows) = match mode {
-        AppMode::Normal | AppMode::Welcome => (
+        AppMode::Normal | AppMode::Welcome | AppMode::Help => (
             " Manual / Help ",
             vec![
                 Row::new(vec![Cell::from(Span::styled(

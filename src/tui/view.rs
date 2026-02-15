@@ -21,13 +21,12 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let ctx = ThemeContext::new(app_state.theme, app_state.ui.effects_phase_time);
     let screen = ScreenContext::new(app_state, settings, &ctx);
 
-    if app_state.show_help {
-        help::draw(f, &screen);
-        apply_theme_effects_to_frame(f, &ctx);
-        return;
-    }
-
     match &app_state.mode {
+        AppMode::Help => {
+            help::draw(f, &screen);
+            apply_theme_effects_to_frame(f, &ctx);
+            return;
+        }
         AppMode::Welcome => {
             welcome::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);

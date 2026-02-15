@@ -57,9 +57,9 @@
 - `DeleteConfirm`: `Enter` confirms and returns to `Normal`; `Esc` cancels.
 
 ## Help Overlay
-- `show_help` remains a global overlay flag (not a dedicated `AppMode` yet).
-- Windows: `m` press toggles help.
-- Non-Windows: `m` press opens, `m` release closes, `Esc` closes.
+- Help now uses dedicated route mode: `AppMode::Help`.
+- Windows: `m` press toggles between `Normal` and `Help`.
+- Non-Windows: `m` press opens help from `Normal`; `m` release or `Esc` closes to `Normal`.
 
 ## Invariants
 - Reducers are deterministic and side-effect free; side effects execute via effect runners.

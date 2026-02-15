@@ -83,6 +83,7 @@ fn handle_global_key_hooks(event: &CrosstermEvent, app: &mut App) -> bool {
 
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
+        AppMode::Help => {}
         AppMode::Welcome => {
             welcome::handle_event(event, &mut app.app_state);
         }

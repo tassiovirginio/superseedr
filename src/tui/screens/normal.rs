@@ -56,7 +56,7 @@ static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
 const MINUTES_HISTORY_MAX: usize = 48 * 60;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
     ClearSystemError,
     StartSearch,
@@ -67,7 +67,9 @@ pub enum UiAction {
     GraphNext,
     GraphPrev,
     OpenAddTorrentBrowser,
-    OpenDeleteConfirm { with_files: bool },
+    OpenDeleteConfirm {
+        with_files: bool,
+    },
     OpenConfig,
     DataRateSlower,
     DataRateFaster,
@@ -75,6 +77,10 @@ pub enum UiAction {
     ThemeNext,
     TogglePauseSelected,
     SortBySelectedColumn,
+    OpenHelp,
+    PasteText(String),
+    #[cfg(windows)]
+    PasteFromClipboard,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +92,10 @@ pub enum UiEffect {
     ApplyThemeNext,
     SendPause(Vec<u8>),
     SendResume(Vec<u8>),
+    OpenHelpScreen,
+    HandlePastedText(String),
+    #[cfg(windows)]
+    ReadClipboardAndPaste,
 }
 
 #[derive(Default)]
@@ -293,6 +303,19 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
                 effects: Vec::new(),
             }
         }
+        UiAction::OpenHelp => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::OpenHelpScreen],
+        },
+        UiAction::PasteText(text) => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::HandlePastedText(text)],
+        },
+        #[cfg(windows)]
+        UiAction::PasteFromClipboard => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::ReadClipboardAndPaste],
+        },
     }
 }
 
@@ -309,6 +332,9 @@ fn map_key_to_ui_action(key_code: KeyCode) -> Option<UiAction> {
         KeyCode::Char('d') => Some(UiAction::OpenDeleteConfirm { with_files: false }),
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
+        KeyCode::Char('m') => Some(UiAction::OpenHelp),
+        #[cfg(windows)]
+        KeyCode::Char('v') => Some(UiAction::PasteFromClipboard),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
         KeyCode::Char(']') | KeyCode::Char('}') => Some(UiAction::DataRateFaster),
         KeyCode::Char('<') => Some(UiAction::ThemePrev),
@@ -3289,26 +3315,21 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         }
         #[cfg(not(windows))]
         CrosstermEvent::Paste(pasted_text) => {
-            handle_pasted_text(app, pasted_text.trim()).await;
+            let _ = handle_paste_text(pasted_text.trim().to_string(), app).await;
         }
         _ => {}
     };
 }
 
 async fn handle_key_press(key_code: KeyCode, app: &mut App) -> bool {
-    if handle_reducer_key(key_code, app) {
-        return true;
-    }
-
-    #[cfg(windows)]
-    if handle_windows_clipboard_key(key_code, app).await {
+    if handle_reducer_key(key_code, app).await {
         return true;
     }
 
     false
 }
 
-fn handle_reducer_key(key_code: KeyCode, app: &mut App) -> bool {
+async fn handle_reducer_key(key_code: KeyCode, app: &mut App) -> bool {
     let Some(action) = map_key_to_ui_action(key_code) else {
         return false;
     };
@@ -3317,17 +3338,26 @@ fn handle_reducer_key(key_code: KeyCode, app: &mut App) -> bool {
     if result.redraw {
         app.app_state.ui.needs_redraw = true;
     }
-    execute_ui_effects(app, result.effects);
+    execute_ui_effects(app, result.effects).await;
     true
 }
 
-fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
+async fn handle_paste_text(text: String, app: &mut App) -> bool {
+    let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
+    if result.redraw {
+        app.app_state.ui.needs_redraw = true;
+    }
+    execute_ui_effects(app, result.effects).await;
+    true
+}
+
+async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
     for effect in effects {
-        execute_ui_effect(app, effect);
+        execute_ui_effect(app, effect).await;
     }
 }
 
-fn execute_ui_effect(app: &mut App, effect: UiEffect) {
+async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
     match effect {
         UiEffect::OpenAddTorrentFileBrowser => {
             let initial_path = app.get_initial_source_path();
@@ -3403,13 +3433,14 @@ fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 });
             }
         }
-    }
-}
-
-#[cfg(windows)]
-async fn handle_windows_clipboard_key(key_code: KeyCode, app: &mut App) -> bool {
-    match key_code {
-        KeyCode::Char('v') => match ClipboardContext::new() {
+        UiEffect::OpenHelpScreen => {
+            app.app_state.mode = AppMode::Help;
+        }
+        UiEffect::HandlePastedText(text) => {
+            handle_pasted_text(app, &text).await;
+        }
+        #[cfg(windows)]
+        UiEffect::ReadClipboardAndPaste => match ClipboardContext::new() {
             Ok(mut ctx) => match ctx.get_contents() {
                 Ok(text) => {
                     handle_pasted_text(app, text.trim()).await;
@@ -3424,9 +3455,7 @@ async fn handle_windows_clipboard_key(key_code: KeyCode, app: &mut App) -> bool 
                 app.app_state.system_error = Some(format!("Clipboard initialization error: {}", e));
             }
         },
-        _ => return false,
     }
-    true
 }
 
 #[cfg(test)]
@@ -3716,5 +3745,29 @@ mod tests {
 
         assert_eq!(app_state.peer_sort.0, PeerSortColumn::Flags);
         assert_eq!(app_state.peer_sort.1, SortDirection::Descending);
+    }
+
+    #[test]
+    fn reducer_open_help_emits_help_effect() {
+        let mut app_state = create_test_app_state();
+        let out = reduce_ui_action(&mut app_state, UiAction::OpenHelp);
+        assert!(out.redraw);
+        assert_eq!(out.effects, vec![UiEffect::OpenHelpScreen]);
+    }
+
+    #[test]
+    fn reducer_paste_text_emits_paste_effect() {
+        let mut app_state = create_test_app_state();
+        let out = reduce_ui_action(
+            &mut app_state,
+            UiAction::PasteText("magnet:?xt=urn:btih:test".to_string()),
+        );
+        assert!(out.redraw);
+        assert_eq!(
+            out.effects,
+            vec![UiEffect::HandlePastedText(
+                "magnet:?xt=urn:btih:test".to_string()
+            )]
+        );
     }
 }

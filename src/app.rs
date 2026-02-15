@@ -392,6 +392,7 @@ pub enum AppMode {
     Welcome,
     #[default]
     Normal,
+    Help,
     PowerSaving,
     DeleteConfirm,
     Config,
@@ -547,7 +548,6 @@ pub struct AppState {
 
     pub screen_area: Rect,
     pub mode: AppMode,
-    pub show_help: bool,
     pub externally_accessable_port: bool,
     pub anonymize_torrent_names: bool,
 
