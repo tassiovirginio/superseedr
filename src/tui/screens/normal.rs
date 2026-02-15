@@ -10,25 +10,31 @@ use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::events::{handle_navigation, handle_pasted_text};
 use crate::tui::formatters::{
-    format_bytes, format_countdown, format_duration, format_speed, sanitize_text, speed_to_style,
-    truncate_with_ellipsis,
+    format_bytes, format_countdown, format_duration, format_speed, ip_to_color, parse_peer_id,
+    sanitize_text, speed_to_style, truncate_with_ellipsis,
 };
 use crate::tui::layout::calculate_layout;
+use crate::tui::layout::compute_smart_table_layout;
 use crate::tui::layout::compute_visible_peer_columns;
 use crate::tui::layout::compute_visible_torrent_columns;
 use crate::tui::layout::get_peer_columns;
 use crate::tui::layout::get_torrent_columns;
 use crate::tui::layout::LayoutContext;
+use crate::tui::layout::{PeerColumnId, SmartCol};
 use crate::app::torrent_completion_percent;
+use crate::app::PeerInfo;
 
 #[cfg(windows)]
 use clipboard::{ClipboardContext, ClipboardProvider};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use ratatui::layout::Layout;
 use ratatui::prelude::{
-    symbols, Alignment, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style, Stylize,
+    symbols, Alignment, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
+    Stylize,
 };
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, LineGauge, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, Gauge, LineGauge, Padding, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use strum::IntoEnumIterator;
 #[cfg(windows)]
@@ -1066,6 +1072,438 @@ pub fn draw_details_panel(
             detail_rows[6],
         );
     }
+}
+
+pub fn draw_peers_table(f: &mut Frame, app_state: &AppState, peers_chunk: Rect, ctx: &ThemeContext) {
+    if peers_chunk.height < 2 || peers_chunk.width < 2 {
+        return;
+    }
+
+    if let Some(info_hash) = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+    {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let state = &torrent.latest_state;
+
+            if peers_chunk.height > 0 {
+                let has_established_peers =
+                    state.peers.iter().any(|p| p.last_action != "Connecting...");
+
+                let mut peers_to_display: Vec<PeerInfo> = if has_established_peers {
+                    state
+                        .peers
+                        .iter()
+                        .filter(|p| p.last_action != "Connecting...")
+                        .cloned()
+                        .collect()
+                } else {
+                    state.peers.clone()
+                };
+
+                let (sort_by, sort_direction) = app_state.peer_sort;
+                peers_to_display.sort_by(|a, b| {
+                    use crate::config::PeerSortColumn::*;
+                    let ordering = match sort_by {
+                        Flags => a.peer_choking.cmp(&b.peer_choking),
+                        Completed => {
+                            let total = state.number_of_pieces_total as usize;
+                            if total == 0 {
+                                std::cmp::Ordering::Equal
+                            } else {
+                                let a_c = a.bitfield.iter().take(total).filter(|&&h| h).count();
+                                let b_c = b.bitfield.iter().take(total).filter(|&&h| h).count();
+                                a_c.cmp(&b_c)
+                            }
+                        }
+                        Address => a.address.cmp(&b.address),
+                        Client => a.peer_id.cmp(&b.peer_id),
+                        Action => a.last_action.cmp(&b.last_action),
+                        DL => a.download_speed_bps.cmp(&b.download_speed_bps),
+                        UL => a.upload_speed_bps.cmp(&b.upload_speed_bps),
+                    };
+                    if sort_direction == SortDirection::Ascending {
+                        ordering
+                    } else {
+                        ordering.reverse()
+                    }
+                });
+
+                let all_peer_cols = get_peer_columns();
+                let smart_cols: Vec<SmartCol> = all_peer_cols
+                    .iter()
+                    .map(|c| SmartCol {
+                        min_width: c.min_width,
+                        priority: c.priority,
+                        constraint: c.default_constraint,
+                    })
+                    .collect();
+
+                let (constraints, visible_indices) =
+                    compute_smart_table_layout(&smart_cols, peers_chunk.width, 1);
+
+                let peer_border_style =
+                    if matches!(app_state.selected_header, SelectedHeader::Peer(_)) {
+                        ctx.apply(Style::default().fg(ctx.state_selected()))
+                    } else {
+                        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
+                    };
+
+                if peers_to_display.is_empty() {
+                    draw_swarm_heatmap(
+                        f,
+                        ctx,
+                        &state.peers,
+                        state.number_of_pieces_total,
+                        peers_chunk,
+                    );
+                } else {
+                    let header_cells: Vec<Cell> = visible_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(visual_idx, &real_idx)| {
+                            let def = &all_peer_cols[real_idx];
+
+                            let is_selected =
+                                app_state.selected_header == SelectedHeader::Peer(visual_idx);
+                            let is_sorting = def.sort_enum == Some(sort_by);
+
+                            let mut style = ctx.apply(Style::default().fg(ctx.state_warning()));
+                            if is_sorting {
+                                style = style.fg(ctx.state_selected());
+                            }
+                            style = ctx.apply(style);
+
+                            let mut text = def.header.to_string();
+                            if is_sorting {
+                                text.push_str(if sort_direction == SortDirection::Ascending {
+                                    " ▲"
+                                } else {
+                                    " ▼"
+                                });
+                            }
+
+                            let mut span = Span::styled(text, style);
+                            if is_selected {
+                                span = span.underlined().bold();
+                            }
+                            Cell::from(Line::from(vec![span]))
+                        })
+                        .collect();
+
+                    let peer_header = Row::new(header_cells).height(1);
+
+                    let peer_rows = peers_to_display.iter().map(|peer| {
+                        let row_color =
+                            if peer.download_speed_bps == 0 && peer.upload_speed_bps == 0 {
+                                ctx.theme.semantic.surface1
+                            } else {
+                                ip_to_color(ctx, &peer.address)
+                            };
+
+                        let cells: Vec<Cell> = visible_indices
+                            .iter()
+                            .map(|&real_idx| {
+                                let def = &all_peer_cols[real_idx];
+                                match def.id {
+                                    PeerColumnId::Flags => Line::from(vec![
+                                        Span::styled(
+                                            "■",
+                                            ctx.apply(Style::default().fg(if peer.am_interested {
+                                                ctx.accent_sapphire()
+                                            } else {
+                                                ctx.theme.semantic.surface1
+                                            })),
+                                        ),
+                                        Span::styled(
+                                            "■",
+                                            ctx.apply(Style::default().fg(if peer.peer_choking {
+                                                ctx.accent_maroon()
+                                            } else {
+                                                ctx.theme.semantic.surface1
+                                            })),
+                                        ),
+                                        Span::styled(
+                                            "■",
+                                            ctx.apply(Style::default().fg(
+                                                if peer.peer_interested {
+                                                    ctx.accent_teal()
+                                                } else {
+                                                    ctx.theme.semantic.surface1
+                                                },
+                                            )),
+                                        ),
+                                        Span::styled(
+                                            "■",
+                                            ctx.apply(Style::default().fg(if peer.am_choking {
+                                                ctx.accent_peach()
+                                            } else {
+                                                ctx.theme.semantic.surface1
+                                            })),
+                                        ),
+                                    ])
+                                    .into(),
+                                    PeerColumnId::Address => {
+                                        let display = if app_state.anonymize_torrent_names {
+                                            "xxx.xxx.xxx"
+                                        } else {
+                                            &peer.address
+                                        };
+                                        Cell::from(display.to_string())
+                                    }
+                                    PeerColumnId::Client => {
+                                        let raw_client = parse_peer_id(&peer.peer_id);
+                                        Cell::from(sanitize_text(&raw_client))
+                                    }
+                                    PeerColumnId::Action => Cell::from(peer.last_action.clone()),
+                                    PeerColumnId::Progress => {
+                                        let total = state.number_of_pieces_total as usize;
+                                        let pct = if total > 0 {
+                                            let c = peer
+                                                .bitfield
+                                                .iter()
+                                                .take(total)
+                                                .filter(|&&b| b)
+                                                .count();
+                                            (c as f64 / total as f64) * 100.0
+                                        } else {
+                                            0.0
+                                        };
+                                        Cell::from(format!("{:.0}%", pct))
+                                    }
+                                    PeerColumnId::DownSpeed => {
+                                        if peers_chunk.width > 120 {
+                                            Cell::from(format!(
+                                                "{} ({})",
+                                                format_speed(peer.download_speed_bps),
+                                                format_bytes(peer.total_downloaded)
+                                            ))
+                                        } else {
+                                            Cell::from(format_speed(peer.download_speed_bps))
+                                        }
+                                    }
+                                    PeerColumnId::UpSpeed => {
+                                        if peers_chunk.width > 120 {
+                                            Cell::from(format!(
+                                                "{} ({})",
+                                                format_speed(peer.upload_speed_bps),
+                                                format_bytes(peer.total_uploaded)
+                                            ))
+                                        } else {
+                                            Cell::from(format_speed(peer.upload_speed_bps))
+                                        }
+                                    }
+                                }
+                            })
+                            .collect();
+                        Row::new(cells).style(ctx.apply(Style::default().fg(row_color)))
+                    });
+
+                    let peers_table = Table::new(peer_rows, constraints)
+                        .header(peer_header)
+                        .block(Block::default());
+
+                    let table_rows_needed: u16 = 1 + peers_to_display.len() as u16;
+                    let peer_block_height_needed: u16 = table_rows_needed + 1;
+                    let remaining_height =
+                        peers_chunk.height.saturating_sub(peer_block_height_needed);
+                    const MIN_HEATMAP_HEIGHT: u16 = 4;
+
+                    let peers_block = Block::default()
+                        .padding(Padding::new(1, 1, 0, 0))
+                        .border_style(peer_border_style);
+
+                    if remaining_height >= MIN_HEATMAP_HEIGHT {
+                        let layout_chunks = Layout::vertical([
+                            Constraint::Length(peer_block_height_needed),
+                            Constraint::Min(0),
+                        ])
+                        .split(peers_chunk);
+                        let inner_peers_area = peers_block.inner(layout_chunks[0]);
+                        f.render_widget(peers_block, layout_chunks[0]);
+                        f.render_widget(peers_table, inner_peers_area);
+                        draw_swarm_heatmap(
+                            f,
+                            ctx,
+                            &state.peers,
+                            state.number_of_pieces_total,
+                            layout_chunks[1],
+                        );
+                    } else {
+                        let inner_peers_area = peers_block.inner(peers_chunk);
+                        f.render_widget(peers_block, peers_chunk);
+                        f.render_widget(peers_table, inner_peers_area);
+                    }
+                }
+            }
+        }
+    } else {
+        draw_swarm_heatmap(f, ctx, &[], 0, peers_chunk);
+    }
+}
+
+fn draw_swarm_heatmap(
+    f: &mut Frame,
+    ctx: &ThemeContext,
+    peers: &[PeerInfo],
+    total_pieces: u32,
+    area: Rect,
+) {
+    let color_status_low = ctx.apply(
+        Style::default()
+            .fg(ctx.state_error())
+            .add_modifier(Modifier::DIM),
+    );
+    let color_status_medium = ctx.apply(
+        Style::default()
+            .fg(ctx.state_warning())
+            .add_modifier(Modifier::DIM),
+    );
+    let color_status_high = ctx.apply(
+        Style::default()
+            .fg(ctx.state_info())
+            .add_modifier(Modifier::DIM),
+    );
+    let color_status_complete = ctx.apply(
+        Style::default()
+            .fg(ctx.state_complete())
+            .add_modifier(Modifier::BOLD),
+    );
+    let color_status_empty = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
+    let color_status_waiting = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
+
+    let color_heatmap_low = ctx.theme.scale.heatmap.low;
+    let color_heatmap_medium = ctx.theme.scale.heatmap.medium;
+    let color_heatmap_high = ctx.theme.scale.heatmap.high;
+    let color_heatmap_empty = ctx.theme.scale.heatmap.empty;
+
+    let shade_light = symbols::shade::LIGHT;
+    let shade_medium = symbols::shade::MEDIUM;
+    let shade_dark = symbols::shade::DARK;
+
+    let total_pieces_usize = total_pieces as usize;
+    let mut availability: Vec<u32> = vec![0; total_pieces_usize];
+    if total_pieces_usize > 0 {
+        for peer in peers {
+            for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces_usize) {
+                if *has_piece {
+                    availability[i] += 1;
+                }
+            }
+        }
+    }
+
+    let max_avail = availability.iter().max().copied().unwrap_or(0);
+    let pieces_available_in_swarm = availability.iter().filter(|&&count| count > 0).count();
+    let is_swarm_complete =
+        total_pieces_usize > 0 && pieces_available_in_swarm == total_pieces_usize;
+    let total_peers = peers.len();
+
+    let (status_text, status_style) = if total_pieces_usize == 0 {
+        ("Waiting...".to_string(), color_status_waiting)
+    } else if is_swarm_complete {
+        ("Complete".to_string(), color_status_complete)
+    } else if max_avail == 0 {
+        ("Empty".to_string(), color_status_empty)
+    } else if total_peers == 0 {
+        ("Low (0%)".to_string(), color_status_low)
+    } else {
+        let availability_percentage =
+            (pieces_available_in_swarm as f64 / total_pieces_usize as f64) * 100.0;
+        if availability_percentage < 33.3 {
+            (
+                format!("Low ({:.0}%)", availability_percentage),
+                color_status_low,
+            )
+        } else if availability_percentage < 66.6 {
+            (
+                format!("Medium ({:.0}%)", availability_percentage),
+                color_status_medium,
+            )
+        } else {
+            (
+                format!("High ({:.0}%)", availability_percentage),
+                color_status_high,
+            )
+        }
+    };
+
+    let title = Line::from(vec![
+        Span::styled(
+            " Swarm Availability: ",
+            ctx.apply(Style::default().fg(ctx.state_complete())),
+        ),
+        Span::styled(status_text, status_style),
+    ]);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::NONE)
+        .padding(Padding::new(1, 1, 0, 1))
+        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    if total_pieces_usize == 0 {
+        let available_width = inner_area.width as usize;
+        let available_height = inner_area.height as usize;
+        let mut lines = Vec::with_capacity(available_height);
+
+        for _ in 0..available_height {
+            let row_str = shade_light.repeat(available_width);
+            lines.push(Line::from(Span::styled(
+                row_str,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface1)),
+            )));
+        }
+
+        let heatmap = Paragraph::new(lines);
+        f.render_widget(heatmap, inner_area);
+        return;
+    }
+
+    let max_avail_f64 = max_avail.max(5) as f64;
+    let available_width = inner_area.width as usize;
+    let available_height = inner_area.height as usize;
+    let total_cells = (available_width * available_height) as u64;
+
+    if total_cells == 0 {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(available_height);
+    let total_pieces_u64 = total_pieces_usize as u64;
+
+    for y in 0..available_height {
+        let mut spans = Vec::with_capacity(available_width);
+        for x in 0..available_width {
+            let cell_index = (y * available_width + x) as u64;
+            let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
+            if piece_index >= total_pieces_usize {
+                spans.push(Span::raw(" "));
+                continue;
+            }
+            let count = availability[piece_index];
+            let (piece_char, color) = if count == 0 {
+                (shade_light, color_heatmap_empty)
+            } else {
+                let norm_val = count as f64 / max_avail_f64;
+                if norm_val < 0.20 {
+                    (shade_light, color_heatmap_low)
+                } else if norm_val < 0.80 {
+                    (shade_medium, color_heatmap_medium)
+                } else {
+                    (shade_dark, color_heatmap_high)
+                }
+            };
+            spans.push(Span::styled(
+                piece_char.to_string(),
+                ctx.apply(Style::default().fg(color)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    let heatmap = Paragraph::new(lines);
+    f.render_widget(heatmap, inner_area);
 }
 
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
