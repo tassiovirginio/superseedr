@@ -14,7 +14,7 @@ use crate::tui::layout::calculate_layout;
 use crate::tui::layout::compute_visible_peer_columns;
 use crate::tui::layout::compute_visible_torrent_columns;
 use crate::tui::layout::LayoutContext;
-use crate::tui::screens::{config, delete_confirm, normal, power, welcome};
+use crate::tui::screens::{browser, config, delete_confirm, normal, power, welcome};
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
 use crate::tui::tree::{TreeAction, TreeFilter, TreeMathHelper};
@@ -175,23 +175,16 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             if let CrosstermEvent::Key(key) = event {
                 if key.kind == KeyEventKind::Press {
                     // 1. Search Interceptor
-                    if app.app_state.is_searching {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.app_state.is_searching = false;
-                                app.app_state.search_query.clear();
-                            }
-                            KeyCode::Enter => {
-                                app.app_state.is_searching = false;
-                            }
-                            KeyCode::Backspace => {
-                                app.app_state.search_query.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                app.app_state.search_query.push(c);
-                            }
-                            _ => {}
-                        }
+                    if browser::handle_search_interceptor(
+                        key.code,
+                        &mut app.app_state.is_searching,
+                        &mut app.app_state.search_query,
+                    ) {
+                        app.app_state.ui_needs_redraw = true;
+                        return; // INTERCEPTED
+                    }
+
+                    if browser::handle_download_name_edit_guard(key.code, browser_mode) {
                         app.app_state.ui_needs_redraw = true;
                         return; // INTERCEPTED
                     }
@@ -209,46 +202,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         ..
                     } = browser_mode
                     {
-                        // Input Guard for Renaming the Container
-                        if *is_editing_name {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    *is_editing_name = false;
-                                }
-                                KeyCode::Esc => {
-                                    *container_name = original_name_backup.clone();
-                                    *is_editing_name = false;
-                                    *cursor_pos = container_name.len();
-                                }
-                                KeyCode::Left => {
-                                    *cursor_pos = cursor_pos.saturating_sub(1);
-                                }
-                                KeyCode::Right => {
-                                    if *cursor_pos < container_name.len() {
-                                        *cursor_pos += 1;
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    if *cursor_pos > 0 {
-                                        container_name.remove(*cursor_pos - 1);
-                                        *cursor_pos -= 1;
-                                    }
-                                }
-                                KeyCode::Delete => {
-                                    if *cursor_pos < container_name.len() {
-                                        container_name.remove(*cursor_pos);
-                                    }
-                                }
-                                KeyCode::Char(c) => {
-                                    container_name.insert(*cursor_pos, c);
-                                    *cursor_pos += 1;
-                                }
-                                _ => {}
-                            }
-                            app.app_state.ui_needs_redraw = true;
-                            return; // INTERCEPTED
-                        }
-
                         // Global Actions (within Download Selection)
                         match key.code {
                             KeyCode::Esc => {

@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod delete_confirm;
+pub mod browser;
 pub mod normal;
 pub mod power;
 pub mod welcome;
