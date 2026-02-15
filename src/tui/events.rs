@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::AppCommand;
-use crate::app::AppState;
 use crate::app::FileBrowserMode;
-use crate::app::{App, AppMode, SelectedHeader, TorrentControlState};
+use crate::app::{App, AppMode, TorrentControlState};
 use crate::app::BrowserPane;
 
-use crate::tui::layout::calculate_layout;
-use crate::tui::layout::compute_visible_peer_columns;
-use crate::tui::layout::compute_visible_torrent_columns;
-use crate::tui::layout::LayoutContext;
 use crate::tui::screens::{browser, config, delete_confirm, help, normal, power, welcome};
 use crate::tui::tree::TreeViewState;
 
@@ -24,6 +19,8 @@ use tracing::{event as tracing_event, Level};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 static GLOBAL_ESC_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) use crate::tui::screens::normal::handle_navigation;
 
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Resize(w, h) = &event {
@@ -135,126 +132,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         AppMode::FileBrowser { .. } => {}
     }
     app.app_state.ui_needs_redraw = true;
-}
-
-pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
-    let selected_torrent = app_state
-        .torrent_list_order
-        .get(app_state.selected_torrent_index)
-        .and_then(|info_hash| app_state.torrents.get(info_hash));
-
-    let selected_torrent_has_peers =
-        selected_torrent.is_some_and(|torrent| !torrent.latest_state.peers.is_empty());
-
-    let selected_torrent_peer_count =
-        selected_torrent.map_or(0, |torrent| torrent.latest_state.peers.len());
-
-    let layout_ctx = LayoutContext::new(app_state.screen_area, app_state, 35);
-    let layout_plan = calculate_layout(app_state.screen_area, &layout_ctx);
-    let (_, visible_torrent_columns) =
-        compute_visible_torrent_columns(app_state, layout_plan.list.width);
-    let (_, visible_peer_columns) = compute_visible_peer_columns(layout_plan.peers.width);
-    let torrent_col_count = visible_torrent_columns.len();
-    let peer_col_count = visible_peer_columns.len();
-
-    app_state.selected_header = match app_state.selected_header {
-        SelectedHeader::Torrent(i) => {
-            if torrent_col_count == 0 {
-                SelectedHeader::Torrent(0)
-            } else {
-                SelectedHeader::Torrent(i.min(torrent_col_count - 1))
-            }
-        }
-        SelectedHeader::Peer(i) => {
-            if !selected_torrent_has_peers || peer_col_count == 0 {
-                SelectedHeader::Torrent(torrent_col_count.saturating_sub(1))
-            } else {
-                SelectedHeader::Peer(i.min(peer_col_count - 1))
-            }
-        }
-    };
-
-    match key_code {
-        // --- UP/DOWN/J/K Navigation (Rows) ---
-        KeyCode::Up | KeyCode::Char('k') => match app_state.selected_header {
-            SelectedHeader::Torrent(_) => {
-                app_state.selected_torrent_index =
-                    app_state.selected_torrent_index.saturating_sub(1);
-                app_state.selected_peer_index = 0;
-            }
-            SelectedHeader::Peer(_) => {
-                app_state.selected_peer_index = app_state.selected_peer_index.saturating_sub(1);
-            }
-        },
-        KeyCode::Down | KeyCode::Char('j') => match app_state.selected_header {
-            SelectedHeader::Torrent(_) => {
-                if !app_state.torrent_list_order.is_empty() {
-                    let new_index = app_state.selected_torrent_index.saturating_add(1);
-                    if new_index < app_state.torrent_list_order.len() {
-                        app_state.selected_torrent_index = new_index;
-                    }
-                }
-                app_state.selected_peer_index = 0;
-            }
-            SelectedHeader::Peer(_) => {
-                if selected_torrent_peer_count > 0 {
-                    let new_index = app_state.selected_peer_index.saturating_add(1);
-                    if new_index < selected_torrent_peer_count {
-                        app_state.selected_peer_index = new_index;
-                    }
-                }
-            }
-        },
-
-        // --- LEFT/RIGHT/H/L Navigation (Columns) ---
-        KeyCode::Left | KeyCode::Char('h') => {
-            app_state.selected_header = match app_state.selected_header {
-                SelectedHeader::Torrent(0) => {
-                    // Wrap around to the last visible Peer column
-                    if selected_torrent_has_peers && peer_col_count > 0 {
-                        SelectedHeader::Peer(peer_col_count - 1)
-                    } else {
-                        SelectedHeader::Torrent(0)
-                    }
-                }
-                SelectedHeader::Torrent(i) => SelectedHeader::Torrent(i - 1),
-
-                SelectedHeader::Peer(0) => {
-                    // Jump back to the last visible Torrent column
-                    SelectedHeader::Torrent(torrent_col_count.saturating_sub(1))
-                }
-
-                SelectedHeader::Peer(i) => SelectedHeader::Peer(i - 1),
-            };
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            app_state.selected_header = match app_state.selected_header {
-                SelectedHeader::Torrent(i) => {
-                    // If not at the last visible column, move right
-                    if i < torrent_col_count.saturating_sub(1) {
-                        SelectedHeader::Torrent(i + 1)
-                    } else {
-                        // At the last visible column, jump to Peer column 0 (if valid)
-                        if selected_torrent_has_peers && peer_col_count > 0 {
-                            SelectedHeader::Peer(0)
-                        } else {
-                            SelectedHeader::Torrent(i)
-                        }
-                    }
-                }
-                SelectedHeader::Peer(i) => {
-                    // If not at the last visible peer column, move right
-                    if i < peer_col_count.saturating_sub(1) {
-                        SelectedHeader::Peer(i + 1)
-                    } else {
-                        // Wrap around to Torrent column 0
-                        SelectedHeader::Torrent(0)
-                    }
-                }
-            };
-        }
-        _ => {}
-    }
 }
 
 pub(crate) async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
