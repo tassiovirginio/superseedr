@@ -8,7 +8,7 @@ use crate::app::{
 use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::formatters::{centered_rect, format_bytes, truncate_with_ellipsis};
-use crate::tui::layout::calculate_file_browser_layout;
+use crate::tui::layout::browser::calculate_file_browser_layout;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::tree::{RawNode, TreeAction, TreeFilter, TreeMathHelper, TreeViewState};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};

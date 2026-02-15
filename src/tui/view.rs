@@ -9,6 +9,7 @@ use crate::tui::screens::{browser, config, delete_confirm, help, normal, power, 
 use crate::app::{AppMode, AppState};
 use crate::theme::ThemeContext;
 
+use crate::tui::effects::apply_theme_effects_to_frame;
 use crate::tui::layout::{calculate_layout, compute_smart_table_layout, LayoutContext, SmartCol};
 
 use crate::config::Settings;
@@ -90,49 +91,6 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     }
 
     apply_theme_effects_to_frame(f, &ctx);
-}
-
-pub(crate) fn compute_effects_activity_speed_multiplier(app_state: &AppState, settings: &Settings) -> f64 {
-    let dl_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
-    let ul_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
-
-    let dl_ref = if settings.global_download_limit_bps > 0 {
-        settings.global_download_limit_bps as f64
-    } else {
-        4_000_000.0
-    };
-    let ul_ref = if settings.global_upload_limit_bps > 0 {
-        settings.global_upload_limit_bps as f64
-    } else {
-        1_000_000.0
-    };
-
-    let dl_activity = (dl_bps / dl_ref).clamp(0.0, 1.0);
-    let ul_activity = (ul_bps / ul_ref).clamp(0.0, 1.0);
-
-    let activity_score = (dl_activity * 0.60) + (ul_activity * 0.40);
-
-    // Keep effects at baseline when idle, then scale up smoothly with throughput.
-    1.0 + (activity_score * 2.0)
-}
-
-fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
-    if !ctx.theme.effects.enabled() {
-        return;
-    }
-
-    let area = f.area();
-    let buf = f.buffer_mut();
-
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                if cell.fg != Color::Reset {
-                    cell.fg = ctx.apply_effects_to_color_at(cell.fg, x, y, area.width, area.height);
-                }
-            }
-        }
-    }
 }
 
 pub(crate) fn calculate_player_stats(app_state: &AppState) -> (u32, f64) {
@@ -391,15 +349,21 @@ mod tests {
 
     #[test]
     fn test_truncate_theme_label_preserves_fx_suffix_when_truncated() {
-        let out =
-            crate::tui::screens::normal::truncate_theme_label_preserving_fx("Bioluminescent Reef", true, 13);
+        let out = crate::tui::screens::normal::truncate_theme_label_preserving_fx(
+            "Bioluminescent Reef",
+            true,
+            13,
+        );
         assert_eq!(out, "Biolum...[FX]");
     }
 
     #[test]
     fn test_truncate_theme_label_shows_full_fx_label_when_space_allows() {
-        let out =
-            crate::tui::screens::normal::truncate_theme_label_preserving_fx("Bioluminescent Reef", true, 25);
+        let out = crate::tui::screens::normal::truncate_theme_label_preserving_fx(
+            "Bioluminescent Reef",
+            true,
+            25,
+        );
         assert_eq!(out, "Bioluminescent Reef [FX]");
     }
 
@@ -415,8 +379,17 @@ mod tests {
 
     #[test]
     fn test_footer_left_width_respects_bounds() {
-        assert_eq!(crate::tui::screens::normal::compute_footer_left_width(90, false), 51);
-        assert_eq!(crate::tui::screens::normal::compute_footer_left_width(200, false), 90);
-        assert_eq!(crate::tui::screens::normal::compute_footer_left_width(200, true), 110);
+        assert_eq!(
+            crate::tui::screens::normal::compute_footer_left_width(90, false),
+            51
+        );
+        assert_eq!(
+            crate::tui::screens::normal::compute_footer_left_width(200, false),
+            90
+        );
+        assert_eq!(
+            crate::tui::screens::normal::compute_footer_left_width(200, true),
+            110
+        );
     }
 }

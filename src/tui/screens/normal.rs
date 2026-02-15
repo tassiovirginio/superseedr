@@ -25,6 +25,7 @@ use crate::tui::layout::compute_visible_peer_columns;
 use crate::tui::layout::compute_visible_torrent_columns;
 use crate::tui::layout::get_peer_columns;
 use crate::tui::layout::get_torrent_columns;
+use crate::tui::layout::ColumnId;
 use crate::tui::layout::LayoutContext;
 use crate::tui::layout::LayoutPlan;
 use crate::tui::layout::{PeerColumnId, SmartCol};
@@ -1003,11 +1004,11 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                         .map(|&real_idx| {
                             let def = &all_cols[real_idx];
                             match def.id {
-                                crate::tui::layout::ColumnId::Status => {
+                                ColumnId::Status => {
                                     let display_pct = torrent_completion_percent(state);
                                     Cell::from(format!("{:.1}%", display_pct))
                                 }
-                                crate::tui::layout::ColumnId::Name => {
+                                ColumnId::Name => {
                                     let name = if app_state.anonymize_torrent_names {
                                         format!("Torrent {}", i + 1)
                                     } else {
@@ -1022,14 +1023,14 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                                     }
                                     c
                                 }
-                                crate::tui::layout::ColumnId::DownSpeed => {
+                                ColumnId::DownSpeed => {
                                     Cell::from(format_speed(torrent.smoothed_download_speed_bps))
                                         .style(ctx.apply(speed_to_style(
                                             ctx,
                                             torrent.smoothed_download_speed_bps,
                                         )))
                                 }
-                                crate::tui::layout::ColumnId::UpSpeed => {
+                                ColumnId::UpSpeed => {
                                     Cell::from(format_speed(torrent.smoothed_upload_speed_bps))
                                         .style(ctx.apply(speed_to_style(
                                             ctx,

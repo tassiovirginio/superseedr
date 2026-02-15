@@ -19,11 +19,12 @@ use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSettings, To
 
 use crate::token_bucket::TokenBucket;
 
+use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
 use crate::tui::tree;
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
-use crate::tui::view::{compute_effects_activity_speed_multiplier, draw};
+use crate::tui::view::draw;
 
 use crate::config::get_watch_path;
 use crate::storage::build_fs_tree;
@@ -1617,7 +1618,8 @@ impl App {
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
 
-                if self.app_state.ui.selected_torrent_index >= self.app_state.torrent_list_order.len()
+                if self.app_state.ui.selected_torrent_index
+                    >= self.app_state.torrent_list_order.len()
                     && !self.app_state.torrent_list_order.is_empty()
                 {
                     self.app_state.ui.selected_torrent_index =
@@ -2818,11 +2820,10 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_selected_indices_in_state,
-        persisted_validation_status_from_piece_completion, torrent_completion_percent,
-        sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, App, AppMode,
-        AppState, FilePriority, PeerInfo, SelectedHeader, SortDirection, TorrentDisplayState,
-        TorrentMetrics, TorrentSortColumn,
+        clamp_selected_indices_in_state, persisted_validation_status_from_piece_completion,
+        sort_and_filter_torrent_list_state, torrent_completion_percent,
+        torrent_is_effectively_incomplete, App, AppMode, AppState, FilePriority, PeerInfo,
+        SelectedHeader, SortDirection, TorrentDisplayState, TorrentMetrics, TorrentSortColumn,
     };
     use std::collections::HashMap;
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
