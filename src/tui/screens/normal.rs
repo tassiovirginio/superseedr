@@ -3116,10 +3116,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                             .get(app.app_state.ui.selected_torrent_index)
                             .cloned()
                         {
-                            app.app_state.mode = AppMode::DeleteConfirm {
-                                info_hash,
-                                with_files: false,
-                            };
+                            app.app_state.ui.delete_confirm.info_hash = info_hash;
+                            app.app_state.ui.delete_confirm.with_files = false;
+                            app.app_state.mode = AppMode::DeleteConfirm;
                         }
                     }
                     KeyCode::Char('D') => {
@@ -3129,10 +3128,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                             .get(app.app_state.ui.selected_torrent_index)
                             .cloned()
                         {
-                            app.app_state.mode = AppMode::DeleteConfirm {
-                                info_hash,
-                                with_files: true,
-                            };
+                            app.app_state.ui.delete_confirm.info_hash = info_hash;
+                            app.app_state.ui.delete_confirm.with_files = true;
+                            app.app_state.mode = AppMode::DeleteConfirm;
                         }
                     }
                     KeyCode::Char('s') => {

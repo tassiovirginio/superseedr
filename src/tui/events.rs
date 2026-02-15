@@ -79,13 +79,8 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             }
         }
 
-        AppMode::DeleteConfirm {
-            info_hash,
-            with_files,
-        } => {
-            let info_hash = info_hash.clone();
-            let with_files = *with_files;
-            if delete_confirm::handle_event(event, app, info_hash, with_files) {
+        AppMode::DeleteConfirm => {
+            if delete_confirm::handle_event(event, app) {
                 app.app_state.mode = AppMode::Normal;
             }
         }

@@ -392,10 +392,7 @@ pub enum AppMode {
     #[default]
     Normal,
     PowerSaving,
-    DeleteConfirm {
-        info_hash: Vec<u8>,
-        with_files: bool,
-    },
+    DeleteConfirm,
     Config,
     FileBrowser {
         state: TreeViewState,
@@ -507,6 +504,7 @@ pub struct UiState {
     pub is_searching: bool,
     pub search_query: String,
     pub config: ConfigUiState,
+    pub delete_confirm: DeleteConfirmUiState,
 }
 
 pub struct ConfigUiState {
@@ -525,6 +523,12 @@ impl Default for ConfigUiState {
             editing: None,
         }
     }
+}
+
+#[derive(Default)]
+pub struct DeleteConfirmUiState {
+    pub info_hash: Vec<u8>,
+    pub with_files: bool,
 }
 
 #[derive(Default)]

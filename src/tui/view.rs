@@ -48,7 +48,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             apply_theme_effects_to_frame(f, &ctx);
             return;
         }
-        AppMode::DeleteConfirm { .. } => {
+        AppMode::DeleteConfirm => {
             delete_confirm::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
             return;

@@ -14,13 +14,12 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.ui;
     let ctx = screen.theme;
 
-    let AppMode::DeleteConfirm {
-        info_hash,
-        with_files,
-    } = &app_state.mode
-    else {
+    if !matches!(app_state.mode, AppMode::DeleteConfirm) {
         return;
-    };
+    }
+
+    let info_hash = &app_state.ui.delete_confirm.info_hash;
+    let with_files = app_state.ui.delete_confirm.with_files;
 
     if let Some(torrent_to_delete) = app_state.torrents.get(info_hash) {
         let terminal_area = f.area();
@@ -71,7 +70,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         );
 
         if chunks[1].height > 0 {
-            let body = if *with_files {
+            let body = if with_files {
                 vec![
                     Line::from(""),
                     Line::from(Span::styled(
@@ -128,8 +127,10 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
 }
 
-pub fn handle_event(event: CrosstermEvent, app: &mut App, info_hash: Vec<u8>, with_files: bool) -> bool {
+pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     if let CrosstermEvent::Key(key) = event {
+        let info_hash = app.app_state.ui.delete_confirm.info_hash.clone();
+        let with_files = app.app_state.ui.delete_confirm.with_files;
         match key.code {
             KeyCode::Enter => {
                 let command = if with_files {
