@@ -14,7 +14,7 @@ use crate::tui::layout::calculate_layout;
 use crate::tui::layout::compute_visible_peer_columns;
 use crate::tui::layout::compute_visible_torrent_columns;
 use crate::tui::layout::LayoutContext;
-use crate::tui::screens::{normal, welcome};
+use crate::tui::screens::{normal, power, welcome};
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
 use crate::tui::tree::{TreeAction, TreeFilter, TreeMathHelper};
@@ -148,15 +148,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             welcome::handle_event(event, &mut app.app_state);
         }
         AppMode::Normal => normal::handle_event(event, app).await,
-        AppMode::PowerSaving => {
-            if let CrosstermEvent::Key(key) = event {
-                if key.kind == KeyEventKind::Press {
-                    if let KeyCode::Char('z') = key.code {
-                        app.app_state.mode = AppMode::Normal;
-                    }
-                }
-            }
-        }
+        AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config {
             settings_edit,
             selected_index,
