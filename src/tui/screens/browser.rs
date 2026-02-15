@@ -4,7 +4,8 @@
 use crate::app::{BrowserPane, FileBrowserMode, FileMetadata};
 use crate::tui::formatters::centered_rect;
 use crate::tui::layout::calculate_file_browser_layout;
-use crate::tui::tree::TreeFilter;
+use crate::app::TorrentPreviewPayload;
+use crate::tui::tree::{RawNode, TreeAction, TreeFilter, TreeMathHelper, TreeViewState};
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 
@@ -176,6 +177,53 @@ pub fn calculate_list_height(
     layout.list.height.saturating_sub(2) as usize
 }
 
+pub fn calculate_preview_list_height(
+    screen: Rect,
+    is_searching: bool,
+    focused_pane: &BrowserPane,
+    use_container: bool,
+) -> Option<usize> {
+    let area = if screen.width < 60 {
+        screen
+    } else {
+        centered_rect(90, 80, screen)
+    };
+    let layout = calculate_file_browser_layout(area, true, is_searching, focused_pane);
+    layout.preview.map(|preview_rect| {
+        let inner_height = preview_rect.height.saturating_sub(2);
+        let header_rows = if use_container { 2 } else { 1 };
+        inner_height.saturating_sub(header_rows) as usize
+    })
+}
+
+pub fn apply_preview_navigation(
+    key_code: KeyCode,
+    preview_state: &mut TreeViewState,
+    preview_tree: &mut [RawNode<TorrentPreviewPayload>],
+    list_height: usize,
+) -> bool {
+    let action = match key_code {
+        KeyCode::Up | KeyCode::Char('k') => Some(TreeAction::Up),
+        KeyCode::Down | KeyCode::Char('j') => Some(TreeAction::Down),
+        KeyCode::Left | KeyCode::Char('h') => Some(TreeAction::Left),
+        KeyCode::Right | KeyCode::Char('l') => Some(TreeAction::Right),
+        _ => None,
+    };
+
+    if let Some(action) = action {
+        TreeMathHelper::apply_action(
+            preview_state,
+            preview_tree,
+            action,
+            TreeFilter::default(),
+            list_height,
+        );
+        true
+    } else {
+        false
+    }
+}
+
 pub fn build_filter(browser_mode: &FileBrowserMode, search_query: &str) -> TreeFilter<FileMetadata> {
     match browser_mode {
         FileBrowserMode::Directory
@@ -282,5 +330,31 @@ mod tests {
         let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
         let path = PathBuf::from("demo.torrent");
         assert!(has_preview_content(&mode, false, false, Some(&path)));
+    }
+
+    #[test]
+    fn preview_navigation_consumes_direction_key() {
+        let mut tree = vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![RawNode {
+                name: "child".to_string(),
+                full_path: PathBuf::from("root/child"),
+                children: vec![],
+                payload: TorrentPreviewPayload::default(),
+                is_dir: false,
+            }],
+            payload: TorrentPreviewPayload::default(),
+            is_dir: true,
+        }];
+        let mut state = TreeViewState::default();
+        state.expanded_paths.insert(PathBuf::from("root"));
+        state.cursor_path = Some(PathBuf::from("root"));
+        assert!(apply_preview_navigation(
+            KeyCode::Down,
+            &mut state,
+            &mut tree,
+            10
+        ));
     }
 }

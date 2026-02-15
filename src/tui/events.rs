@@ -8,8 +8,6 @@ use crate::app::{App, AppMode, ConfigItem, SelectedHeader, TorrentControlState};
 use crate::app::{BrowserPane, TorrentPreviewPayload};
 use crate::torrent_manager::ManagerCommand;
 
-use crate::tui::formatters::centered_rect;
-use crate::tui::layout::calculate_file_browser_layout;
 use crate::tui::layout::calculate_layout;
 use crate::tui::layout::compute_visible_peer_columns;
 use crate::tui::layout::compute_visible_torrent_columns;
@@ -17,7 +15,7 @@ use crate::tui::layout::LayoutContext;
 use crate::tui::screens::{browser, config, delete_confirm, normal, power, welcome};
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
-use crate::tui::tree::{TreeAction, TreeFilter, TreeMathHelper};
+use crate::tui::tree::{TreeAction, TreeMathHelper};
 
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::prelude::Rect;
@@ -244,78 +242,22 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
                         // Pane-Specific Navigation (Intercepting tree keys if focused on preview)
                         if let BrowserPane::TorrentPreview = focused_pane {
-                            // 1. Re-calculate area logic from view.rs
-                            let screen = app.app_state.screen_area;
-                            let area = if screen.width < 60 {
-                                screen
-                            } else {
-                                centered_rect(90, 80, screen)
-                            };
-
-                            // 2. Run the layout calculator
-                            let layout = calculate_file_browser_layout(
-                                area,
-                                true, // DownloadLocSelection always has preview content
+                            if let Some(list_height) = browser::calculate_preview_list_height(
+                                app.app_state.screen_area,
                                 app.app_state.is_searching,
                                 focused_pane,
-                            );
-
-                            if let Some(preview_rect) = layout.preview {
-                                // 3. Calculate inner list height
-                                let inner_height = preview_rect.height.saturating_sub(2); // Remove borders
-                                                                                          // If using container, we have 2 header rows. Else 1.
-                                let header_rows = if *use_container { 2 } else { 1 };
-                                let list_height = inner_height.saturating_sub(header_rows) as usize;
-
-                                let filter = TreeFilter::default();
-
-                                match key.code {
-                                    KeyCode::Up | KeyCode::Char('k') => {
-                                        TreeMathHelper::apply_action(
-                                            preview_state,
-                                            preview_tree,
-                                            TreeAction::Up,
-                                            filter,
-                                            list_height,
-                                        );
+                                *use_container,
+                            ) {
+                                if !browser::apply_preview_navigation(
+                                    key.code,
+                                    preview_state,
+                                    preview_tree,
+                                    list_height,
+                                ) && key.code == KeyCode::Char(' ')
+                                {
+                                    if let Some(t) = &preview_state.cursor_path {
+                                        apply_priority_action(preview_tree, t, PriorityAction::Cycle);
                                     }
-                                    KeyCode::Down | KeyCode::Char('j') => {
-                                        TreeMathHelper::apply_action(
-                                            preview_state,
-                                            preview_tree,
-                                            TreeAction::Down,
-                                            filter,
-                                            list_height,
-                                        );
-                                    }
-                                    KeyCode::Left | KeyCode::Char('h') => {
-                                        TreeMathHelper::apply_action(
-                                            preview_state,
-                                            preview_tree,
-                                            TreeAction::Left,
-                                            filter,
-                                            list_height,
-                                        );
-                                    }
-                                    KeyCode::Right | KeyCode::Char('l') => {
-                                        TreeMathHelper::apply_action(
-                                            preview_state,
-                                            preview_tree,
-                                            TreeAction::Right,
-                                            filter,
-                                            list_height,
-                                        );
-                                    }
-                                    KeyCode::Char(' ') => {
-                                        if let Some(t) = &preview_state.cursor_path {
-                                            apply_priority_action(
-                                                preview_tree,
-                                                t,
-                                                PriorityAction::Cycle,
-                                            );
-                                        }
-                                    }
-                                    _ => {}
                                 }
                             }
                             app.app_state.ui_needs_redraw = true;
