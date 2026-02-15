@@ -220,6 +220,20 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 - `9f3688c` `tui: split layout planners and extract theme effects module`
 - `926ee89` `tui: harden layout boundaries and finalize phase6 docs`
 
+### Post-Phase Validation (2026-02-15)
+- Checklist-mapped parity regression sweep passed:
+  - `cargo test -q --no-run`
+  - `cargo test -q tui::events::tests`
+  - `cargo test -q tui::screens::normal::tests`
+  - `cargo test -q tui::screens::browser::tests`
+  - `cargo test -q tui::screens::config::tests`
+  - `cargo test -q tui::screens::delete_confirm::tests`
+  - `cargo test -q tui::events::tests::test_nav_down_torrents`
+  - `cargo test -q app::tests::should_only_draw_dirty_in_power_saving_mode`
+- API-surface cleanup audit completed:
+  - No remaining legacy layout re-export call sites found.
+  - Layout usage is now direct per module (`layout::normal`, `layout::browser`, `layout::common`).
+
 ### Steps
 1. Split layout into `tui/layout/common.rs` + per-screen planners.
 2. Keep layout pure: `plan(area, ctx) -> LayoutPlan`.
