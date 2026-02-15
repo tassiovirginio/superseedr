@@ -218,6 +218,7 @@ This plan is incremental, parity-driven, and includes manual testing after each 
 
 ### Implementation Checkpoints (2026-02-15)
 - `9f3688c` `tui: split layout planners and extract theme effects module`
+- `926ee89` `tui: harden layout boundaries and finalize phase6 docs`
 
 ### Steps
 1. Split layout into `tui/layout/common.rs` + per-screen planners.
