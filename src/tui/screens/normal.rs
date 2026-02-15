@@ -3210,12 +3210,12 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
     }
 }
 
-pub fn handle_search_key(key: ratatui::crossterm::event::KeyEvent, app: &mut App) -> bool {
+fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::Normal) || !app.app_state.ui.is_searching {
         return false;
     }
 
-    match key.code {
+    match key_code {
         KeyCode::Esc => {
             app.app_state.ui.is_searching = false;
             app.app_state.ui.search_query.clear();
@@ -3322,6 +3322,11 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 }
 
 async fn handle_key_press(key_code: KeyCode, app: &mut App) -> bool {
+    if handle_search_key(key_code, app) {
+        app.app_state.ui.needs_redraw = true;
+        return true;
+    }
+
     if handle_reducer_key(key_code, app).await {
         return true;
     }

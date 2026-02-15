@@ -21,10 +21,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         return;
     }
 
-    if handle_global_key_hooks(&event, app) {
-        return;
-    }
-
     if matches!(app.app_state.mode, AppMode::FileBrowser) {
         browser::handle_event(event, app).await;
         app.app_state.ui.needs_redraw = true;
@@ -58,16 +54,6 @@ fn should_debounce_escape(event: &CrosstermEvent) -> bool {
             }
 
             GLOBAL_ESC_TIMESTAMP.store(now, Ordering::Relaxed);
-        }
-    }
-    false
-}
-
-fn handle_global_key_hooks(event: &CrosstermEvent, app: &mut App) -> bool {
-    if let CrosstermEvent::Key(key) = event {
-        if key.kind == KeyEventKind::Press && normal::handle_search_key(*key, app) {
-            app.app_state.ui.needs_redraw = true;
-            return true;
         }
     }
     false
