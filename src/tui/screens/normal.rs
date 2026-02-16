@@ -1205,20 +1205,13 @@ pub fn draw_details_panel(
 
         f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-        let (progress_ratio, progress_label_text) = if state.number_of_pieces_total > 0 {
-            if state.torrent_control_state != TorrentControlState::Running
-                || state.activity_message.contains("Seeding")
-                || state.activity_message.contains("Finished")
-            {
-                (1.0, "100.0%".to_string())
-            } else {
-                let ratio =
-                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
-                (ratio, format!("{:.1}%", ratio * 100.0))
-            }
+        let progress_pct = if state.torrent_control_state != TorrentControlState::Running {
+            100.0
         } else {
-            (0.0, "0.0%".to_string())
+            torrent_completion_percent(state)
         };
+        let progress_ratio = (progress_pct / 100.0).clamp(0.0, 1.0);
+        let progress_label_text = format!("{:.1}%", progress_pct);
         let custom_line_set = symbols::line::Set {
             horizontal: "⣿",
             ..symbols::line::THICK

@@ -2062,11 +2062,25 @@ impl App {
         let torrent = match from_bytes(&buffer) {
             Ok(t) => t,
             Err(e) => {
+                let file_size = buffer.len();
+                let head_len = file_size.min(24);
+                let tail_len = file_size.min(24);
+                let head_hex = hex::encode(&buffer[..head_len]);
+                let tail_hex = hex::encode(&buffer[file_size.saturating_sub(tail_len)..]);
+                let likely_cause = if e.to_string().contains("End of stream") {
+                    "likely truncated/incomplete .torrent file"
+                } else {
+                    "malformed or unsupported bencode payload"
+                };
                 tracing_event!(
                     Level::ERROR,
-                    "Failed to parse torrent file {:?}: {}",
+                    "Failed to parse torrent file {:?}: {} | size={} bytes | head={} | tail={} | hint={}",
                     &path,
-                    e
+                    e,
+                    file_size,
+                    head_hex,
+                    tail_hex,
+                    likely_cause
                 );
                 return;
             }
@@ -2135,10 +2149,26 @@ impl App {
         }
         let permanent_torrent_path =
             torrent_files_dir.join(format!("{}.torrent", hex::encode(&info_hash)));
-        if let Err(e) = fs::copy(&path, &permanent_torrent_path) {
+        // Persist from in-memory bytes via temp+rename to avoid self-copy corruption
+        // when `path` already points at `permanent_torrent_path` during startup reload.
+        let temp_torrent_path = torrent_files_dir.join(format!(
+            "{}.{}.tmp",
+            hex::encode(&info_hash),
+            std::process::id()
+        ));
+        if let Err(e) = fs::write(&temp_torrent_path, &buffer) {
             tracing_event!(
                 Level::ERROR,
-                "Failed to copy torrent to data directory: {}",
+                "Failed to write temp torrent in data directory: {}",
+                e
+            );
+            return;
+        }
+        if let Err(e) = fs::rename(&temp_torrent_path, &permanent_torrent_path) {
+            let _ = fs::remove_file(&temp_torrent_path);
+            tracing_event!(
+                Level::ERROR,
+                "Failed to finalize torrent copy in data directory: {}",
                 e
             );
             return;
@@ -2479,8 +2509,18 @@ fn activity_marks_torrent_complete(activity_message: &str) -> bool {
     activity_message.contains("Seeding") || activity_message.contains("Finished")
 }
 
+fn torrent_has_skipped_files(metrics: &TorrentMetrics) -> bool {
+    metrics
+        .file_priorities
+        .values()
+        .any(|p| matches!(p, FilePriority::Skip))
+}
+
 pub fn torrent_is_effectively_incomplete(metrics: &TorrentMetrics) -> bool {
     if activity_marks_torrent_complete(&metrics.activity_message) {
+        return false;
+    }
+    if torrent_has_skipped_files(metrics) {
         return false;
     }
     metrics.number_of_pieces_total > 0
@@ -2489,6 +2529,9 @@ pub fn torrent_is_effectively_incomplete(metrics: &TorrentMetrics) -> bool {
 
 pub fn torrent_completion_percent(metrics: &TorrentMetrics) -> f64 {
     if activity_marks_torrent_complete(&metrics.activity_message) {
+        return 100.0;
+    }
+    if torrent_has_skipped_files(metrics) {
         return 100.0;
     }
     if metrics.number_of_pieces_total == 0 {
@@ -2892,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_helper_uses_piece_progress_without_skip_piece_guessing() {
+    fn completion_helper_marks_skipped_files_complete() {
         let metrics = TorrentMetrics {
             number_of_pieces_total: 8,
             number_of_pieces_completed: 2,
@@ -2900,8 +2943,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(torrent_is_effectively_incomplete(&metrics));
-        assert_eq!(torrent_completion_percent(&metrics), 25.0);
+        assert!(!torrent_is_effectively_incomplete(&metrics));
+        assert_eq!(torrent_completion_percent(&metrics), 100.0);
     }
 
     #[test]
