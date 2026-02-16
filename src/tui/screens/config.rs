@@ -48,18 +48,10 @@ pub struct ConfigHandleContext<'a> {
     pub global_ul_bucket: &'a Arc<TokenBucket>,
 }
 
+#[derive(Default)]
 pub struct ConfigReduceResult {
     pub consumed: bool,
     pub effects: Vec<ConfigEffect>,
-}
-
-impl Default for ConfigReduceResult {
-    fn default() -> Self {
-        Self {
-            consumed: false,
-            effects: Vec::new(),
-        }
-    }
 }
 
 fn map_key_to_config_action(

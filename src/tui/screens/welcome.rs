@@ -380,42 +380,6 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
-
-    #[test]
-    fn welcome_esc_transitions_to_normal() {
-        let mut app_state = AppState {
-            mode: AppMode::Welcome,
-            ..Default::default()
-        };
-
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::Normal));
-    }
-
-    #[test]
-    fn welcome_ignores_non_esc_keys() {
-        let mut app_state = AppState {
-            mode: AppMode::Welcome,
-            ..Default::default()
-        };
-
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::Welcome));
-    }
-}
-
 fn get_animated_style(ctx: &ThemeContext, x: usize, y: usize) -> Style {
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -513,4 +477,40 @@ fn draw_background_dust(f: &mut Frame, area: Rect, ctx: &ThemeContext) {
 
     let p = Paragraph::new(lines);
     f.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn welcome_esc_transitions_to_normal() {
+        let mut app_state = AppState {
+            mode: AppMode::Welcome,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn welcome_ignores_non_esc_keys() {
+        let mut app_state = AppState {
+            mode: AppMode::Welcome,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Welcome));
+    }
 }

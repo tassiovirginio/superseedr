@@ -224,56 +224,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
-
-    #[test]
-    fn help_esc_returns_to_normal() {
-        let mut app_state = AppState {
-            mode: AppMode::Help,
-            ..Default::default()
-        };
-
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::Normal));
-    }
-
-    #[test]
-    fn help_ignores_non_close_key() {
-        let mut app_state = AppState {
-            mode: AppMode::Help,
-            ..Default::default()
-        };
-
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::Help));
-    }
-
-    #[test]
-    fn help_handler_ignores_when_not_in_help_mode() {
-        let mut app_state = AppState {
-            mode: AppMode::Normal,
-            ..Default::default()
-        };
-
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::Normal));
-    }
-}
 fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     let mode = &app_state.mode;
 
@@ -685,4 +635,55 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
 
     f.render_widget(Clear, area);
     f.render_widget(help_table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn help_esc_returns_to_normal() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn help_ignores_non_close_key() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Help));
+    }
+
+    #[test]
+    fn help_handler_ignores_when_not_in_help_mode() {
+        let mut app_state = AppState {
+            mode: AppMode::Normal,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+    }
 }
