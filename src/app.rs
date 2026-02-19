@@ -2951,7 +2951,11 @@ impl App {
         if host.eq_ignore_ascii_case("localhost") {
             return false;
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let normalized_host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = normalized_host.parse::<std::net::IpAddr>() {
             match ip {
                 std::net::IpAddr::V4(v4) => {
                     if v4.is_private()

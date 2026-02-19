@@ -569,7 +569,11 @@ fn is_safe_rss_item_url(value: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return false;
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let normalized_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => {
                 if v4.is_private()
