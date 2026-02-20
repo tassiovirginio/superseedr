@@ -4,14 +4,14 @@
 use crate::app::{AppCommand, RssPreviewItem};
 use crate::config::{RssAddedVia, RssFilterMode, RssHistoryEntry, Settings};
 use crate::integrations::rss_ingest;
+use crate::integrations::rss_url_safety::is_safe_rss_item_url;
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use reqwest::{Client, Url};
+use reqwest::Client;
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
-use std::net::IpAddr;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration};
@@ -551,61 +551,11 @@ async fn fetch_torrent_bytes(client: &Client, url: &str) -> Result<Vec<u8>, Stri
     Ok(bytes.to_vec())
 }
 
-fn is_safe_rss_item_url(value: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
-    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-
-    let host = match url.host_str() {
-        Some(host) => host,
-        None => return false,
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return false;
-    }
-    let normalized_host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                if v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_multicast()
-                    || v4.is_broadcast()
-                    || v4.is_documentation()
-                    || v4.is_unspecified()
-                {
-                    return false;
-                }
-            }
-            IpAddr::V6(v6) => {
-                if v6.is_loopback()
-                    || v6.is_multicast()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-                {
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn dedupe_key_prefers_guid_then_link_then_title_source() {
@@ -640,22 +590,6 @@ mod tests {
         let a = retry_delay_ms("https://example.test/rss.xml", 2);
         let b = retry_delay_ms("https://example.test/rss.xml", 2);
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn rss_item_url_guard_rejects_localhost_and_private_literal_ips() {
-        assert!(!is_safe_rss_item_url("http://localhost/file.torrent"));
-        assert!(!is_safe_rss_item_url("https://127.0.0.1/file.torrent"));
-        assert!(!is_safe_rss_item_url("https://192.168.10.5/file.torrent"));
-        assert!(!is_safe_rss_item_url("https://[::1]/file.torrent"));
-    }
-
-    #[test]
-    fn rss_item_url_guard_accepts_public_http_hosts() {
-        assert!(is_safe_rss_item_url("https://example.com/file.torrent"));
-        assert!(is_safe_rss_item_url(
-            "http://downloads.example.net/a.torrent"
-        ));
     }
 
     #[tokio::test]
@@ -723,6 +657,122 @@ mod tests {
             other => panic!("unexpected command: {:?}", other.map(|_| "non-preview")),
         }
 
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn rss_sync_match_and_auto_ingest_magnet_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("listener addr");
+        let feed_url = format!("http://{}/rss.xml", addr);
+        let magnet = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&dn=SampleAlpha%20Episode%2001";
+        let magnet_xml = magnet.replace('&', "&amp;");
+        let feed_body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Sample Feed</title>
+    <item>
+      <title>SampleAlpha Episode 01</title>
+      <guid>guid-samplealpha-1</guid>
+      <link>{}</link>
+      <pubDate>Fri, 20 Feb 2026 00:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>"#,
+            magnet_xml
+        );
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                feed_body.len(),
+                feed_body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let watch_folder = temp.path().join("watch");
+
+        let mut settings = Settings::default();
+        settings.rss.enabled = true;
+        settings.watch_folder = Some(watch_folder.clone());
+        settings.rss.feeds.push(crate::config::RssFeed {
+            url: feed_url,
+            enabled: true,
+        });
+        settings.rss.filters.push(crate::config::RssFilter {
+            query: "samplealpha".to_string(),
+            mode: RssFilterMode::Fuzzy,
+            enabled: true,
+        });
+
+        let (tx, mut rx) = mpsc::channel::<AppCommand>(16);
+        let (sync_tx, sync_rx) = mpsc::channel::<()>(2);
+        let (_downloaded_entry_tx, downloaded_entry_rx) = mpsc::channel::<RssHistoryEntry>(2);
+        let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let handle = spawn_rss_service(
+            settings,
+            Vec::new(),
+            tx,
+            sync_rx,
+            downloaded_entry_rx,
+            settings_rx,
+            shutdown_tx.clone(),
+        );
+
+        sync_tx.send(()).await.expect("send sync trigger");
+
+        let mut got_download: Option<RssHistoryEntry> = None;
+        let mut got_preview: Option<Vec<RssPreviewItem>> = None;
+        let deadline = time::Instant::now() + Duration::from_secs(3);
+        while time::Instant::now() < deadline && (got_download.is_none() || got_preview.is_none()) {
+            let recv = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+            let Some(cmd) = recv.ok().flatten() else {
+                continue;
+            };
+            match cmd {
+                AppCommand::RssDownloadSelected(entry) => got_download = Some(entry),
+                AppCommand::RssPreviewUpdated(items) => got_preview = Some(items),
+                _ => {}
+            }
+        }
+
+        let download = got_download.expect("expected RssDownloadSelected");
+        assert_eq!(download.added_via, RssAddedVia::Auto);
+        assert_eq!(download.guid.as_deref(), Some("guid-samplealpha-1"));
+        assert_eq!(download.link.as_deref(), Some(magnet));
+
+        let preview = got_preview.expect("expected RssPreviewUpdated");
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].is_match);
+        assert!(preview[0].is_downloaded);
+
+        let mut entries = std::fs::read_dir(&watch_folder)
+            .expect("read watch folder")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect watch entries");
+        entries.sort_by_key(|e| e.file_name());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].path().extension().and_then(|e| e.to_str()),
+            Some("magnet")
+        );
+        let written = std::fs::read_to_string(entries[0].path()).expect("read written magnet");
+        assert_eq!(written, magnet);
+
+        server.await.expect("join server");
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }

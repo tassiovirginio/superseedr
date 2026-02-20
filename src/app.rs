@@ -37,6 +37,7 @@ use crate::resource_manager::ResourceType;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::theme::Theme;
 
+use crate::integrations::rss_url_safety::is_safe_rss_item_url;
 use crate::integrations::status::AppOutputState;
 use crate::integrations::{rss_ingest, rss_service, status, watcher};
 use crate::torrent_file::parser::from_bytes;
@@ -2847,7 +2848,7 @@ impl App {
     }
 
     async fn download_rss_torrent_from_url(&mut self, url: &str) -> (bool, Option<Vec<u8>>) {
-        if !Self::is_safe_rss_item_url(url) {
+        if !is_safe_rss_item_url(url) {
             tracing_event!(
                 Level::WARN,
                 "RSS manual download blocked URL by network safety policy: {}",
@@ -2965,58 +2966,6 @@ impl App {
             );
             (false, None)
         }
-    }
-
-    fn is_safe_rss_item_url(value: &str) -> bool {
-        let Ok(url) = reqwest::Url::parse(value) else {
-            return false;
-        };
-        if !matches!(url.scheme(), "http" | "https") {
-            return false;
-        }
-        if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
-            return false;
-        }
-
-        let host = match url.host_str() {
-            Some(host) => host,
-            None => return false,
-        };
-        if host.eq_ignore_ascii_case("localhost") {
-            return false;
-        }
-        let normalized_host = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
-        if let Ok(ip) = normalized_host.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    if v4.is_private()
-                        || v4.is_loopback()
-                        || v4.is_link_local()
-                        || v4.is_multicast()
-                        || v4.is_broadcast()
-                        || v4.is_documentation()
-                        || v4.is_unspecified()
-                    {
-                        return false;
-                    }
-                }
-                std::net::IpAddr::V6(v6) => {
-                    if v6.is_loopback()
-                        || v6.is_multicast()
-                        || v6.is_unspecified()
-                        || v6.is_unique_local()
-                        || v6.is_unicast_link_local()
-                    {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
     }
 
     async fn fetch_latest_version() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -3775,25 +3724,5 @@ mod tests {
         let changed = prune_rss_feed_errors(&mut feed_errors, &settings);
         assert!(!changed);
         assert_eq!(feed_errors.len(), 1);
-    }
-
-    #[test]
-    fn is_safe_rss_item_url_rejects_localhost_and_private_literal_ips() {
-        assert!(!App::is_safe_rss_item_url("http://localhost/file.torrent"));
-        assert!(!App::is_safe_rss_item_url("https://127.0.0.1/file.torrent"));
-        assert!(!App::is_safe_rss_item_url(
-            "https://192.168.1.40/file.torrent"
-        ));
-        assert!(!App::is_safe_rss_item_url("https://[::1]/file.torrent"));
-    }
-
-    #[test]
-    fn is_safe_rss_item_url_accepts_public_hosts() {
-        assert!(App::is_safe_rss_item_url(
-            "https://downloads.example.com/file.torrent"
-        ));
-        assert!(App::is_safe_rss_item_url(
-            "http://cdn.example.net/archive.torrent"
-        ));
     }
 }
