@@ -11,7 +11,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::{prelude::*, widgets::*};
 use reqwest::Url;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -120,7 +120,7 @@ fn current_list_len(app_state: &AppState, settings: &crate::config::Settings) ->
     match app_state.ui.rss.focused_section {
         RssSectionFocus::Links => settings.rss.feeds.len(),
         RssSectionFocus::Filters => settings.rss.filters.len(),
-        RssSectionFocus::Explorer => app_state.rss_runtime.preview_items.len(),
+        RssSectionFocus::Explorer => app_state.rss_derived.explorer_items.len(),
     }
 }
 
@@ -170,6 +170,45 @@ struct FilterSpec {
     mode: RssFilterMode,
 }
 
+struct PreparedFilter {
+    mode: RssFilterMode,
+    query_lc: String,
+    regex: Option<regex::Regex>,
+}
+fn prepare_filter(query: &str, mode: RssFilterMode) -> Option<PreparedFilter> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let regex = if matches!(mode, RssFilterMode::Regex) {
+        regex::RegexBuilder::new(trimmed)
+            .case_insensitive(true)
+            .build()
+            .ok()
+    } else {
+        None
+    };
+
+    Some(PreparedFilter {
+        mode,
+        query_lc: trimmed.to_lowercase(),
+        regex,
+    })
+}
+
+fn prepared_filter_matches(
+    title: &str,
+    title_lc: &str,
+    filter: &PreparedFilter,
+    matcher: &SkimMatcherV2,
+) -> bool {
+    match filter.mode {
+        RssFilterMode::Fuzzy => matcher.fuzzy_match(title_lc, &filter.query_lc).is_some(),
+        RssFilterMode::Regex => filter.regex.as_ref().is_some_and(|re| re.is_match(title)),
+    }
+}
+
 fn enabled_filters(settings: &crate::config::Settings) -> Vec<FilterSpec> {
     settings
         .rss
@@ -190,21 +229,11 @@ fn filter_matches_title(
     mode: RssFilterMode,
     matcher: &SkimMatcherV2,
 ) -> bool {
-    let query = filter_query.trim();
-    if query.is_empty() {
+    let Some(filter) = prepare_filter(filter_query, mode) else {
         return false;
-    }
-
-    match mode {
-        RssFilterMode::Fuzzy => matcher
-            .fuzzy_match(&title.to_lowercase(), &query.to_lowercase())
-            .is_some(),
-        RssFilterMode::Regex => regex::RegexBuilder::new(query)
-            .case_insensitive(true)
-            .build()
-            .map(|re| re.is_match(title))
-            .unwrap_or(false),
-    }
+    };
+    let title_lc = title.to_lowercase();
+    prepared_filter_matches(title, &title_lc, &filter, matcher)
 }
 
 fn explorer_should_be_greyed_out(settings: &crate::config::Settings) -> bool {
@@ -280,6 +309,13 @@ fn execute_rss_effects(
     app_command_tx: &mpsc::Sender<AppCommand>,
     effects: Vec<RssAction>,
 ) {
+    if app_state.rss_derived.explorer_items.is_empty()
+        && !app_state.rss_runtime.preview_items.is_empty()
+    {
+        // Lazy warm-up to avoid full derived recompute on every key press.
+        recompute_rss_derived(app_state, settings);
+    }
+
     fn set_rss_status(app_state: &mut AppState, message: impl Into<String>) {
         app_state.ui.rss.status_message = Some(message.into());
     }
@@ -302,6 +338,7 @@ fn execute_rss_effects(
         true
     }
 
+    let mut recompute_needed = false;
     for effect in effects {
         match effect {
             RssAction::ToNormal => app_state.mode = AppMode::Normal,
@@ -326,6 +363,7 @@ fn execute_rss_effects(
                         RssFilterMode::Fuzzy => RssFilterMode::Regex,
                         RssFilterMode::Regex => RssFilterMode::Fuzzy,
                     };
+                    recompute_needed = true;
                 }
             }
             RssAction::MoveUp => {
@@ -374,9 +412,11 @@ fn execute_rss_effects(
                     app_state.ui.rss.edit_buffer.push(c);
                     if matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters) {
                         app_state.ui.rss.filter_draft = app_state.ui.rss.edit_buffer.clone();
+                        recompute_needed = true;
                     }
                 } else if app_state.ui.rss.is_searching {
                     app_state.ui.rss.search_query.push(c);
+                    recompute_needed = true;
                 }
             }
             RssAction::Backspace => {
@@ -384,9 +424,11 @@ fn execute_rss_effects(
                     app_state.ui.rss.edit_buffer.pop();
                     if matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters) {
                         app_state.ui.rss.filter_draft = app_state.ui.rss.edit_buffer.clone();
+                        recompute_needed = true;
                     }
                 } else if app_state.ui.rss.is_searching {
                     app_state.ui.rss.search_query.pop();
+                    recompute_needed = true;
                 }
             }
             RssAction::CommitInput => {
@@ -439,6 +481,7 @@ fn execute_rss_effects(
                     app_state.ui.rss.is_editing = false;
                     app_state.ui.rss.edit_buffer.clear();
                     app_state.ui.rss.add_filter_mode = RssFilterMode::Fuzzy;
+                    recompute_needed = true;
                 } else if app_state.ui.rss.is_searching {
                     if app_state.ui.rss.search_query.trim().is_empty() {
                         app_state.ui.rss.is_searching = false;
@@ -446,6 +489,7 @@ fn execute_rss_effects(
                     } else {
                         set_rss_status(app_state, "Search applied");
                     }
+                    recompute_needed = true;
                 }
             }
             RssAction::CancelInput => {
@@ -455,10 +499,12 @@ fn execute_rss_effects(
                     app_state.ui.rss.filter_draft.clear();
                     app_state.ui.rss.add_filter_mode = RssFilterMode::Fuzzy;
                     set_rss_status(app_state, "Edit cancelled");
+                    recompute_needed = true;
                 } else if app_state.ui.rss.is_searching {
                     app_state.ui.rss.is_searching = false;
                     app_state.ui.rss.search_query.clear();
                     set_rss_status(app_state, "Search cleared");
+                    recompute_needed = true;
                 } else {
                     app_state.mode = AppMode::Normal;
                 }
@@ -476,6 +522,7 @@ fn execute_rss_effects(
                         app_state.ui.rss.add_filter_mode = RssFilterMode::Fuzzy;
                     }
                     set_rss_status(app_state, "Editing new entry");
+                    recompute_needed = true;
                 }
             }
             RssAction::DeleteEntry => {
@@ -499,6 +546,7 @@ fn execute_rss_effects(
                                 new_settings,
                                 Some("Link deleted"),
                             );
+                            recompute_needed = true;
                         }
                     }
                     RssSectionFocus::Filters => {
@@ -515,6 +563,7 @@ fn execute_rss_effects(
                                 new_settings,
                                 Some("Filter deleted"),
                             );
+                            recompute_needed = true;
                         }
                     }
                     RssSectionFocus::Explorer => {}
@@ -545,6 +594,7 @@ fn execute_rss_effects(
                                     "Link disabled"
                                 }),
                             );
+                            recompute_needed = true;
                         }
                     }
                     RssSectionFocus::Filters => {
@@ -565,6 +615,7 @@ fn execute_rss_effects(
                                     "Filter disabled"
                                 }),
                             );
+                            recompute_needed = true;
                         }
                     }
                     RssSectionFocus::Explorer => {}
@@ -577,39 +628,19 @@ fn execute_rss_effects(
                 {
                     app_state.ui.rss.is_searching = true;
                     set_rss_status(app_state, "Search mode");
+                    recompute_needed = true;
                 }
             }
             RssAction::DownloadSelectedExplorer => {
                 if matches!(app_state.ui.rss.active_screen, RssScreen::Unified)
                     && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Explorer)
                 {
-                    let enabled_filters = enabled_filters(settings);
-                    let is_creating_filter = app_state.ui.rss.is_editing
-                        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
-                    let active_filter = active_filter_spec(app_state, settings);
-                    let active_filter_query = active_filter
-                        .as_ref()
-                        .map(|f| f.query.as_str())
-                        .unwrap_or("");
-                    let active_filter_mode = active_filter
-                        .as_ref()
-                        .map(|f| f.mode)
-                        .unwrap_or(RssFilterMode::Fuzzy);
-                    let (items, _, _) = compute_explorer_items(
-                        &app_state.rss_runtime.preview_items,
-                        &app_state.ui.rss.search_query,
-                        &enabled_filters,
-                        active_filter_query,
-                        active_filter_mode,
-                        is_creating_filter,
-                    );
-
                     let idx = app_state
                         .ui
                         .rss
                         .selected_explorer_index
-                        .min(items.len().saturating_sub(1));
-                    if let Some(item) = items.get(idx) {
+                        .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
+                    if let Some(item) = app_state.rss_derived.explorer_items.get(idx) {
                         if item.is_downloaded {
                             set_rss_status(app_state, "Already downloaded");
                         } else if app_command_tx
@@ -624,6 +655,10 @@ fn execute_rss_effects(
                 }
             }
         }
+    }
+
+    if recompute_needed {
+        recompute_rss_derived(app_state, settings);
     }
 }
 
@@ -665,6 +700,7 @@ pub fn handle_event(
         }
         CrosstermEvent::Paste(pasted_text) => {
             apply_pasted_text(app_state, pasted_text.as_str());
+            recompute_rss_derived(app_state, settings);
             app_state.ui.needs_redraw = true;
         }
         _ => {}
@@ -904,44 +940,29 @@ fn pane_block<'a>(title: &'a str, active: bool, ctx: &crate::theme::ThemeContext
 }
 
 fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
+    let perf_start = Instant::now();
     let app_state = screen.app.state;
     let settings = screen.settings;
     let ctx = screen.theme;
     let selected = app_state.ui.rss.selected_feed_index;
+    let selected_item_start = Instant::now();
     let selected_explorer_item = if matches!(app_state.ui.rss.active_screen, RssScreen::Unified)
         && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Explorer)
     {
-        let enabled_filters = enabled_filters(settings);
-        let active_filter = active_filter_spec(app_state, settings);
-        let active_filter_query = active_filter
-            .as_ref()
-            .map(|f| f.query.as_str())
-            .unwrap_or("");
-        let active_filter_mode = active_filter
-            .as_ref()
-            .map(|f| f.mode)
-            .unwrap_or(RssFilterMode::Fuzzy);
-        let (items, _, _) = compute_explorer_items(
-            &app_state.rss_runtime.preview_items,
-            &app_state.ui.rss.search_query,
-            &enabled_filters,
-            active_filter_query,
-            active_filter_mode,
-            false,
-        );
-        if items.is_empty() {
+        if app_state.rss_derived.explorer_items.is_empty() {
             None
         } else {
             let idx = app_state
                 .ui
                 .rss
                 .selected_explorer_index
-                .min(items.len().saturating_sub(1));
-            items.get(idx).cloned()
+                .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
+            app_state.rss_derived.explorer_items.get(idx).cloned()
         }
     } else {
         None
     };
+    let selected_item_ms = selected_item_start.elapsed().as_millis();
 
     let sorted_indices = sorted_feed_indices(settings);
     let sync_countdown = app_state
@@ -949,6 +970,7 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
         .next_sync_at
         .as_deref()
         .and_then(sync_countdown_label);
+    let lines_start = Instant::now();
     let mut lines: Vec<Line<'static>> = sorted_indices
         .iter()
         .map(|idx| {
@@ -977,7 +999,9 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
             Line::from(spans)
         })
         .collect();
+    let lines_ms = lines_start.elapsed().as_millis();
 
+    let errors_start = Instant::now();
     let mut feed_error_rows: Vec<_> = app_state
         .rss_runtime
         .feed_errors
@@ -1010,6 +1034,7 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
             ]));
         }
     }
+    let errors_ms = errors_start.elapsed().as_millis();
 
     let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
     let mut state = ListState::default();
@@ -1023,6 +1048,7 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
     } else {
         screen.theme.apply(Style::default())
     };
+    let render_start = Instant::now();
     f.render_stateful_widget(
         List::new(items)
             .block(pane_block("Links", active, screen.theme))
@@ -1030,6 +1056,13 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
         area,
         &mut state,
     );
+    let render_ms = render_start.elapsed().as_millis();
+
+    let _ = perf_start;
+    let _ = selected_item_ms;
+    let _ = lines_ms;
+    let _ = errors_ms;
+    let _ = render_ms;
 }
 
 fn active_filter_spec(
@@ -1116,6 +1149,7 @@ fn compute_filter_preview_items(
     ranked
 }
 
+#[cfg(test)]
 fn compute_filter_match_counts(
     app_state: &AppState,
     filter_text: &str,
@@ -1176,6 +1210,55 @@ fn compute_filter_match_counts(
     (feed_matches, downloaded_matches)
 }
 
+fn compute_filter_downloaded_matches(
+    app_state: &AppState,
+    filter_text: &str,
+    filter_mode: RssFilterMode,
+    matcher: &SkimMatcherV2,
+) -> usize {
+    let filter = filter_text.trim();
+    if filter.is_empty() {
+        return 0;
+    }
+
+    let downloaded_from_torrents = app_state
+        .torrents
+        .values()
+        .filter(|torrent| {
+            filter_matches_title(
+                &torrent.latest_state.torrent_name,
+                filter,
+                filter_mode,
+                matcher,
+            )
+        })
+        .count();
+    let app_hashes: HashSet<Vec<u8>> = app_state.torrents.keys().cloned().collect();
+    let app_titles: HashSet<String> = app_state
+        .torrents
+        .values()
+        .map(|torrent| normalize_title(&torrent.latest_state.torrent_name))
+        .collect();
+
+    let history_missing_from_app = app_state
+        .rss_runtime
+        .history
+        .iter()
+        .filter(|entry| filter_matches_title(&entry.title, filter, filter_mode, matcher))
+        .filter(|entry| {
+            let hash_in_app = entry
+                .info_hash
+                .as_deref()
+                .and_then(|hash| hex::decode(hash).ok())
+                .is_some_and(|hash| app_hashes.contains(&hash));
+            let title_in_app = app_titles.contains(&normalize_title(&entry.title));
+            !hash_in_app && !title_in_app
+        })
+        .count();
+
+    downloaded_from_torrents + history_missing_from_app
+}
+
 fn filter_history_age_label(
     app_state: &AppState,
     filter_text: &str,
@@ -1207,270 +1290,51 @@ fn filter_history_age_label(
     }
 }
 
-fn normalize_title(input: &str) -> String {
-    input
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
-    let app_state = screen.app.state;
-    let settings = screen.settings;
-    let ctx = screen.theme;
-    let matcher = SkimMatcherV2::default();
-    let selected = app_state.ui.rss.selected_filter_index;
-    let is_creating_filter = app_state.ui.rss.is_editing
-        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
-    let draft_lc = app_state.ui.rss.edit_buffer.trim().to_lowercase();
-    let explorer_selected_title_lc = if matches!(app_state.ui.rss.active_screen, RssScreen::Unified)
-        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Explorer)
-    {
-        let enabled_filters = enabled_filters(settings);
-        let active_filter = active_filter_spec(app_state, settings);
-        let active_filter_query = active_filter
-            .as_ref()
-            .map(|f| f.query.as_str())
-            .unwrap_or("");
-        let active_filter_mode = active_filter
-            .as_ref()
-            .map(|f| f.mode)
-            .unwrap_or(RssFilterMode::Fuzzy);
-        let (items, _, _) = compute_explorer_items(
-            &app_state.rss_runtime.preview_items,
-            &app_state.ui.rss.search_query,
-            &enabled_filters,
-            active_filter_query,
-            active_filter_mode,
-            false,
-        );
-        if items.is_empty() {
-            None
-        } else {
-            let idx = app_state
-                .ui
-                .rss
-                .selected_explorer_index
-                .min(items.len().saturating_sub(1));
-            items.get(idx).map(|item| item.title.to_lowercase())
-        }
-    } else {
-        None
-    };
-
-    let mut sorted_indices = sorted_filter_indices(settings);
-    if is_creating_filter && !draft_lc.is_empty() {
-        sorted_indices.sort_by(|a, b| {
-            let a_query = settings.rss.filters[*a].query.to_lowercase();
-            let b_query = settings.rss.filters[*b].query.to_lowercase();
-            let a_match = a_query.contains(&draft_lc);
-            let b_match = b_query.contains(&draft_lc);
-            b_match.cmp(&a_match).then_with(|| a_query.cmp(&b_query))
-        });
-    }
-    let items: Vec<ListItem<'static>> = sorted_indices
-        .iter()
-        .map(|idx| {
-            let filter = &settings.rss.filters[*idx];
-            let filter_text = filter.query.clone();
-            let filter_lc = filter_text.trim().to_lowercase();
-            let is_matching_existing = is_creating_filter
-                && !draft_lc.is_empty()
-                && matches!(app_state.ui.rss.add_filter_mode, RssFilterMode::Fuzzy)
-                && filter_lc.contains(&draft_lc);
-            let matches_explorer_selection = filter.enabled
-                && !filter_lc.is_empty()
-                && explorer_selected_title_lc.as_ref().is_some_and(|title| {
-                    filter_matches_title(title, &filter_text, filter.mode, &matcher)
-                });
-            let style = if !filter.enabled {
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.theme.semantic.overlay0)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                )
-            } else if matches_explorer_selection {
-                ctx.apply(Style::default().fg(ctx.state_selected()).bold())
-            } else if is_matching_existing {
-                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
-            } else {
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text))
-            };
-            let (_, downloaded_matches) =
-                compute_filter_match_counts(app_state, &filter_text, filter.mode, &matcher);
-            let history_age =
-                filter_history_age_label(app_state, &filter_text, filter.mode, &matcher);
-            let mode_label = match filter.mode {
-                RssFilterMode::Fuzzy => "[fuzzy]",
-                RssFilterMode::Regex => "[regex]",
-            };
-
-            ListItem::new(Line::from(vec![Span::styled(
-                format!(
-                    "{} [downloaded {}] \"{}\" - {}",
-                    mode_label, downloaded_matches, filter_text, history_age
-                ),
-                style,
-            )]))
-        })
-        .collect();
-    let mut state = ListState::default();
-    if !sorted_indices.is_empty() {
-        state.select(Some(selected.min(sorted_indices.len() - 1)));
-    }
-    let highlight_style = if active {
-        screen
-            .theme
-            .apply(Style::default().fg(screen.theme.state_selected()).bold())
-    } else {
-        screen.theme.apply(Style::default())
-    };
-    f.render_stateful_widget(
-        List::new(items)
-            .block(pane_block("Filters", active, screen.theme))
-            .highlight_style(highlight_style),
-        area,
-        &mut state,
-    );
-}
-
-fn compute_explorer_items(
-    preview_items: &[crate::app::RssPreviewItem],
-    search_query: &str,
-    enabled_filters: &[FilterSpec],
-    draft_filter_query: &str,
-    draft_filter_mode: RssFilterMode,
-    prefer_draft_sort: bool,
-) -> (Vec<crate::app::RssPreviewItem>, Vec<bool>, bool) {
-    let search = search_query.to_lowercase();
-    let has_search = !search.is_empty();
-    let draft_q = draft_filter_query.to_lowercase();
-    let has_draft_query = !draft_q.is_empty();
-    let matcher = SkimMatcherV2::default();
-
-    let has_enabled_filters = !enabled_filters.is_empty();
-    let prioritise_matches = has_search || has_enabled_filters || has_draft_query;
-
-    let mut items = preview_items.to_vec();
-    let mut combined_match: Vec<bool> = items
-        .iter()
-        .map(|item| {
-            let search_hit = has_search && item.title.to_lowercase().contains(&search);
-            let enabled_filter_hit = enabled_filters
-                .iter()
-                .any(|f| filter_matches_title(&item.title, &f.query, f.mode, &matcher));
-            let draft_hit = has_draft_query
-                && filter_matches_title(&item.title, &draft_q, draft_filter_mode, &matcher);
-            enabled_filter_hit || search_hit || draft_hit
-        })
-        .collect();
-
-    if has_search {
-        let filtered: Vec<(crate::app::RssPreviewItem, bool)> = items
-            .into_iter()
-            .zip(combined_match)
-            .filter(|(_, is_match)| *is_match)
-            .collect();
-        let mut filtered = filtered;
-        filtered.sort_by(|a, b| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()));
-        combined_match = filtered.iter().map(|p| p.1).collect();
-        items = filtered.into_iter().map(|p| p.0).collect();
-        return (items, combined_match, prioritise_matches);
-    }
-
-    let mut paired: Vec<(crate::app::RssPreviewItem, bool, bool, Option<i64>)> = items
-        .into_iter()
-        .zip(combined_match)
-        .map(|(item, is_match)| {
-            let draft_hit = has_draft_query
-                && filter_matches_title(&item.title, &draft_q, draft_filter_mode, &matcher);
-            let draft_score = if has_draft_query {
-                if matches!(draft_filter_mode, RssFilterMode::Fuzzy) {
-                    matcher.fuzzy_match(&item.title.to_lowercase(), &draft_q)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            (item, is_match, draft_hit, draft_score)
-        })
-        .collect();
-    if prioritise_matches {
-        if prefer_draft_sort && has_draft_query {
-            paired.sort_by(|a, b| {
-                b.2.cmp(&a.2)
-                    .then_with(|| b.3.unwrap_or(0).cmp(&a.3.unwrap_or(0)))
-                    .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()))
-            });
-        } else {
-            paired.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then_with(|| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()))
-            });
-        }
-    } else {
-        paired.sort_by(|a, b| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()));
-    }
-    combined_match = paired.iter().map(|p| p.1).collect();
-    items = paired.into_iter().map(|p| p.0).collect();
-
-    (items, combined_match, prioritise_matches)
-}
-
-fn rss_item_completion_percent(
-    item: &crate::app::RssPreviewItem,
+fn compute_filter_runtime_stats(
     app_state: &AppState,
-) -> Option<f64> {
-    if let Some(link) = &item.link {
-        if link.starts_with("magnet:") {
-            let (v1_hash, v2_hash) = crate::app::parse_hybrid_hashes(link);
-            for hash in [v1_hash, v2_hash].into_iter().flatten() {
-                if let Some(torrent) = app_state.torrents.get(&hash) {
-                    return Some(crate::app::torrent_completion_percent(
-                        &torrent.latest_state,
-                    ));
-                }
-            }
-        }
-    }
-
-    if let Some(history_hash) = app_state
-        .rss_runtime
-        .history
+    settings: &crate::config::Settings,
+) -> HashMap<usize, crate::app::RssFilterRuntimeStat> {
+    let matcher = SkimMatcherV2::default();
+    settings
+        .rss
+        .filters
         .iter()
-        .find(|entry| entry.dedupe_key == item.dedupe_key)
-        .and_then(|entry| entry.info_hash.as_deref())
-        .and_then(|hash| hex::decode(hash).ok())
-    {
-        if let Some(torrent) = app_state.torrents.get(&history_hash) {
-            return Some(crate::app::torrent_completion_percent(
-                &torrent.latest_state,
-            ));
-        }
-    }
-
-    None
+        .enumerate()
+        .map(|(idx, filter)| {
+            let downloaded_matches =
+                compute_filter_downloaded_matches(app_state, &filter.query, filter.mode, &matcher);
+            let history_age =
+                filter_history_age_label(app_state, &filter.query, filter.mode, &matcher);
+            (
+                idx,
+                crate::app::RssFilterRuntimeStat {
+                    downloaded_matches,
+                    history_age,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>()
 }
 
-fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
-    let app_state = screen.app.state;
-    let settings = screen.settings;
-    let ctx = screen.theme;
-    let matcher = SkimMatcherV2::default();
-    let selected = app_state
-        .ui
-        .rss
-        .selected_explorer_index
-        .min(app_state.rss_runtime.preview_items.len().saturating_sub(1));
+fn build_history_hash_by_dedupe(
+    history: &[crate::config::RssHistoryEntry],
+) -> HashMap<String, Vec<u8>> {
+    history
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .info_hash
+                .as_deref()
+                .and_then(|hash| hex::decode(hash).ok())
+                .map(|decoded| (entry.dedupe_key.clone(), decoded))
+        })
+        .collect()
+}
 
+pub fn recompute_rss_derived(app_state: &mut AppState, settings: &crate::config::Settings) {
     let enabled_filters = enabled_filters(settings);
-    let explorer_greyed_out = explorer_should_be_greyed_out(settings);
     let is_creating_filter = app_state.ui.rss.is_editing
         && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
-    let focused_filter_query = focused_filter_query(app_state, settings);
     let active_filter = active_filter_spec(app_state, settings);
     let active_filter_query = active_filter
         .as_ref()
@@ -1489,28 +1353,323 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
         is_creating_filter,
     );
 
+    app_state.rss_derived.explorer_items = items;
+    app_state.rss_derived.explorer_combined_match = combined_match;
+    app_state.rss_derived.explorer_prioritise_matches = prioritise_matches;
+    app_state.rss_derived.history_hash_by_dedupe =
+        build_history_hash_by_dedupe(&app_state.rss_runtime.history);
+    app_state.rss_derived.filter_runtime_stats = compute_filter_runtime_stats(app_state, settings);
+}
+
+fn normalize_title(input: &str) -> String {
+    input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
+    let perf_start = Instant::now();
+    let app_state = screen.app.state;
+    let settings = screen.settings;
+    let ctx = screen.theme;
+    let matcher = SkimMatcherV2::default();
+    let selected = app_state.ui.rss.selected_filter_index;
+    let is_creating_filter = app_state.ui.rss.is_editing
+        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
+    let draft_lc = app_state.ui.rss.edit_buffer.trim().to_lowercase();
+    let crosswire_start = Instant::now();
+    let explorer_selected_title_lc = if matches!(app_state.ui.rss.active_screen, RssScreen::Unified)
+        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Explorer)
+    {
+        if app_state.rss_derived.explorer_items.is_empty() {
+            None
+        } else {
+            let idx = app_state
+                .ui
+                .rss
+                .selected_explorer_index
+                .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
+            app_state
+                .rss_derived
+                .explorer_items
+                .get(idx)
+                .map(|item| item.title.to_lowercase())
+        }
+    } else {
+        None
+    };
+    let crosswire_ms = crosswire_start.elapsed().as_millis();
+
+    let sort_start = Instant::now();
+    let mut sorted_indices = sorted_filter_indices(settings);
+    if is_creating_filter && !draft_lc.is_empty() {
+        sorted_indices.sort_by(|a, b| {
+            let a_query = settings.rss.filters[*a].query.to_lowercase();
+            let b_query = settings.rss.filters[*b].query.to_lowercase();
+            let a_match = a_query.contains(&draft_lc);
+            let b_match = b_query.contains(&draft_lc);
+            b_match.cmp(&a_match).then_with(|| a_query.cmp(&b_query))
+        });
+    }
+    let sort_ms = sort_start.elapsed().as_millis();
+    let stats_start = Instant::now();
+    let filter_runtime_stats = &app_state.rss_derived.filter_runtime_stats;
+    let stats_ms = stats_start.elapsed().as_millis();
+    let rows_start = Instant::now();
+    let mut items: Vec<ListItem<'static>> = Vec::with_capacity(sorted_indices.len());
+    for idx in &sorted_indices {
+        let filter = &settings.rss.filters[*idx];
+        let filter_text = filter.query.clone();
+        let filter_lc = filter_text.trim().to_lowercase();
+        let is_matching_existing = is_creating_filter
+            && !draft_lc.is_empty()
+            && matches!(app_state.ui.rss.add_filter_mode, RssFilterMode::Fuzzy)
+            && filter_lc.contains(&draft_lc);
+        let matches_explorer_selection = filter.enabled
+            && !filter_lc.is_empty()
+            && explorer_selected_title_lc.as_ref().is_some_and(|title| {
+                filter_matches_title(title, &filter_text, filter.mode, &matcher)
+            });
+        let style = if !filter.enabled {
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.overlay0)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            )
+        } else if matches_explorer_selection {
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold())
+        } else if is_matching_existing {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+        };
+        let stats = filter_runtime_stats.get(idx);
+        let downloaded_matches = stats.map(|s| s.downloaded_matches).unwrap_or(0);
+        let history_age = stats.map(|s| s.history_age.as_str()).unwrap_or("today");
+        let mode_label = match filter.mode {
+            RssFilterMode::Fuzzy => "[fuzzy]",
+            RssFilterMode::Regex => "[regex]",
+        };
+
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!(
+                "{} [downloaded {}] \"{}\" - {}",
+                mode_label, downloaded_matches, filter_text, history_age
+            ),
+            style,
+        )])));
+    }
+    let rows_ms = rows_start.elapsed().as_millis();
+    let mut state = ListState::default();
+    if !sorted_indices.is_empty() {
+        state.select(Some(selected.min(sorted_indices.len() - 1)));
+    }
+    let highlight_style = if active {
+        screen
+            .theme
+            .apply(Style::default().fg(screen.theme.state_selected()).bold())
+    } else {
+        screen.theme.apply(Style::default())
+    };
+    let render_start = Instant::now();
+    f.render_stateful_widget(
+        List::new(items)
+            .block(pane_block("Filters", active, screen.theme))
+            .highlight_style(highlight_style),
+        area,
+        &mut state,
+    );
+    let render_ms = render_start.elapsed().as_millis();
+    let _ = perf_start;
+    let _ = crosswire_ms;
+    let _ = sort_ms;
+    let _ = stats_ms;
+    let _ = rows_ms;
+    let _ = render_ms;
+}
+
+fn compute_explorer_items(
+    preview_items: &[crate::app::RssPreviewItem],
+    search_query: &str,
+    enabled_filters: &[FilterSpec],
+    draft_filter_query: &str,
+    draft_filter_mode: RssFilterMode,
+    prefer_draft_sort: bool,
+) -> (Vec<crate::app::RssPreviewItem>, Vec<bool>, bool) {
+    let search = search_query.to_lowercase();
+    let has_search = !search.is_empty();
+    let draft_filter = prepare_filter(draft_filter_query, draft_filter_mode);
+    let has_draft_query = draft_filter.is_some();
+    let matcher = SkimMatcherV2::default();
+    let enabled_prepared: Vec<PreparedFilter> = enabled_filters
+        .iter()
+        .filter_map(|f| prepare_filter(&f.query, f.mode))
+        .collect();
+
+    let has_enabled_filters = !enabled_prepared.is_empty();
+    let prioritise_matches = has_search || has_enabled_filters || has_draft_query;
+    let prepared_items: Vec<(crate::app::RssPreviewItem, String)> = preview_items
+        .iter()
+        .cloned()
+        .map(|item| {
+            let title_lc = item.title.to_lowercase();
+            (item, title_lc)
+        })
+        .collect();
+
+    let mut combined_match: Vec<bool> = prepared_items
+        .iter()
+        .map(|(item, title_lc)| {
+            let search_hit = has_search && title_lc.contains(&search);
+            let enabled_filter_hit = enabled_prepared
+                .iter()
+                .any(|f| prepared_filter_matches(&item.title, title_lc, f, &matcher));
+            let draft_hit = draft_filter
+                .as_ref()
+                .is_some_and(|f| prepared_filter_matches(&item.title, title_lc, f, &matcher));
+            enabled_filter_hit || search_hit || draft_hit
+        })
+        .collect();
+
+    if has_search {
+        let filtered: Vec<(crate::app::RssPreviewItem, String, bool)> = prepared_items
+            .into_iter()
+            .zip(combined_match)
+            .filter_map(|((item, title_lc), is_match)| is_match.then_some((item, title_lc, true)))
+            .collect();
+        let mut filtered = filtered;
+        filtered.sort_by(|a, b| a.1.cmp(&b.1));
+        combined_match = filtered.iter().map(|p| p.2).collect();
+        let items = filtered.into_iter().map(|p| p.0).collect();
+        return (items, combined_match, prioritise_matches);
+    }
+
+    let mut paired: Vec<(crate::app::RssPreviewItem, String, bool, bool, Option<i64>)> =
+        prepared_items
+            .into_iter()
+            .zip(combined_match)
+            .map(|((item, title_lc), is_match)| {
+                let draft_hit = draft_filter
+                    .as_ref()
+                    .is_some_and(|f| prepared_filter_matches(&item.title, &title_lc, f, &matcher));
+                let draft_score = draft_filter.as_ref().and_then(|f| {
+                    if matches!(f.mode, RssFilterMode::Fuzzy) {
+                        matcher.fuzzy_match(&title_lc, &f.query_lc)
+                    } else {
+                        None
+                    }
+                });
+                (item, title_lc, is_match, draft_hit, draft_score)
+            })
+            .collect();
+    if prioritise_matches {
+        if prefer_draft_sort && has_draft_query {
+            paired.sort_by(|a, b| {
+                b.3.cmp(&a.3)
+                    .then_with(|| b.4.unwrap_or(0).cmp(&a.4.unwrap_or(0)))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        } else {
+            paired.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        }
+    } else {
+        paired.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+    combined_match = paired.iter().map(|p| p.2).collect();
+    let items = paired.into_iter().map(|p| p.0).collect();
+
+    (items, combined_match, prioritise_matches)
+}
+
+fn rss_item_completion_percent(
+    item: &crate::app::RssPreviewItem,
+    app_state: &AppState,
+    history_hash_map: &HashMap<String, Vec<u8>>,
+) -> Option<f64> {
+    if app_state.torrents.is_empty() {
+        return None;
+    }
+
+    if let Some(link) = &item.link {
+        if link.starts_with("magnet:") {
+            let (v1_hash, v2_hash) = crate::app::parse_hybrid_hashes(link);
+            for hash in [v1_hash, v2_hash].into_iter().flatten() {
+                if let Some(torrent) = app_state.torrents.get(&hash) {
+                    return Some(crate::app::torrent_completion_percent(
+                        &torrent.latest_state,
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(history_hash) = history_hash_map.get(&item.dedupe_key) {
+        if let Some(torrent) = app_state.torrents.get(history_hash) {
+            return Some(crate::app::torrent_completion_percent(
+                &torrent.latest_state,
+            ));
+        }
+    }
+
+    None
+}
+
+fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
+    let perf_start = Instant::now();
+    let app_state = screen.app.state;
+    let settings = screen.settings;
+    let ctx = screen.theme;
+    let matcher = SkimMatcherV2::default();
+    let selected = app_state
+        .ui
+        .rss
+        .selected_explorer_index
+        .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
+
+    let explorer_greyed_out = explorer_should_be_greyed_out(settings);
+    let is_creating_filter = app_state.ui.rss.is_editing
+        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
+    let focused_filter_query = focused_filter_query(app_state, settings);
+    let compute_start = Instant::now();
+    let items = &app_state.rss_derived.explorer_items;
+    let combined_match = &app_state.rss_derived.explorer_combined_match;
+    let prioritise_matches = app_state.rss_derived.explorer_prioritise_matches;
+    let compute_ms = compute_start.elapsed().as_millis();
+    let history_hash_map = &app_state.rss_derived.history_hash_by_dedupe;
+    let draft_filter = prepare_filter(
+        &app_state.ui.rss.edit_buffer,
+        app_state.ui.rss.add_filter_mode,
+    );
+    let enabled_prepared: Vec<PreparedFilter> = settings
+        .rss
+        .filters
+        .iter()
+        .filter(|f| f.enabled)
+        .filter_map(|f| prepare_filter(&f.query, f.mode))
+        .collect();
+    let focused_filter = focused_filter_query
+        .as_ref()
+        .and_then(|f| prepare_filter(&f.query, f.mode));
+
+    let rows_start = Instant::now();
     let list_items: Vec<ListItem<'static>> = items
         .iter()
         .enumerate()
         .map(|(i, item)| {
             let is_combined_match = combined_match.get(i).copied().unwrap_or(item.is_match);
-            let draft_lc = app_state.ui.rss.edit_buffer.trim().to_lowercase();
-            let draft_hit = !draft_lc.is_empty()
-                && filter_matches_title(
-                    &item.title,
-                    &draft_lc,
-                    app_state.ui.rss.add_filter_mode,
-                    &matcher,
-                );
-            let existing_filter_hit = settings
-                .rss
-                .filters
-                .iter()
-                .filter(|f| f.enabled)
-                .any(|f| filter_matches_title(&item.title, &f.query, f.mode, &matcher));
-            let focused_filter_hit = focused_filter_query
+            let title_lc = item.title.to_lowercase();
+            let draft_hit = draft_filter
                 .as_ref()
-                .is_none_or(|f| filter_matches_title(&item.title, &f.query, f.mode, &matcher));
+                .is_some_and(|f| prepared_filter_matches(&item.title, &title_lc, f, &matcher));
+            let existing_filter_hit = enabled_prepared
+                .iter()
+                .any(|f| prepared_filter_matches(&item.title, &title_lc, f, &matcher));
+            let focused_filter_hit = focused_filter
+                .as_ref()
+                .is_none_or(|f| prepared_filter_matches(&item.title, &title_lc, f, &matcher));
 
             let dim_as_other_filter_match = is_creating_filter && existing_filter_hit && !draft_hit;
             let style = if explorer_greyed_out || dim_as_other_filter_match {
@@ -1523,7 +1682,7 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
                 ctx.apply(Style::default().fg(ctx.theme.semantic.text))
             };
 
-            let completion_pct = rss_item_completion_percent(item, app_state);
+            let completion_pct = rss_item_completion_percent(item, app_state, history_hash_map);
             if let Some(pct) = completion_pct {
                 let completion_style = style.patch(Style::default().fg(ctx.state_success()));
                 ListItem::new(Line::from(vec![
@@ -1535,6 +1694,7 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
             }
         })
         .collect();
+    let rows_ms = rows_start.elapsed().as_millis();
 
     let mut state = ListState::default();
     if active && !items.is_empty() {
@@ -1553,6 +1713,7 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
             .theme
             .apply(Style::default().fg(screen.theme.theme.semantic.text).bold())
     };
+    let render_start = Instant::now();
     f.render_stateful_widget(
         List::new(list_items)
             .block(pane_block("Explorer", active, screen.theme))
@@ -1560,6 +1721,11 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
         area,
         &mut state,
     );
+    let render_ms = render_start.elapsed().as_millis();
+    let _ = perf_start;
+    let _ = compute_ms;
+    let _ = rows_ms;
+    let _ = render_ms;
 }
 
 fn draw_history(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
@@ -3089,6 +3255,7 @@ mod tests {
     #[test]
     fn rss_item_completion_percent_is_none_without_live_torrent_metrics() {
         let app_state = base_state();
+        let history_hash_map = build_history_hash_by_dedupe(&app_state.rss_runtime.history);
         let item = RssPreviewItem {
             title: "Series Alpha".to_string(),
             is_downloaded: true,
@@ -3096,7 +3263,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(rss_item_completion_percent(&item, &app_state).is_none());
+        assert!(rss_item_completion_percent(&item, &app_state, &history_hash_map).is_none());
     }
 
     #[test]
@@ -3127,7 +3294,45 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(rss_item_completion_percent(&item, &app_state), Some(100.0));
+        let history_hash_map = build_history_hash_by_dedupe(&app_state.rss_runtime.history);
+        assert_eq!(
+            rss_item_completion_percent(&item, &app_state, &history_hash_map),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn rss_item_completion_percent_does_not_require_downloaded_flag() {
+        let mut app_state = base_state();
+        let info_hash = vec![0xbb; 20];
+
+        let mut torrent = crate::app::TorrentDisplayState::default();
+        torrent.latest_state.number_of_pieces_total = 10;
+        torrent.latest_state.number_of_pieces_completed = 10;
+        app_state.torrents.insert(info_hash.clone(), torrent);
+
+        app_state
+            .rss_runtime
+            .history
+            .push(crate::config::RssHistoryEntry {
+                dedupe_key: "guid:series-beta".to_string(),
+                info_hash: Some(hex::encode(&info_hash)),
+                title: "Series Beta".to_string(),
+                ..Default::default()
+            });
+
+        let item = RssPreviewItem {
+            dedupe_key: "guid:series-beta".to_string(),
+            title: "Series Beta".to_string(),
+            is_downloaded: false,
+            ..Default::default()
+        };
+
+        let history_hash_map = build_history_hash_by_dedupe(&app_state.rss_runtime.history);
+        assert_eq!(
+            rss_item_completion_percent(&item, &app_state, &history_hash_map),
+            Some(100.0)
+        );
     }
 
     #[test]

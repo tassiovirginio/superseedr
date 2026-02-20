@@ -595,6 +595,21 @@ pub struct RssRuntimeState {
 }
 
 #[derive(Default, Clone)]
+pub struct RssFilterRuntimeStat {
+    pub downloaded_matches: usize,
+    pub history_age: String,
+}
+
+#[derive(Default, Clone)]
+pub struct RssDerivedState {
+    pub explorer_items: Vec<RssPreviewItem>,
+    pub explorer_combined_match: Vec<bool>,
+    pub explorer_prioritise_matches: bool,
+    pub history_hash_by_dedupe: HashMap<String, Vec<u8>>,
+    pub filter_runtime_stats: HashMap<usize, RssFilterRuntimeStat>,
+}
+
+#[derive(Default, Clone)]
 #[allow(dead_code)]
 pub struct RssPreviewItem {
     pub dedupe_key: String,
@@ -670,6 +685,7 @@ pub struct AppState {
 
     pub ui: UiState,
     pub rss_runtime: RssRuntimeState,
+    pub rss_derived: RssDerivedState,
     pub data_rate: DataRate,
     pub theme: Theme,
 
@@ -936,6 +952,7 @@ impl App {
             t.latest_state.number_of_pieces_completed < t.latest_state.number_of_pieces_total
         });
         app.app_state.is_seeding = !is_leeching;
+        app.refresh_rss_derived();
 
         Ok(app)
     }
@@ -1263,6 +1280,10 @@ impl App {
                 }
             }
         });
+    }
+
+    fn refresh_rss_derived(&mut self) {
+        crate::tui::screens::rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
     }
 
     async fn handle_app_command(&mut self, command: AppCommand) {
@@ -1687,6 +1708,7 @@ impl App {
             }
             AppCommand::RssPreviewUpdated(preview_items) => {
                 self.app_state.rss_runtime.preview_items = preview_items;
+                self.refresh_rss_derived();
                 self.app_state.ui.needs_redraw = true;
             }
             AppCommand::RssSyncStatusUpdated {
@@ -1725,10 +1747,12 @@ impl App {
                     self.app_state.rss_runtime.history.push(entry);
                     self.save_state_to_disk();
                 }
+                self.refresh_rss_derived();
                 self.app_state.ui.needs_redraw = true;
             }
             AppCommand::RssDownloadPreview(item) => {
                 self.download_rss_preview_item(item).await;
+                self.refresh_rss_derived();
                 self.app_state.ui.needs_redraw = true;
             }
             AppCommand::UpdateConfig(new_settings) => {
@@ -1782,6 +1806,7 @@ impl App {
                         &mut self.app_state.rss_runtime.feed_errors,
                         &self.client_configs,
                     );
+                    self.refresh_rss_derived();
                     let _ = self.rss_sync_tx.try_send(());
                 }
 
@@ -1845,6 +1870,7 @@ impl App {
                 }
 
                 self.save_state_to_disk();
+                self.refresh_rss_derived();
 
                 self.app_state.ui.needs_redraw = true;
             }
@@ -2095,6 +2121,8 @@ impl App {
 
         if changed {
             self.sort_and_filter_torrent_list();
+            // Keep RSS derived recomputation off the hot metrics path.
+            // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
             self.app_state.ui.needs_redraw = true;
         }
     }
@@ -2476,6 +2504,7 @@ impl App {
             .torrents
             .insert(info_hash.clone(), placeholder_state);
         self.app_state.torrent_list_order.push(info_hash.clone());
+        self.refresh_rss_derived();
 
         if matches!(self.app_state.mode, AppMode::Welcome) {
             self.app_state.mode = AppMode::Normal;
@@ -2536,6 +2565,7 @@ impl App {
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
+                self.refresh_rss_derived();
             }
         }
     }
@@ -2597,6 +2627,7 @@ impl App {
             .torrents
             .insert(info_hash.clone(), placeholder_state);
         self.app_state.torrent_list_order.push(info_hash.clone());
+        self.refresh_rss_derived();
 
         if matches!(self.app_state.mode, AppMode::Welcome) {
             self.app_state.mode = AppMode::Normal;
@@ -2652,6 +2683,7 @@ impl App {
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
+                self.refresh_rss_derived();
             }
         }
     }
@@ -2810,6 +2842,8 @@ impl App {
         {
             let _ = self.rss_downloaded_entry_tx.try_send(history_entry);
         }
+
+        self.refresh_rss_derived();
     }
 
     async fn download_rss_torrent_from_url(&mut self, url: &str) -> (bool, Option<Vec<u8>>) {
