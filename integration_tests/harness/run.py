@@ -12,6 +12,7 @@ from integration_tests.harness.scenarios import (
     superseedr_to_transmission,
     superseedr_to_qbittorrent,
     superseedr_to_superseedr,
+    transmission_to_superseedr,
 )
 
 ALL_MODES = ("v1", "v2", "hybrid")
@@ -20,6 +21,7 @@ SCENARIOS = {
     "superseedr_to_qbittorrent": superseedr_to_qbittorrent,
     "qbittorrent_to_superseedr": qbittorrent_to_superseedr,
     "superseedr_to_transmission": superseedr_to_transmission,
+    "transmission_to_superseedr": transmission_to_superseedr,
 }
 
 

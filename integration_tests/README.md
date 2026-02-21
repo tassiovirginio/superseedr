@@ -9,6 +9,7 @@ Current stable scope:
 
 Experimental scope:
 - `superseedr -> transmission` (seed + leech, currently `v1` only)
+- `transmission -> superseedr` (seed + leech, currently `v1` only)
 
 ## Purpose
 
@@ -98,6 +99,7 @@ Accepted arguments:
   - `superseedr_to_qbittorrent`
   - `qbittorrent_to_superseedr`
   - `superseedr_to_transmission` (experimental)
+  - `transmission_to_superseedr` (experimental)
 - `--mode`: `all`, `v1`, `v2`, `hybrid`
 - `--timeout-secs`: timeout per mode in seconds
 - `--run-id`: optional explicit run id
@@ -161,10 +163,11 @@ As of February 21, 2026:
 - CI interop matrix now enforces all three scenarios (`superseedr_to_superseedr`, `superseedr_to_qbittorrent`, `qbittorrent_to_superseedr`) across all three modes.
 - qBittorrent and tracker host ports are dynamically allocated in qBittorrent scenarios/tests to reduce local port-collision flakes.
 - Transmission adapter now supports auth/session handshake, torrent add, status polling, and log collection.
-- `superseedr -> transmission` scenario/test scaffolding has been added (currently validated on `v1`) but is not yet in CI matrix.
+- Transmission scenario/test scaffolding has been added for both directions (currently validated on `v1`) but is not yet in CI matrix.
+- Transmission `v2`/`hybrid` adds currently fail with RPC result `unrecognized info` on the linuxserver image.
 
 ## Plan / Next Tasks
 
-1. Validate and stabilize `superseedr -> transmission` for `v2` and `hybrid` compatibility.
+1. Validate Transmission `v2`/`hybrid` compatibility and enable non-`v1` modes when supported.
 2. Add focused diagnostics for reverse failures (piece-level mapping/torrent-level correlation) to shorten triage loops.
-3. Add `transmission -> superseedr` scenario and extend CI once transmission scenarios are stable.
+3. Extend CI matrix with transmission scenarios once mode support and runtime budget are accepted.

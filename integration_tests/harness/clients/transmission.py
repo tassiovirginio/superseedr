@@ -59,9 +59,15 @@ class TransmissionAdapter(ClientAdapter):
                 with urllib.request.urlopen(request, timeout=10) as response:
                     body = response.read().decode("utf-8", errors="replace")
                 parsed = json.loads(body)
-                if parsed.get("result") != "success":
+                result = parsed.get("result")
+                if result != "success":
+                    if method == "torrent-add" and result == "unrecognized info":
+                        raise RuntimeError(
+                            "Transmission rejected torrent metainfo as 'unrecognized info' "
+                            "(likely unsupported format, e.g. v2/hybrid on this image)."
+                        )
                     raise RuntimeError(
-                        f"Transmission RPC failed method={method} result={parsed.get('result')!r}"
+                        f"Transmission RPC failed method={method} result={result!r}"
                     )
                 args = parsed.get("arguments", {})
                 if not isinstance(args, dict):
