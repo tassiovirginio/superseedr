@@ -1515,6 +1515,22 @@ fn normalize_title(input: &str) -> String {
         .to_lowercase()
 }
 
+fn new_filter_placeholder_label(
+    app_state: &AppState,
+    settings: &crate::config::Settings,
+) -> Option<String> {
+    let is_creating_filter = app_state.ui.rss.is_editing
+        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
+    if !is_creating_filter || !settings.rss.filters.is_empty() {
+        return None;
+    }
+    let draft = app_state.ui.rss.edit_buffer.trim();
+    if draft.is_empty() {
+        return None;
+    }
+    Some(format!("[new] {}", draft))
+}
+
 fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
     let perf_start = Instant::now();
     let app_state = screen.app.state;
@@ -1607,14 +1623,11 @@ fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: b
             style,
         )])));
     }
-    if items.is_empty() && is_creating_filter {
-        let draft = app_state.ui.rss.edit_buffer.trim();
-        if !draft.is_empty() {
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                format!("[new] {}", draft),
-                ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-            )])));
-        }
+    if let Some(label) = new_filter_placeholder_label(app_state, settings) {
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            label,
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        )])));
     }
     let rows_ms = rows_start.elapsed().as_millis();
     let mut state = ListState::default();
@@ -3385,6 +3398,19 @@ mod tests {
         });
 
         assert!(focused_filter_query(&app_state, &settings).is_none());
+    }
+
+    #[test]
+    fn new_filter_placeholder_label_is_shown_when_creating_with_no_filters() {
+        let mut app_state = base_state();
+        app_state.ui.rss.active_screen = RssScreen::Unified;
+        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
+        app_state.ui.rss.is_editing = true;
+        app_state.ui.rss.edit_buffer = "sample draft".to_string();
+
+        let settings = crate::config::Settings::default();
+        let label = new_filter_placeholder_label(&app_state, &settings);
+        assert_eq!(label.as_deref(), Some("[new] sample draft"));
     }
 
     #[test]
