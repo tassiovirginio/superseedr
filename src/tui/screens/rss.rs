@@ -233,6 +233,19 @@ fn enabled_filters(settings: &crate::config::Settings) -> Vec<FilterSpec> {
         .collect()
 }
 
+fn filter_already_exists(
+    settings: &crate::config::Settings,
+    query: &str,
+    mode: RssFilterMode,
+) -> bool {
+    let normalized = query.trim();
+    settings
+        .rss
+        .filters
+        .iter()
+        .any(|f| f.mode == mode && f.query.trim().eq_ignore_ascii_case(normalized))
+}
+
 fn filter_matches_title(
     title: &str,
     filter_query: &str,
@@ -248,6 +261,13 @@ fn filter_matches_title(
 
 fn explorer_should_be_greyed_out(settings: &crate::config::Settings) -> bool {
     settings.rss.filters.iter().all(|f| !f.enabled)
+}
+
+fn explorer_effective_greyed_out(app_state: &AppState, settings: &crate::config::Settings) -> bool {
+    let is_creating_filter = app_state.ui.rss.is_editing
+        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
+    let has_draft = !app_state.ui.rss.edit_buffer.trim().is_empty();
+    explorer_should_be_greyed_out(settings) && !(is_creating_filter && has_draft)
 }
 
 fn is_valid_feed_url(value: &str) -> bool {
@@ -467,6 +487,14 @@ fn execute_rss_effects(
                                     set_rss_status(app_state, "Invalid regex pattern");
                                     continue;
                                 }
+                                if filter_already_exists(
+                                    &new_settings,
+                                    &value,
+                                    app_state.ui.rss.add_filter_mode,
+                                ) {
+                                    set_rss_status(app_state, "Filter already exists");
+                                    continue;
+                                }
                                 new_settings.rss.filters.push(crate::config::RssFilter {
                                     query: value,
                                     mode: app_state.ui.rss.add_filter_mode,
@@ -521,10 +549,7 @@ fn execute_rss_effects(
             }
             RssAction::AddEntry => {
                 if matches!(app_state.ui.rss.active_screen, RssScreen::Unified)
-                    && matches!(
-                        app_state.ui.rss.focused_section,
-                        RssSectionFocus::Links | RssSectionFocus::Filters
-                    )
+                    && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters)
                 {
                     app_state.ui.rss.is_editing = true;
                     app_state.ui.rss.edit_buffer.clear();
@@ -1515,22 +1540,6 @@ fn normalize_title(input: &str) -> String {
         .to_lowercase()
 }
 
-fn new_filter_placeholder_label(
-    app_state: &AppState,
-    settings: &crate::config::Settings,
-) -> Option<String> {
-    let is_creating_filter = app_state.ui.rss.is_editing
-        && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
-    if !is_creating_filter || !settings.rss.filters.is_empty() {
-        return None;
-    }
-    let draft = app_state.ui.rss.edit_buffer.trim();
-    if draft.is_empty() {
-        return None;
-    }
-    Some(format!("[new] {}", draft))
-}
-
 fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
     let perf_start = Instant::now();
     let app_state = screen.app.state;
@@ -1621,12 +1630,6 @@ fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: b
                 mode_label, downloaded_matches, filter_text, history_age
             ),
             style,
-        )])));
-    }
-    if let Some(label) = new_filter_placeholder_label(app_state, settings) {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            label,
-            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
         )])));
     }
     let rows_ms = rows_start.elapsed().as_millis();
@@ -1828,7 +1831,7 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
         .selected_explorer_index
         .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
 
-    let explorer_greyed_out = explorer_should_be_greyed_out(settings);
+    let explorer_greyed_out = explorer_effective_greyed_out(app_state, settings);
     let is_creating_filter = app_state.ui.rss.is_editing
         && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters);
     let focused_filter_query = focused_filter_query(app_state, settings);
@@ -2364,19 +2367,9 @@ mod tests {
     fn add_link_dispatches_update_config() {
         let mut app_state = base_state();
         app_state.ui.rss.focused_section = RssSectionFocus::Links;
+        app_state.ui.rss.is_editing = true;
         let settings = crate::config::Settings::default();
         let (tx, mut rx) = mpsc::channel(8);
-
-        handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
-                KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            )),
-            &mut app_state,
-            &settings,
-            &tx,
-        );
-        assert!(app_state.ui.rss.is_editing);
 
         for c in "https://example.com/rss.xml".chars() {
             handle_event(
@@ -2412,14 +2405,13 @@ mod tests {
     }
 
     #[test]
-    fn add_link_reports_failure_when_update_config_enqueue_fails() {
+    fn add_entry_from_explorer_does_not_start_editing() {
         let mut app_state = base_state();
-        app_state.ui.rss.focused_section = RssSectionFocus::Links;
+        app_state.ui.rss.focused_section = RssSectionFocus::Explorer;
+        app_state.ui.rss.add_filter_mode = RssFilterMode::Fuzzy;
+        app_state.ui.rss.edit_buffer.clear();
         let settings = crate::config::Settings::default();
-        let (tx, mut rx) = mpsc::channel(1);
-
-        tx.try_send(AppCommand::RssSyncNow)
-            .expect("prefill channel to force enqueue failure");
+        let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
             CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
@@ -2430,6 +2422,30 @@ mod tests {
             &settings,
             &tx,
         );
+
+        assert!(matches!(
+            app_state.ui.rss.focused_section,
+            RssSectionFocus::Explorer
+        ));
+        assert!(!app_state.ui.rss.is_editing);
+        assert!(app_state.ui.rss.edit_buffer.is_empty());
+        assert!(matches!(
+            app_state.ui.rss.add_filter_mode,
+            RssFilterMode::Fuzzy
+        ));
+        assert!(app_state.ui.rss.status_message.is_none());
+    }
+
+    #[test]
+    fn add_link_reports_failure_when_update_config_enqueue_fails() {
+        let mut app_state = base_state();
+        app_state.ui.rss.focused_section = RssSectionFocus::Links;
+        app_state.ui.rss.is_editing = true;
+        let settings = crate::config::Settings::default();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        tx.try_send(AppCommand::RssSyncNow)
+            .expect("prefill channel to force enqueue failure");
 
         for c in "https://example.com/rss.xml".chars() {
             handle_event(
@@ -2465,18 +2481,9 @@ mod tests {
     fn invalid_feed_url_is_rejected() {
         let mut app_state = base_state();
         app_state.ui.rss.focused_section = RssSectionFocus::Links;
+        app_state.ui.rss.is_editing = true;
         let settings = crate::config::Settings::default();
         let (tx, mut rx) = mpsc::channel(8);
-
-        handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
-                KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            )),
-            &mut app_state,
-            &settings,
-            &tx,
-        );
         for c in "javascript:alert(1)".chars() {
             handle_event(
                 CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
@@ -2510,18 +2517,9 @@ mod tests {
     fn paste_link_in_edit_mode_dispatches_update_config() {
         let mut app_state = base_state();
         app_state.ui.rss.focused_section = RssSectionFocus::Links;
+        app_state.ui.rss.is_editing = true;
         let settings = crate::config::Settings::default();
         let (tx, mut rx) = mpsc::channel(8);
-
-        handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
-                KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            )),
-            &mut app_state,
-            &settings,
-            &tx,
-        );
 
         handle_event(
             CrosstermEvent::Paste("https://example.test/rss/?t&r=1080".to_string()),
@@ -2784,6 +2782,106 @@ mod tests {
         assert_eq!(
             app_state.ui.rss.status_message.as_deref(),
             Some("Invalid regex pattern")
+        );
+    }
+
+    #[test]
+    fn add_filter_rejects_duplicate_filter() {
+        let mut app_state = base_state();
+        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
+        let mut settings = crate::config::Settings::default();
+        settings.rss.filters.push(crate::config::RssFilter {
+            query: "samplealpha".to_string(),
+            mode: RssFilterMode::Fuzzy,
+            enabled: true,
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+
+        handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+        );
+        for c in "samplealpha".chars() {
+            handle_event(
+                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                    KeyCode::Char(c),
+                    ratatui::crossterm::event::KeyModifiers::NONE,
+                )),
+                &mut app_state,
+                &settings,
+                &tx,
+            );
+        }
+        handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(app_state.ui.rss.is_editing);
+        assert_eq!(
+            app_state.ui.rss.status_message.as_deref(),
+            Some("Filter already exists")
+        );
+    }
+
+    #[test]
+    fn add_filter_rejects_duplicate_filter_with_case_and_whitespace() {
+        let mut app_state = base_state();
+        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
+        let mut settings = crate::config::Settings::default();
+        settings.rss.filters.push(crate::config::RssFilter {
+            query: "  SampleAlpha  ".to_string(),
+            mode: RssFilterMode::Fuzzy,
+            enabled: true,
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+
+        handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+        );
+        for c in "samplealpha".chars() {
+            handle_event(
+                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                    KeyCode::Char(c),
+                    ratatui::crossterm::event::KeyModifiers::NONE,
+                )),
+                &mut app_state,
+                &settings,
+                &tx,
+            );
+        }
+        handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(app_state.ui.rss.is_editing);
+        assert_eq!(
+            app_state.ui.rss.status_message.as_deref(),
+            Some("Filter already exists")
         );
     }
 
@@ -3401,73 +3499,6 @@ mod tests {
     }
 
     #[test]
-    fn new_filter_placeholder_label_is_shown_when_creating_with_no_filters() {
-        let mut app_state = base_state();
-        app_state.ui.rss.active_screen = RssScreen::Unified;
-        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
-        app_state.ui.rss.is_editing = true;
-        app_state.ui.rss.edit_buffer = "sample draft".to_string();
-
-        let settings = crate::config::Settings::default();
-        let label = new_filter_placeholder_label(&app_state, &settings);
-        assert_eq!(label.as_deref(), Some("[new] sample draft"));
-    }
-
-    #[test]
-    fn new_filter_placeholder_label_is_none_when_not_editing() {
-        let mut app_state = base_state();
-        app_state.ui.rss.active_screen = RssScreen::Unified;
-        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
-        app_state.ui.rss.is_editing = false;
-        app_state.ui.rss.edit_buffer = "sample draft".to_string();
-
-        let settings = crate::config::Settings::default();
-        assert!(new_filter_placeholder_label(&app_state, &settings).is_none());
-    }
-
-    #[test]
-    fn new_filter_placeholder_label_is_none_when_not_focused_on_filters() {
-        let mut app_state = base_state();
-        app_state.ui.rss.active_screen = RssScreen::Unified;
-        app_state.ui.rss.focused_section = RssSectionFocus::Explorer;
-        app_state.ui.rss.is_editing = true;
-        app_state.ui.rss.edit_buffer = "sample draft".to_string();
-
-        let settings = crate::config::Settings::default();
-        assert!(new_filter_placeholder_label(&app_state, &settings).is_none());
-    }
-
-    #[test]
-    fn new_filter_placeholder_label_is_none_when_filters_exist() {
-        let mut app_state = base_state();
-        app_state.ui.rss.active_screen = RssScreen::Unified;
-        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
-        app_state.ui.rss.is_editing = true;
-        app_state.ui.rss.edit_buffer = "sample draft".to_string();
-
-        let mut settings = crate::config::Settings::default();
-        settings.rss.filters.push(crate::config::RssFilter {
-            query: "series alpha".to_string(),
-            mode: RssFilterMode::Fuzzy,
-            enabled: true,
-        });
-
-        assert!(new_filter_placeholder_label(&app_state, &settings).is_none());
-    }
-
-    #[test]
-    fn new_filter_placeholder_label_is_none_for_whitespace_draft() {
-        let mut app_state = base_state();
-        app_state.ui.rss.active_screen = RssScreen::Unified;
-        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
-        app_state.ui.rss.is_editing = true;
-        app_state.ui.rss.edit_buffer = "   \t  ".to_string();
-
-        let settings = crate::config::Settings::default();
-        assert!(new_filter_placeholder_label(&app_state, &settings).is_none());
-    }
-
-    #[test]
     fn explorer_greyed_out_when_no_filters_exist() {
         let settings = crate::config::Settings::default();
         assert!(explorer_should_be_greyed_out(&settings));
@@ -3503,6 +3534,28 @@ mod tests {
             enabled: true,
         });
         assert!(!explorer_should_be_greyed_out(&settings));
+    }
+
+    #[test]
+    fn explorer_effective_greyed_out_is_false_while_creating_first_filter_with_draft() {
+        let mut app_state = base_state();
+        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
+        app_state.ui.rss.is_editing = true;
+        app_state.ui.rss.edit_buffer = "sample draft".to_string();
+
+        let settings = crate::config::Settings::default();
+        assert!(!explorer_effective_greyed_out(&app_state, &settings));
+    }
+
+    #[test]
+    fn explorer_effective_greyed_out_is_true_while_creating_first_filter_without_draft() {
+        let mut app_state = base_state();
+        app_state.ui.rss.focused_section = RssSectionFocus::Filters;
+        app_state.ui.rss.is_editing = true;
+        app_state.ui.rss.edit_buffer.clear();
+
+        let settings = crate::config::Settings::default();
+        assert!(explorer_effective_greyed_out(&app_state, &settings));
     }
 
     #[test]
