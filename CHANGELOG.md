@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v1.0.0
+### 🚀 New Features
+- **Integrated RSS Workspace**: Added a full RSS experience in-app, including feed management, preview browsing, and streamlined ingest so you can discover and add downloads without leaving the terminal.
+- **Advanced RSS Filtering**: Added richer filter modes and smarter match handling so you can surface relevant feed items faster and reduce manual triage.
+- **Safer High-Impact Actions**: Added stronger confirmation flows (including Shift+Y confirmation paths) to reduce accidental destructive actions during everyday use.
+
+### ✨ Improvements
+- **Magnet Name Resolution**: Magnet entries now resolve display names more reliably from link metadata, making startup and history views clearer.
+- **UI Flow Consistency**: Screen transitions, search behavior, and key routing are more predictable across browser, normal, and help flows for smoother navigation.
+- **Persistence Robustness**: Torrent metadata persistence is now more durable across restart scenarios, with safer file finalization behavior on platform-specific edge cases.
+
+### 🐛 Bug Fixes
+- **DHT Recovery Handling**: Fixed DHT rebind/bootstrap warning handling and added automatic recovery retries so temporary bootstrap failures are less disruptive.
+- **Progress Accuracy with Skipped Files**: Fixed completion/progress display for torrents with skipped files to avoid misleading partial-progress states.
+- **RSS Network Safety Edge Cases**: Fixed RSS URL safety handling for localhost/private-network edge cases (including IPv6-localhost parsing) and improved stale RSS error cleanup.
+
 ## Release v0.9.39
 ### 🚀 New Features
 - **Boundary-Aware Piece Scheduling**: Added a piece-local request path that correctly handles torrents where piece sizes are not aligned to 16 KiB blocks, improving reliability on edge-case torrent layouts.

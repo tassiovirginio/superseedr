@@ -464,7 +464,6 @@ pub struct ThemeScale {
     pub ip_hash: [Color; 14],
     pub heatmap: ThemeHeatmap,
     pub stream: ThemeStream,
-    pub disk_blob: Color,
     pub categorical: ThemeCategorical,
 }
 
@@ -501,17 +500,11 @@ pub struct ThemeAccentSlots {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ThemeUiSlots {
-    pub disk_blob: Color,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct ThemeRoleSlots {
     pub state: ThemeStateSlots,
     pub metric: ThemeMetricSlots,
     pub peer: ThemePeerSlots,
     pub accent: ThemeAccentSlots,
-    pub ui: ThemeUiSlots,
 }
 
 pub fn color_to_rgb(color: Color) -> (u8, u8, u8) {
@@ -624,11 +617,6 @@ impl ThemeContext {
     pub fn accent_maroon(&self) -> Color {
         self.theme.role_slots().accent.maroon
     }
-
-    pub fn ui_disk_blob(&self) -> Color {
-        self.theme.role_slots().ui.disk_blob
-    }
-
     pub fn apply_effects_to_color_at(
         &self,
         color: Color,
@@ -767,9 +755,6 @@ impl Theme {
                 sapphire: self.scale.categorical.sapphire,
                 maroon: self.scale.categorical.maroon,
             },
-            ui: ThemeUiSlots {
-                disk_blob: self.scale.disk_blob,
-            },
         }
     }
 
@@ -872,7 +857,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -941,7 +925,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1023,7 +1006,6 @@ impl Theme {
                     inflow: categorical.mauve,
                     outflow: categorical.pink,
                 },
-                disk_blob: categorical.pink,
                 categorical,
             },
         }
@@ -1091,7 +1073,6 @@ impl Theme {
                     inflow: categorical.sapphire,
                     outflow: categorical.sky,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1159,7 +1140,6 @@ impl Theme {
                     inflow: categorical.sapphire,
                     outflow: categorical.sky,
                 },
-                disk_blob: categorical.sky,
                 categorical,
             },
         }
@@ -1233,7 +1213,6 @@ impl Theme {
                     inflow: categorical.peach,
                     outflow: categorical.flamingo,
                 },
-                disk_blob: categorical.yellow,
                 categorical,
             },
         }
@@ -1293,7 +1272,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.pink,
                 categorical,
             },
         }
@@ -1353,7 +1331,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1413,7 +1390,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.yellow,
                 categorical,
             },
         }
@@ -1473,7 +1449,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1533,7 +1508,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1593,7 +1567,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -1653,7 +1626,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.yellow,
                 categorical,
             },
         }
@@ -1713,7 +1685,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.green,
                 categorical,
             },
         }
@@ -1773,7 +1744,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -1833,7 +1803,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.blue,
                 categorical,
             },
         }
@@ -1893,7 +1862,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -1973,7 +1941,6 @@ impl Theme {
                     inflow: Color::Rgb(0, 255, 65),
                     outflow: Color::Rgb(0, 143, 17),
                 },
-                disk_blob: categorical.green,
                 categorical,
             },
         }
@@ -2033,7 +2000,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -2098,7 +2064,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -2158,7 +2123,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.yellow,
                 categorical,
             },
         }
@@ -2218,7 +2182,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.green,
                 categorical,
             },
         }
@@ -2285,7 +2248,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.pink,
                 categorical,
             },
         }
@@ -2345,7 +2307,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.blue,
                 categorical,
             },
         }
@@ -2420,7 +2381,6 @@ impl Theme {
                     inflow: Color::Rgb(255, 175, 0),
                     outflow: Color::Rgb(255, 128, 0),
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -2480,7 +2440,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -2540,7 +2499,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.yellow,
                 categorical,
             },
         }
@@ -2600,7 +2558,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.sky,
                 categorical,
             },
         }
@@ -2665,7 +2622,6 @@ impl Theme {
                     inflow: Color::Rgb(0, 255, 255),
                     outflow: Color::Rgb(255, 0, 255),
                 },
-                disk_blob: categorical.lavender,
                 categorical,
             },
         }
@@ -2730,7 +2686,6 @@ impl Theme {
                     inflow: Color::Rgb(255, 255, 0),
                     outflow: Color::Rgb(255, 50, 0),
                 },
-                disk_blob: categorical.peach,
                 categorical,
             },
         }
@@ -2800,7 +2755,6 @@ impl Theme {
                     inflow: Color::Rgb(0, 255, 255),
                     outflow: Color::Rgb(200, 150, 255),
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -2860,7 +2814,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.mauve,
                 categorical,
             },
         }
@@ -2920,7 +2873,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.lavender,
                 categorical,
             },
         }
@@ -2980,7 +2932,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }
@@ -3040,7 +2991,6 @@ impl Theme {
                     inflow: categorical.blue,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.blue,
                 categorical,
             },
         }
@@ -3114,7 +3064,6 @@ impl Theme {
                     inflow: categorical.lavender,
                     outflow: categorical.teal,
                 },
-                disk_blob: categorical.mauve,
                 categorical,
             },
         }
@@ -3184,7 +3133,6 @@ impl Theme {
                     inflow: categorical.sky,
                     outflow: categorical.peach,
                 },
-                disk_blob: categorical.peach,
                 categorical,
             },
         }
@@ -3258,7 +3206,6 @@ impl Theme {
                     inflow: categorical.sapphire,
                     outflow: categorical.teal,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -3347,7 +3294,6 @@ impl Theme {
                     inflow: categorical.sky,
                     outflow: categorical.teal,
                 },
-                disk_blob: categorical.sapphire,
                 categorical,
             },
         }
@@ -3421,7 +3367,6 @@ impl Theme {
                     inflow: categorical.sky,
                     outflow: categorical.green,
                 },
-                disk_blob: categorical.teal,
                 categorical,
             },
         }

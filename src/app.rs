@@ -85,6 +85,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use tokio::time;
+use tokio::time::MissedTickBehavior;
 
 use directories::UserDirs;
 
@@ -721,6 +722,9 @@ pub struct AppState {
 pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
+    pub base_system_warning: Option<String>,
+    #[cfg(feature = "dht")]
+    pub dht_bootstrap_warning: Option<String>,
 
     pub listener: tokio::net::TcpListener,
 
@@ -827,12 +831,33 @@ impl App {
             .collect();
 
         #[cfg(feature = "dht")]
-        let distributed_hash_table = Dht::builder()
+        let (distributed_hash_table, dht_bootstrap_warning) = match Dht::builder()
             .bootstrap(&bootstrap_nodes)
             .port(client_configs.client_port)
             .server_mode()
-            .build()?
-            .as_async();
+            .build()
+        {
+            Ok(dht_server) => (dht_server.as_async(), None),
+            Err(e) => {
+                let warning = format!(
+                    "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
+                    e
+                );
+                tracing_event!(Level::WARN, "{}", warning);
+                let fallback = Dht::builder()
+                    .port(client_configs.client_port)
+                    .server_mode()
+                    .build()
+                    .map_err(|fallback_err| {
+                        format!(
+                            "Failed to initialize DHT startup fallback. Bootstrap error: {}. Fallback error: {}",
+                            e, fallback_err
+                        )
+                    })?
+                    .as_async();
+                (fallback, Some(warning))
+            }
+        };
 
         #[cfg(not(feature = "dht"))]
         let distributed_hash_table = ();
@@ -844,7 +869,7 @@ impl App {
         let persisted_rss_state = load_rss_state();
 
         let app_state = AppState {
-            system_warning,
+            system_warning: None,
             system_error: None,
             limits: limits.clone(),
             ui: UiState {
@@ -885,6 +910,9 @@ impl App {
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
+            base_system_warning: system_warning,
+            #[cfg(feature = "dht")]
+            dht_bootstrap_warning,
             listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
@@ -909,6 +937,7 @@ impl App {
             watcher,
             notify_rx,
         };
+        app.refresh_system_warning();
 
         let _rss_service_task = rss_service::spawn_rss_service(
             app.client_configs.clone(),
@@ -977,6 +1006,8 @@ impl App {
         let mut stats_interval = time::interval(Duration::from_secs(1));
         let mut tuning_interval = time::interval(Duration::from_secs(90));
         let mut version_interval = time::interval(Duration::from_secs(24 * 60 * 60));
+        let mut dht_bootstrap_retry_interval = time::interval(Duration::from_secs(60));
+        dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let output_status_interval = self.client_configs.output_status_interval;
         let mut status_dump_timer = tokio::time::interval(std::time::Duration::from_secs(
@@ -1069,6 +1100,11 @@ impl App {
                         }
                     });
                 }
+                _ = dht_bootstrap_retry_interval.tick() => {
+                    if self.should_retry_dht_bootstrap() {
+                        self.maybe_retry_dht_bootstrap();
+                    }
+                }
             }
         }
 
@@ -1115,6 +1151,70 @@ impl App {
         self.app_state.disk_health_phase = (self.app_state.disk_health_phase
             + frame_dt * disk_phase_speed)
             .rem_euclid(std::f64::consts::TAU);
+    }
+
+    fn refresh_system_warning(&mut self) {
+        self.app_state.system_warning =
+            compose_system_warning(self.base_system_warning.as_deref(), {
+                #[cfg(feature = "dht")]
+                {
+                    self.dht_bootstrap_warning.as_deref()
+                }
+                #[cfg(not(feature = "dht"))]
+                {
+                    None
+                }
+            });
+    }
+
+    #[cfg(feature = "dht")]
+    fn should_retry_dht_bootstrap(&self) -> bool {
+        self.dht_bootstrap_warning.is_some()
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn should_retry_dht_bootstrap(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "dht")]
+    fn maybe_retry_dht_bootstrap(&mut self) {
+        self.retry_dht_bootstrap();
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn maybe_retry_dht_bootstrap(&mut self) {}
+
+    #[cfg(feature = "dht")]
+    fn retry_dht_bootstrap(&mut self) {
+        let bootstrap_nodes: Vec<&str> = self
+            .client_configs
+            .bootstrap_nodes
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+
+        match Dht::builder()
+            .bootstrap(&bootstrap_nodes)
+            .port(self.client_configs.client_port)
+            .server_mode()
+            .build()
+        {
+            Ok(new_dht_server) => {
+                let new_dht_handle = new_dht_server.as_async();
+                self.distributed_hash_table = new_dht_handle.clone();
+                for manager_tx in self.torrent_manager_command_txs.values() {
+                    let _ = manager_tx
+                        .try_send(ManagerCommand::UpdateDhtHandle(new_dht_handle.clone()));
+                }
+                self.dht_bootstrap_warning = None;
+                self.refresh_system_warning();
+                tracing_event!(Level::INFO, "DHT bootstrap recovered.");
+            }
+            Err(e) => {
+                tracing_event!(Level::DEBUG, "DHT bootstrap retry failed: {}", e);
+            }
+        }
     }
 
     fn startup_crossterm_event_listener(&mut self) {
@@ -2053,12 +2153,19 @@ impl App {
                                                 ),
                                             );
                                         }
+                                        self.dht_bootstrap_warning = None;
+                                        self.refresh_system_warning();
                                         tracing::event!(
                                             Level::INFO,
                                             "DHT server rebound and handles updated."
                                         );
                                     }
                                     Err(e) => {
+                                        self.dht_bootstrap_warning = Some(format!(
+                                            "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
+                                            e
+                                        ));
+                                        self.refresh_system_warning();
                                         tracing::event!(
                                             Level::ERROR,
                                             "Failed to build new DHT server: {}",
@@ -2742,8 +2849,15 @@ impl App {
                                     new_dht_handle.clone(),
                                 ));
                             }
+                            self.dht_bootstrap_warning = None;
+                            self.refresh_system_warning();
                         }
                         Err(e) => {
+                            self.dht_bootstrap_warning = Some(format!(
+                                "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
+                                e
+                            ));
+                            self.refresh_system_warning();
                             tracing_event!(
                                 Level::ERROR,
                                 "Failed to rebuild DHT on new port: {}",
@@ -2765,10 +2879,6 @@ impl App {
     }
 
     async fn download_rss_preview_item(&mut self, item: RssPreviewItem) {
-        if item.is_downloaded {
-            return;
-        }
-
         let Some(link) = item.link.clone() else {
             tracing_event!(
                 Level::INFO,
@@ -3112,6 +3222,18 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
     };
 
     (limits, system_warning)
+}
+
+fn compose_system_warning(
+    base_warning: Option<&str>,
+    dht_bootstrap_warning: Option<&str>,
+) -> Option<String> {
+    match (base_warning, dht_bootstrap_warning) {
+        (Some(base), Some(dht)) => Some(format!("{} | {}", base, dht)),
+        (Some(base), None) => Some(base.to_string()),
+        (None, Some(dht)) => Some(dht.to_string()),
+        (None, None) => None,
+    }
 }
 
 const MIN_STEP_RATE: f64 = 0.01;
@@ -3466,12 +3588,13 @@ fn prune_rss_feed_errors(
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_selected_indices_in_state, extract_magnet_display_name, parse_hybrid_hashes,
-        persisted_validation_status_from_piece_completion, prune_rss_feed_errors,
-        resolve_magnet_torrent_name, rss_settings_changed, sort_and_filter_torrent_list_state,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppMode, AppState,
-        FilePriority, PeerInfo, SelectedHeader, SortDirection, TorrentDisplayState, TorrentMetrics,
-        TorrentSortColumn, UiState,
+        clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
+        parse_hybrid_hashes, persisted_validation_status_from_piece_completion,
+        prune_rss_feed_errors, resolve_magnet_torrent_name, rss_settings_changed,
+        sort_and_filter_torrent_list_state, torrent_completion_percent,
+        torrent_is_effectively_incomplete, App, AppMode, AppState, FilePriority, PeerInfo,
+        SelectedHeader, SortDirection, TorrentDisplayState, TorrentMetrics, TorrentSortColumn,
+        UiState,
     };
     use std::collections::HashMap;
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
@@ -3727,5 +3850,24 @@ mod tests {
         let changed = prune_rss_feed_errors(&mut feed_errors, &settings);
         assert!(!changed);
         assert_eq!(feed_errors.len(), 1);
+    }
+
+    #[test]
+    fn compose_system_warning_merges_base_and_dht_messages() {
+        let composed = compose_system_warning(Some("base warning"), Some("dht warning"));
+        assert_eq!(composed, Some("base warning | dht warning".to_string()));
+    }
+
+    #[test]
+    fn compose_system_warning_handles_single_or_no_messages() {
+        assert_eq!(
+            compose_system_warning(Some("base warning"), None),
+            Some("base warning".to_string())
+        );
+        assert_eq!(
+            compose_system_warning(None, Some("dht warning")),
+            Some("dht warning".to_string())
+        );
+        assert_eq!(compose_system_warning(None, None), None);
     }
 }

@@ -2131,10 +2131,27 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface1))
         }
     };
+    let use_compact_legend = should_use_compact_peer_activity_legend(
+        area.width.saturating_sub(2) as usize,
+        connected_count,
+        discovered_count,
+        disconnected_count,
+    );
+    let connected_label = if use_compact_legend { "C" } else { "Connected" };
+    let discovered_label = if use_compact_legend {
+        "D"
+    } else {
+        "Discovered"
+    };
+    let disconnected_label = if use_compact_legend {
+        "X"
+    } else {
+        "Disconnected"
+    };
 
     let legend_line = Line::from(vec![
         Span::styled(
-            "Connected:",
+            format!("{}:", connected_label),
             legend_style_fn(connected_count, color_connected),
         ),
         Span::styled(
@@ -2143,7 +2160,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         ),
         Span::raw(" "),
         Span::styled(
-            "Discovered:",
+            format!("{}:", discovered_label),
             legend_style_fn(discovered_count, color_discovered),
         ),
         Span::styled(
@@ -2152,7 +2169,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         ),
         Span::raw(" "),
         Span::styled(
-            "Disconnected:",
+            format!("{}:", disconnected_label),
             legend_style_fn(disconnected_count, color_disconnected),
         ),
         Span::styled(
@@ -2314,6 +2331,19 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     f.render_widget(chart, area);
 }
 
+fn should_use_compact_peer_activity_legend(
+    available_width: usize,
+    connected: u64,
+    discovered: u64,
+    disconnected: u64,
+) -> bool {
+    let full = format!(
+        "Connected: {}  Discovered: {}  Disconnected: {}",
+        connected, discovered, disconnected
+    );
+    full.len() > available_width
+}
+
 pub fn draw_block_stream_and_disk_orb(
     f: &mut Frame,
     app_state: &AppState,
@@ -2348,10 +2378,11 @@ fn draw_vertical_block_stream_panel(
     if area.width < 2 || area.height < 2 {
         return;
     }
+    let title_color = block_stream_title_color(app_state, ctx);
     let block = Block::default()
         .title(Span::styled(
             "Blocks",
-            ctx.apply(Style::default().fg(ctx.theme.scale.stream.inflow)),
+            ctx.apply(Style::default().fg(title_color)),
         ))
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
@@ -2360,34 +2391,99 @@ fn draw_vertical_block_stream_panel(
     draw_vertical_block_stream_content(f, app_state, inner, ctx);
 }
 
+fn block_stream_title_color(app_state: &AppState, ctx: &ThemeContext) -> Color {
+    let torrent = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    let Some(torrent) = torrent else {
+        return ctx.theme.semantic.border;
+    };
+
+    let dl_tick = torrent.latest_state.blocks_in_this_tick;
+    let ul_tick = torrent.latest_state.blocks_out_this_tick;
+    if dl_tick > 0 || ul_tick > 0 {
+        return if dl_tick >= ul_tick {
+            ctx.theme.scale.stream.inflow
+        } else {
+            ctx.theme.scale.stream.outflow
+        };
+    }
+
+    // Prevent title flicker by falling back to recent stream direction.
+    let in_history = &torrent.latest_state.blocks_in_history;
+    let out_history = &torrent.latest_state.blocks_out_history;
+    let history_len = in_history.len().min(out_history.len());
+    for i in (0..history_len).rev() {
+        let dl = in_history[i];
+        let ul = out_history[i];
+        if dl == 0 && ul == 0 {
+            continue;
+        }
+        return if dl >= ul {
+            ctx.theme.scale.stream.inflow
+        } else {
+            ctx.theme.scale.stream.outflow
+        };
+    }
+
+    ctx.theme.semantic.border
+}
+
 fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     if area.width < 2 || area.height < 2 {
         return;
     }
-    let disk_theme_color = ctx.ui_disk_blob();
-    let disk_state_word = match app_state.disk_health_state_level {
-        0 => "Stable",
-        1 => "Busy",
-        2 => "Strain",
-        _ => "Chaos",
-    };
+    let disk_state_word = disk_health_state_word(app_state.disk_health_state_level);
+    let border_color = disk_health_border_color(ctx, app_state.disk_health_state_level);
+    let title_color = disk_health_title_color(ctx, app_state.disk_health_state_level);
     let block = Block::default()
         .title_top(Span::styled(
             "Disk",
-            ctx.apply(Style::default().fg(disk_theme_color).bold()),
+            ctx.apply(Style::default().fg(title_color).bold()),
         ))
         .title_top(
             Line::from(Span::styled(
                 disk_state_word,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ctx.apply(Style::default().fg(title_color).bold()),
             ))
             .alignment(Alignment::Right),
         )
         .borders(Borders::ALL)
-        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
+        .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     draw_disk_health_orb(f, app_state, inner, ctx);
+}
+
+fn disk_health_state_word(state_level: u8) -> &'static str {
+    match state_level {
+        0 => "Stable",
+        1 => "Busy",
+        2 => "Strain",
+        _ => "Chaos",
+    }
+}
+
+fn disk_health_status_color(ctx: &ThemeContext, state_level: u8) -> Color {
+    match state_level {
+        0 => ctx.theme.semantic.subtext0,
+        1 => ctx.state_info(),
+        2 => ctx.state_warning(),
+        _ => ctx.state_error(),
+    }
+}
+
+fn disk_health_title_color(ctx: &ThemeContext, state_level: u8) -> Color {
+    disk_health_status_color(ctx, state_level)
+}
+
+fn disk_health_border_color(ctx: &ThemeContext, state_level: u8) -> Color {
+    match state_level {
+        0 => ctx.theme.semantic.border,
+        _ => disk_health_status_color(ctx, state_level),
+    }
 }
 
 fn compute_throughput_gap(app_state: &AppState) -> f64 {
@@ -2409,13 +2505,13 @@ fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         .disk_health_ema
         .max(app_state.disk_health_peak_hold)
         .clamp(0.0, 1.0);
+    let deform_profile = disk_health_deform_profile(app_state.disk_health_state_level);
     let gap = compute_throughput_gap(app_state);
     let phase = app_state.disk_health_phase;
 
-    let orb_color = ctx.ui_disk_blob();
-    let orb_style = if health > 0.70 {
-        ctx.apply(Style::default().fg(orb_color).bold())
-    } else if health > 0.35 {
+    let orb_color = disk_health_status_color(ctx, app_state.disk_health_state_level);
+    let has_iops_activity = app_state.read_iops > 0 || app_state.write_iops > 0;
+    let orb_style = if has_iops_activity {
         ctx.apply(Style::default().fg(orb_color))
     } else {
         ctx.apply(Style::default().fg(orb_color).dim())
@@ -2452,19 +2548,29 @@ fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
                     let nx = ((px / cells_w as f64) - 0.5) * 2.0;
                     let ny = ((py / cells_h as f64) - 0.5) * 2.0;
 
-                    let squeeze = if nx > 0.0 { 1.0 - (0.35 * gap) } else { 1.0 };
-                    let x = nx / squeeze.max(0.35);
+                    // Keep gap-driven deformation centered by applying horizontal squeeze symmetrically.
+                    let squeeze = (1.0 - (0.22 * gap)).max(0.35);
+                    let x = nx / squeeze;
                     // Terminal cells are usually taller than they are wide; compensate to keep a round shape.
                     let y = ny * (cells_w as f64 / cells_h as f64).clamp(0.6, 1.8) * 2.0;
                     let theta = y.atan2(x);
                     let dist = (x * x + y * y).sqrt();
 
-                    let deform = (0.04 + 0.18 * health) * f64::sin(2.0 * theta + phase)
-                        + (0.02 + 0.10 * health) * f64::sin(3.0 * theta - 0.7 * phase);
+                    let deform = (deform_profile.low_freq_base
+                        + deform_profile.low_freq_health_scale * health)
+                        * f64::sin(deform_profile.low_freq_wave * theta + phase)
+                        + (deform_profile.high_freq_base
+                            + deform_profile.high_freq_health_scale * health)
+                            * f64::sin(
+                                deform_profile.high_freq_wave * theta
+                                    - deform_profile.high_freq_phase_scale * phase,
+                            );
                     let edge = 0.96 + deform;
 
                     // Render as a solid blob (no hollow shell look).
-                    let fill_factor = (1.02 - 0.04 * health).clamp(0.94, 1.02);
+                    let fill_factor = (deform_profile.fill_base
+                        - deform_profile.fill_health_scale * health)
+                        .clamp(0.90, 1.03);
                     let in_blob = dist <= edge * fill_factor;
 
                     if in_blob {
@@ -2482,6 +2588,72 @@ fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     }
 
     f.render_widget(Paragraph::new(lines), orb_area);
+}
+
+#[derive(Clone, Copy)]
+struct DiskDeformProfile {
+    low_freq_base: f64,
+    low_freq_health_scale: f64,
+    low_freq_wave: f64,
+    high_freq_base: f64,
+    high_freq_health_scale: f64,
+    high_freq_wave: f64,
+    high_freq_phase_scale: f64,
+    fill_base: f64,
+    fill_health_scale: f64,
+}
+
+fn disk_health_deform_profile(state_level: u8) -> DiskDeformProfile {
+    match state_level {
+        // Stable: calm and rounded.
+        0 => DiskDeformProfile {
+            low_freq_base: 0.03,
+            low_freq_health_scale: 0.12,
+            low_freq_wave: 2.0,
+            high_freq_base: 0.015,
+            high_freq_health_scale: 0.05,
+            high_freq_wave: 3.0,
+            high_freq_phase_scale: 0.6,
+            fill_base: 1.02,
+            fill_health_scale: 0.03,
+        },
+        // Busy: moderate wobble, still relatively smooth.
+        1 => DiskDeformProfile {
+            low_freq_base: 0.04,
+            low_freq_health_scale: 0.16,
+            low_freq_wave: 2.0,
+            high_freq_base: 0.02,
+            high_freq_health_scale: 0.09,
+            high_freq_wave: 3.2,
+            high_freq_phase_scale: 0.75,
+            fill_base: 1.01,
+            fill_health_scale: 0.04,
+        },
+        // Strain: sharper and more turbulent silhouette.
+        2 => DiskDeformProfile {
+            low_freq_base: 0.06,
+            low_freq_health_scale: 0.23,
+            low_freq_wave: 2.35,
+            high_freq_base: 0.035,
+            high_freq_health_scale: 0.125,
+            high_freq_wave: 4.1,
+            high_freq_phase_scale: 0.98,
+            fill_base: 0.995,
+            fill_health_scale: 0.05,
+        },
+        // Chaos: most unstable / jagged.
+        _ => DiskDeformProfile {
+            low_freq_base: 0.09,
+            low_freq_health_scale: 0.34,
+            low_freq_wave: 3.0,
+            high_freq_base: 0.06,
+            high_freq_health_scale: 0.21,
+            high_freq_wave: 5.8,
+            high_freq_phase_scale: 1.30,
+            fill_base: 0.965,
+            fill_health_scale: 0.06,
+        },
+    }
 }
 
 fn draw_vertical_block_stream_content(
@@ -2519,9 +2691,12 @@ fn draw_vertical_block_stream_content(
 
     let in_history = &torrent.latest_state.blocks_in_history;
     let out_history = &torrent.latest_state.blocks_out_history;
+    let allow_download_inflow = should_render_download_inflow(&torrent.latest_state);
 
     let in_slice = &in_history[in_history.len().saturating_sub(history_len)..];
     let out_slice = &out_history[out_history.len().saturating_sub(history_len)..];
+    let has_activity = in_slice.iter().any(|&v| v > 0) || out_slice.iter().any(|&v| v > 0);
+    let idle_slow_probability = if has_activity { 0.0 } else { 0.20 };
 
     let slice_len = in_slice.len();
     let mut lines: Vec<Line> = Vec::with_capacity(history_len);
@@ -2533,7 +2708,7 @@ fn draw_vertical_block_stream_content(
     for i in 0..history_len {
         let mut spans = Vec::new();
         let dl_slice_index = slice_len.saturating_sub(1).saturating_sub(i);
-        let raw_blocks_in = if i < slice_len {
+        let raw_blocks_in = if allow_download_inflow && i < slice_len {
             *in_slice.get(dl_slice_index).unwrap_or(&0)
         } else {
             0
@@ -2640,6 +2815,24 @@ fn draw_vertical_block_stream_content(
             let total_scaled_blocks_f64 = (larger_stream_count + smaller_stream_count) as f64;
             let ratio_smaller = smaller_stream_count as f64 / total_scaled_blocks_f64;
             let smaller_first: bool = order_rng.random_bool(1.0 - ratio_smaller);
+            let smaller_stay_probability = (idle_slow_probability * 3.0_f64).clamp(0.0, 1.0);
+            let larger_stay_probability = (idle_slow_probability * 0.35_f64).clamp(0.0, 1.0);
+            let mut slow_rng = StdRng::seed_from_u64(
+                frame_seed
+                    ^ (dl_slice_index as u64).rotate_left(7)
+                    ^ (ul_slice_index as u64).rotate_right(11)
+                    ^ 0xAC71_4D2F,
+            );
+            let smaller_seed = if slow_rng.random_bool(smaller_stay_probability) {
+                smaller_seed_salt
+            } else {
+                frame_seed ^ smaller_seed_salt
+            };
+            let larger_seed = if slow_rng.random_bool(larger_stay_probability) {
+                larger_seed_salt
+            } else {
+                frame_seed ^ larger_seed_salt
+            };
 
             spans.push(Span::raw(" ".repeat(padding)));
             if smaller_first {
@@ -2648,14 +2841,14 @@ fn draw_vertical_block_stream_content(
                     smaller_symbol,
                     smaller_stream_count,
                     smaller_color,
-                    frame_seed ^ smaller_seed_salt,
+                    smaller_seed,
                 );
                 render_sparkles(
                     &mut spans,
                     larger_symbol,
                     larger_stream_count,
                     larger_color,
-                    frame_seed ^ larger_seed_salt,
+                    larger_seed,
                 );
             } else {
                 render_sparkles(
@@ -2663,14 +2856,14 @@ fn draw_vertical_block_stream_content(
                     larger_symbol,
                     larger_stream_count,
                     larger_color,
-                    frame_seed ^ larger_seed_salt,
+                    larger_seed,
                 );
                 render_sparkles(
                     &mut spans,
                     smaller_symbol,
                     smaller_stream_count,
                     smaller_color,
-                    frame_seed ^ smaller_seed_salt,
+                    smaller_seed,
                 );
             }
             spans.push(Span::raw(" ".repeat(trailing_padding)));
@@ -2679,6 +2872,11 @@ fn draw_vertical_block_stream_content(
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn should_render_download_inflow(metrics: &crate::app::TorrentMetrics) -> bool {
+    let total = metrics.number_of_pieces_total;
+    total == 0 || metrics.number_of_pieces_completed < total
 }
 
 fn render_sparkles<'a>(
@@ -3684,6 +3882,7 @@ mod tests {
         TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
+    use crate::theme::{Theme, ThemeContext, ThemeName};
 
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
         let mut metrics = TorrentMetrics::default();
@@ -4038,6 +4237,159 @@ mod tests {
         let data = [0_u64, 10, 0];
         let smoothed = peer_stream_smoothed_activity(&data, 1);
         assert!((smoothed - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn block_stream_title_color_is_neutral_without_activity() {
+        let app_state = create_test_app_state();
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        assert_eq!(
+            block_stream_title_color(&app_state, &ctx),
+            ctx.theme.semantic.border
+        );
+    }
+
+    #[test]
+    fn block_stream_title_color_prefers_download_when_dominant() {
+        let mut app_state = create_test_app_state();
+        let selected = app_state.torrent_list_order[app_state.ui.selected_torrent_index].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.latest_state.blocks_in_this_tick = 7;
+            torrent.latest_state.blocks_out_this_tick = 2;
+        }
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        assert_eq!(
+            block_stream_title_color(&app_state, &ctx),
+            ctx.theme.scale.stream.inflow
+        );
+    }
+
+    #[test]
+    fn block_stream_title_color_prefers_upload_when_dominant() {
+        let mut app_state = create_test_app_state();
+        let selected = app_state.torrent_list_order[app_state.ui.selected_torrent_index].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.latest_state.blocks_in_this_tick = 1;
+            torrent.latest_state.blocks_out_this_tick = 9;
+        }
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        assert_eq!(
+            block_stream_title_color(&app_state, &ctx),
+            ctx.theme.scale.stream.outflow
+        );
+    }
+
+    #[test]
+    fn block_stream_title_color_uses_recent_download_history_when_tick_is_zero() {
+        let mut app_state = create_test_app_state();
+        let selected = app_state.torrent_list_order[app_state.ui.selected_torrent_index].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.latest_state.blocks_in_history.push(8);
+            torrent.latest_state.blocks_out_history.push(2);
+            torrent.latest_state.blocks_in_this_tick = 0;
+            torrent.latest_state.blocks_out_this_tick = 0;
+        }
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        assert_eq!(
+            block_stream_title_color(&app_state, &ctx),
+            ctx.theme.scale.stream.inflow
+        );
+    }
+
+    #[test]
+    fn block_stream_title_color_uses_recent_upload_history_when_tick_is_zero() {
+        let mut app_state = create_test_app_state();
+        let selected = app_state.torrent_list_order[app_state.ui.selected_torrent_index].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.latest_state.blocks_in_history.push(1);
+            torrent.latest_state.blocks_out_history.push(6);
+            torrent.latest_state.blocks_in_this_tick = 0;
+            torrent.latest_state.blocks_out_this_tick = 0;
+        }
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        assert_eq!(
+            block_stream_title_color(&app_state, &ctx),
+            ctx.theme.scale.stream.outflow
+        );
+    }
+
+    #[test]
+    fn block_stream_download_inflow_hidden_when_download_is_complete() {
+        let metrics = TorrentMetrics {
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            ..Default::default()
+        };
+        assert!(!should_render_download_inflow(&metrics));
+    }
+
+    #[test]
+    fn block_stream_download_inflow_visible_when_download_is_incomplete() {
+        let metrics = TorrentMetrics {
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 9,
+            ..Default::default()
+        };
+        assert!(should_render_download_inflow(&metrics));
+    }
+
+    #[test]
+    fn disk_health_status_color_uses_state_slots_across_themes() {
+        for theme_name in ThemeName::sorted_for_ui() {
+            let ctx = ThemeContext::new(Theme::builtin(theme_name), 0.0);
+            assert_eq!(
+                disk_health_status_color(&ctx, 0),
+                ctx.theme.semantic.subtext0
+            );
+            assert_eq!(disk_health_status_color(&ctx, 1), ctx.state_info());
+            assert_eq!(disk_health_status_color(&ctx, 2), ctx.state_warning());
+            assert_eq!(disk_health_status_color(&ctx, 3), ctx.state_error());
+            assert_eq!(disk_health_status_color(&ctx, 255), ctx.state_error());
+        }
+    }
+
+    #[test]
+    fn disk_health_title_color_keeps_stable_readable_and_maps_alerts() {
+        for theme_name in ThemeName::sorted_for_ui() {
+            let ctx = ThemeContext::new(Theme::builtin(theme_name), 0.0);
+            assert_eq!(
+                disk_health_title_color(&ctx, 0),
+                ctx.theme.semantic.subtext0
+            );
+            assert_eq!(disk_health_title_color(&ctx, 1), ctx.state_info());
+            assert_eq!(disk_health_title_color(&ctx, 2), ctx.state_warning());
+            assert_eq!(disk_health_title_color(&ctx, 3), ctx.state_error());
+        }
+    }
+
+    #[test]
+    fn disk_health_border_color_uses_normal_border_for_stable() {
+        for theme_name in ThemeName::sorted_for_ui() {
+            let ctx = ThemeContext::new(Theme::builtin(theme_name), 0.0);
+            assert_eq!(disk_health_border_color(&ctx, 0), ctx.theme.semantic.border);
+            assert_eq!(disk_health_border_color(&ctx, 1), ctx.state_info());
+            assert_eq!(disk_health_border_color(&ctx, 2), ctx.state_warning());
+            assert_eq!(disk_health_border_color(&ctx, 3), ctx.state_error());
+        }
+    }
+
+    #[test]
+    fn disk_health_state_word_maps_levels() {
+        assert_eq!(disk_health_state_word(0), "Stable");
+        assert_eq!(disk_health_state_word(1), "Busy");
+        assert_eq!(disk_health_state_word(2), "Strain");
+        assert_eq!(disk_health_state_word(3), "Chaos");
+        assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn peer_activity_legend_compacts_when_width_is_tight() {
+        assert!(should_use_compact_peer_activity_legend(32, 5, 182, 104));
+    }
+
+    #[test]
+    fn peer_activity_legend_stays_verbose_when_width_allows() {
+        assert!(!should_use_compact_peer_activity_legend(90, 5, 182, 104));
     }
 
     #[tokio::test]
