@@ -16,8 +16,8 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 | **Experience** | **Networking** | **Engineering** |
 | :--- | :--- | :--- |
-| 🎨 **60 FPS TUI**<br>Fluid, animated interface with heatmaps. | 🐳 **Docker + VPN**<br>Gluetun integration out of the box. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
-| 📊 **Deep Analytics**<br>Real-time bandwidth graphs & peer metrics. | ⚓ **Auto-Bind**<br>Dynamic port reloading without restarts. | 🧠 **Self-Tuning**<br>Adaptive limits control for max speed and I/O Stability. |
+| 🎨 **60 FPS TUI**<br>Fluid, animated interface with heatmaps. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
+| 📊 **Deep Analytics**<br>Real-time bandwidth graphs & peer metrics. | 📰 **RSS Feeds**<br>In-app feed tracking, filtering, and ingest. | 🧠 **Self-Tuning**<br>Adaptive limits control for max speed and I/O Stability. |
 | 🧲 **Magnet Links**<br>Native OS-level handler support. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 🎨 **Themes**<br>Large built-in theme library with live switching. |
 
 ### Terminal Torrenting With Superseedr
