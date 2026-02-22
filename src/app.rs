@@ -85,6 +85,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use tokio::time;
+use tokio::time::MissedTickBehavior;
 
 use directories::UserDirs;
 
@@ -1006,6 +1007,7 @@ impl App {
         let mut tuning_interval = time::interval(Duration::from_secs(90));
         let mut version_interval = time::interval(Duration::from_secs(24 * 60 * 60));
         let mut dht_bootstrap_retry_interval = time::interval(Duration::from_secs(60));
+        dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let output_status_interval = self.client_configs.output_status_interval;
         let mut status_dump_timer = tokio::time::interval(std::time::Duration::from_secs(
@@ -1098,8 +1100,10 @@ impl App {
                         }
                     });
                 }
-                _ = dht_bootstrap_retry_interval.tick(), if self.should_retry_dht_bootstrap() => {
-                    self.maybe_retry_dht_bootstrap();
+                _ = dht_bootstrap_retry_interval.tick() => {
+                    if self.should_retry_dht_bootstrap() {
+                        self.maybe_retry_dht_bootstrap();
+                    }
                 }
             }
         }
