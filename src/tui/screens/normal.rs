@@ -13,6 +13,7 @@ use crate::app::{
 };
 use crate::config::Settings;
 use crate::config::SortDirection;
+use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::formatters::{
@@ -59,6 +60,36 @@ use tracing::{event as tracing_event, Level};
 static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
 const MINUTES_HISTORY_MAX: usize = 48 * 60;
+
+fn build_time_aligned_window(
+    points: &[NetworkHistoryPoint],
+    step_secs: u64,
+    window_points: usize,
+    now_unix: u64,
+) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    if window_points == 0 || step_secs == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let mut dl = vec![0_u64; window_points];
+    let mut ul = vec![0_u64; window_points];
+    let mut backoff = vec![0_u64; window_points];
+    let start_ts = now_unix.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
+
+    for point in points {
+        if point.ts_unix < start_ts || point.ts_unix > now_unix {
+            continue;
+        }
+        let idx = ((point.ts_unix - start_ts) / step_secs) as usize;
+        if idx < window_points {
+            dl[idx] = point.download_bps;
+            ul[idx] = point.upload_bps;
+            backoff[idx] = backoff[idx].max(point.backoff_ms_max);
+        }
+    }
+
+    (dl, ul, backoff)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
@@ -1452,105 +1483,41 @@ pub fn draw_network_chart(
         }
         smoothed_data
     };
-    let right_aligned_window = |data: &[u64], target_points: usize| -> Vec<u64> {
-        if target_points == 0 {
-            return Vec::new();
-        }
-        if data.len() >= target_points {
-            let start = data.len() - target_points;
-            return data[start..].to_vec();
-        }
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
-        let mut out = vec![0_u64; target_points - data.len()];
-        out.extend_from_slice(data);
-        out
+    let (points_to_show, step_secs, source_points) = match app_state.graph_mode {
+        GraphDisplayMode::OneMinute
+        | GraphDisplayMode::FiveMinutes
+        | GraphDisplayMode::TenMinutes
+        | GraphDisplayMode::ThirtyMinutes
+        | GraphDisplayMode::OneHour => (
+            app_state.graph_mode.as_seconds().min(SECONDS_HISTORY_MAX).max(1),
+            1_u64,
+            &app_state.network_history_state.tiers.second_1s,
+        ),
+        GraphDisplayMode::ThreeHours
+        | GraphDisplayMode::TwelveHours
+        | GraphDisplayMode::TwentyFourHours => (
+            (app_state.graph_mode.as_seconds() / 60)
+                .min(MINUTES_HISTORY_MAX)
+                .max(1),
+            60_u64,
+            &app_state.network_history_state.tiers.minute_1m,
+        ),
+        GraphDisplayMode::SevenDays => (7 * 24 * 4, 15 * 60_u64, &app_state.network_history_state.tiers.minute_15m),
+        GraphDisplayMode::ThirtyDays => (
+            30 * 24 * 4,
+            15 * 60_u64,
+            &app_state.network_history_state.tiers.minute_15m,
+        ),
+        GraphDisplayMode::OneYear => (365 * 24, 60 * 60_u64, &app_state.network_history_state.tiers.hour_1h),
     };
 
-    let (dl_history_source, ul_history_source, backoff_history_source_ms, time_window_points) =
-        match app_state.graph_mode {
-            GraphDisplayMode::ThreeHours
-            | GraphDisplayMode::TwelveHours
-            | GraphDisplayMode::TwentyFourHours => (
-                app_state.minute_avg_dl_history.clone(),
-                app_state.minute_avg_ul_history.clone(),
-                app_state
-                    .minute_disk_backoff_history_ms
-                    .iter()
-                    .copied()
-                    .collect::<Vec<u64>>(),
-                MINUTES_HISTORY_MAX,
-            ),
-            GraphDisplayMode::SevenDays | GraphDisplayMode::ThirtyDays => (
-                app_state
-                    .network_history_state
-                    .tiers
-                    .minute_15m
-                    .iter()
-                    .map(|p| p.download_bps)
-                    .collect::<Vec<u64>>(),
-                app_state
-                    .network_history_state
-                    .tiers
-                    .minute_15m
-                    .iter()
-                    .map(|p| p.upload_bps)
-                    .collect::<Vec<u64>>(),
-                app_state
-                    .network_history_state
-                    .tiers
-                    .minute_15m
-                    .iter()
-                    .map(|p| p.backoff_ms_max)
-                    .collect::<Vec<u64>>(),
-                match app_state.graph_mode {
-                    GraphDisplayMode::SevenDays => 7 * 24 * 4,
-                    GraphDisplayMode::ThirtyDays => 30 * 24 * 4,
-                    _ => 0,
-                },
-            ),
-            GraphDisplayMode::OneYear => (
-                app_state
-                    .network_history_state
-                    .tiers
-                    .hour_1h
-                    .iter()
-                    .map(|p| p.download_bps)
-                    .collect::<Vec<u64>>(),
-                app_state
-                    .network_history_state
-                    .tiers
-                    .hour_1h
-                    .iter()
-                    .map(|p| p.upload_bps)
-                    .collect::<Vec<u64>>(),
-                app_state
-                    .network_history_state
-                    .tiers
-                    .hour_1h
-                    .iter()
-                    .map(|p| p.backoff_ms_max)
-                    .collect::<Vec<u64>>(),
-                365 * 24,
-            ),
-            _ => {
-                let points = app_state.graph_mode.as_seconds().min(SECONDS_HISTORY_MAX);
-                (
-                    app_state.avg_download_history.clone(),
-                    app_state.avg_upload_history.clone(),
-                    app_state
-                        .disk_backoff_history_ms
-                        .iter()
-                        .copied()
-                        .collect::<Vec<u64>>(),
-                    points,
-                )
-            }
-        };
-
-    let points_to_show = time_window_points.max(1);
-    let dl_history_slice = right_aligned_window(&dl_history_source, points_to_show);
-    let ul_history_slice = right_aligned_window(&ul_history_source, points_to_show);
-    let backoff_history_relevant_ms = right_aligned_window(&backoff_history_source_ms, points_to_show);
+    let (dl_history_slice, ul_history_slice, backoff_history_relevant_ms) =
+        build_time_aligned_window(source_points, step_secs, points_to_show, now_unix);
 
     let stable_max_speed = dl_history_slice
         .iter()
