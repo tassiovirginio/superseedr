@@ -1452,51 +1452,105 @@ pub fn draw_network_chart(
         }
         smoothed_data
     };
-
-    let (
-        dl_history_source,
-        ul_history_source,
-        backoff_history_source_ms,
-        time_window_points,
-        _time_unit_secs,
-    ) = match app_state.graph_mode {
-        GraphDisplayMode::ThreeHours
-        | GraphDisplayMode::TwelveHours
-        | GraphDisplayMode::TwentyFourHours => (
-            &app_state.minute_avg_dl_history,
-            &app_state.minute_avg_ul_history,
-            &app_state.minute_disk_backoff_history_ms,
-            MINUTES_HISTORY_MAX,
-            60,
-        ),
-        _ => {
-            let points = app_state.graph_mode.as_seconds().min(SECONDS_HISTORY_MAX);
-            (
-                &app_state.avg_download_history,
-                &app_state.avg_upload_history,
-                &app_state.disk_backoff_history_ms,
-                points,
-                1,
-            )
+    let right_aligned_window = |data: &[u64], target_points: usize| -> Vec<u64> {
+        if target_points == 0 {
+            return Vec::new();
         }
+        if data.len() >= target_points {
+            let start = data.len() - target_points;
+            return data[start..].to_vec();
+        }
+
+        let mut out = vec![0_u64; target_points - data.len()];
+        out.extend_from_slice(data);
+        out
     };
 
-    let dl_len = dl_history_source.len();
-    let ul_len = ul_history_source.len();
-    let backoff_len = backoff_history_source_ms.len();
+    let (dl_history_source, ul_history_source, backoff_history_source_ms, time_window_points) =
+        match app_state.graph_mode {
+            GraphDisplayMode::ThreeHours
+            | GraphDisplayMode::TwelveHours
+            | GraphDisplayMode::TwentyFourHours => (
+                app_state.minute_avg_dl_history.clone(),
+                app_state.minute_avg_ul_history.clone(),
+                app_state
+                    .minute_disk_backoff_history_ms
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u64>>(),
+                MINUTES_HISTORY_MAX,
+            ),
+            GraphDisplayMode::SevenDays | GraphDisplayMode::ThirtyDays => (
+                app_state
+                    .network_history_state
+                    .tiers
+                    .minute_15m
+                    .iter()
+                    .map(|p| p.download_bps)
+                    .collect::<Vec<u64>>(),
+                app_state
+                    .network_history_state
+                    .tiers
+                    .minute_15m
+                    .iter()
+                    .map(|p| p.upload_bps)
+                    .collect::<Vec<u64>>(),
+                app_state
+                    .network_history_state
+                    .tiers
+                    .minute_15m
+                    .iter()
+                    .map(|p| p.backoff_ms_max)
+                    .collect::<Vec<u64>>(),
+                match app_state.graph_mode {
+                    GraphDisplayMode::SevenDays => 7 * 24 * 4,
+                    GraphDisplayMode::ThirtyDays => 30 * 24 * 4,
+                    _ => 0,
+                },
+            ),
+            GraphDisplayMode::OneYear => (
+                app_state
+                    .network_history_state
+                    .tiers
+                    .hour_1h
+                    .iter()
+                    .map(|p| p.download_bps)
+                    .collect::<Vec<u64>>(),
+                app_state
+                    .network_history_state
+                    .tiers
+                    .hour_1h
+                    .iter()
+                    .map(|p| p.upload_bps)
+                    .collect::<Vec<u64>>(),
+                app_state
+                    .network_history_state
+                    .tiers
+                    .hour_1h
+                    .iter()
+                    .map(|p| p.backoff_ms_max)
+                    .collect::<Vec<u64>>(),
+                365 * 24,
+            ),
+            _ => {
+                let points = app_state.graph_mode.as_seconds().min(SECONDS_HISTORY_MAX);
+                (
+                    app_state.avg_download_history.clone(),
+                    app_state.avg_upload_history.clone(),
+                    app_state
+                        .disk_backoff_history_ms
+                        .iter()
+                        .copied()
+                        .collect::<Vec<u64>>(),
+                    points,
+                )
+            }
+        };
 
-    let available_points = dl_len.min(ul_len).min(backoff_len);
-    let points_to_show = time_window_points.min(available_points);
-
-    let dl_history_slice = &dl_history_source[dl_len.saturating_sub(points_to_show)..];
-    let ul_history_slice = &ul_history_source[ul_len.saturating_sub(points_to_show)..];
-
-    let skip_count = backoff_len.saturating_sub(points_to_show);
-    let backoff_history_relevant_ms: Vec<u64> = backoff_history_source_ms
-        .iter()
-        .skip(skip_count)
-        .copied()
-        .collect();
+    let points_to_show = time_window_points.max(1);
+    let dl_history_slice = right_aligned_window(&dl_history_source, points_to_show);
+    let ul_history_slice = right_aligned_window(&ul_history_source, points_to_show);
+    let backoff_history_relevant_ms = right_aligned_window(&backoff_history_source_ms, points_to_show);
 
     let stable_max_speed = dl_history_slice
         .iter()
@@ -1508,8 +1562,8 @@ pub fn draw_network_chart(
 
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
-    let smoothed_dl_data = smooth_data(dl_history_slice, alpha);
-    let smoothed_ul_data = smooth_data(ul_history_slice, alpha);
+    let smoothed_dl_data = smooth_data(&dl_history_slice, alpha);
+    let smoothed_ul_data = smooth_data(&ul_history_slice, alpha);
 
     let dl_data: Vec<(f64, f64)> = smoothed_dl_data
         .iter()
@@ -1596,6 +1650,9 @@ pub fn draw_network_chart(
         GraphDisplayMode::ThreeHours,
         GraphDisplayMode::TwelveHours,
         GraphDisplayMode::TwentyFourHours,
+        GraphDisplayMode::SevenDays,
+        GraphDisplayMode::ThirtyDays,
+        GraphDisplayMode::OneYear,
     ];
     let mut title_spans: Vec<Span> = vec![Span::styled(
         "Network Activity ",

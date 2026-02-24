@@ -304,6 +304,9 @@ pub enum GraphDisplayMode {
     ThreeHours,
     TwelveHours,
     TwentyFourHours,
+    SevenDays,
+    ThirtyDays,
+    OneYear,
 }
 
 impl GraphDisplayMode {
@@ -317,6 +320,9 @@ impl GraphDisplayMode {
             Self::ThreeHours => 3 * 3600,
             Self::TwelveHours => 12 * 3600,
             Self::TwentyFourHours => 86_400,
+            Self::SevenDays => 7 * 86_400,
+            Self::ThirtyDays => 30 * 86_400,
+            Self::OneYear => 365 * 86_400,
         }
     }
 
@@ -330,6 +336,9 @@ impl GraphDisplayMode {
             Self::ThreeHours => "3h",
             Self::TwelveHours => "12h",
             Self::TwentyFourHours => "24h",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+            Self::OneYear => "1y",
         }
     }
 
@@ -342,13 +351,16 @@ impl GraphDisplayMode {
             Self::OneHour => Self::ThreeHours,
             Self::ThreeHours => Self::TwelveHours,
             Self::TwelveHours => Self::TwentyFourHours,
-            Self::TwentyFourHours => Self::OneMinute,
+            Self::TwentyFourHours => Self::SevenDays,
+            Self::SevenDays => Self::ThirtyDays,
+            Self::ThirtyDays => Self::OneYear,
+            Self::OneYear => Self::OneMinute,
         }
     }
 
     pub fn prev(&self) -> Self {
         match self {
-            Self::OneMinute => Self::TwentyFourHours,
+            Self::OneMinute => Self::OneYear,
             Self::FiveMinutes => Self::OneMinute,
             Self::TenMinutes => Self::FiveMinutes,
             Self::ThirtyMinutes => Self::TenMinutes,
@@ -356,6 +368,9 @@ impl GraphDisplayMode {
             Self::ThreeHours => Self::OneHour,
             Self::TwelveHours => Self::ThreeHours,
             Self::TwentyFourHours => Self::TwelveHours,
+            Self::SevenDays => Self::TwentyFourHours,
+            Self::ThirtyDays => Self::SevenDays,
+            Self::OneYear => Self::ThirtyDays,
         }
     }
 }
@@ -1308,7 +1323,7 @@ impl App {
             return;
         }
 
-        let shutdown_timeout = time::sleep(Duration::from_secs(5));
+        let shutdown_timeout = time::sleep(Duration::from_secs(10));
         let mut draw_interval = time::interval(Duration::from_millis(100));
         tokio::pin!(shutdown_timeout);
 

@@ -275,13 +275,16 @@ pub fn format_limit_bps(bps: u64) -> String {
 pub fn format_graph_time_label(duration_secs: usize) -> String {
     const MINUTE: usize = 60;
     const HOUR: usize = 60 * MINUTE;
+    const DAY: usize = 24 * HOUR;
 
     if duration_secs < MINUTE {
         format!("-{}s", duration_secs)
     } else if duration_secs < HOUR {
         format!("-{}m", duration_secs / MINUTE)
-    } else {
+    } else if duration_secs < DAY {
         format!("-{}h", duration_secs / HOUR)
+    } else {
+        format!("-{}d", duration_secs / DAY)
     }
 }
 
@@ -313,6 +316,15 @@ pub fn generate_x_axis_labels(
             .collect(),
         GraphDisplayMode::TwentyFourHours => (0..=6)
             .map(|i| format_graph_time_label(86400 - i * 14400)) // Every 4 hours
+            .collect(),
+        GraphDisplayMode::SevenDays => (0..=7)
+            .map(|i| format_graph_time_label(7 * 86_400 - i * 86_400)) // Daily ticks
+            .collect(),
+        GraphDisplayMode::ThirtyDays => (0..=6)
+            .map(|i| format_graph_time_label(30 * 86_400 - i * 5 * 86_400)) // Every 5 days
+            .collect(),
+        GraphDisplayMode::OneYear => (0..=12)
+            .map(|i| format_graph_time_label(365 * 86_400 - i * 30 * 86_400)) // ~monthly
             .collect(),
     };
 
