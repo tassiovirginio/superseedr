@@ -419,6 +419,7 @@ pub enum ParticleProfile {
     Matrix,
     Diamond,
     BioluminescentReef,
+    BlackHole,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3099,7 +3100,14 @@ impl Theme {
                 wave_wavelength: 64.0,
                 wave_angle_degrees: -34.0,
                 wave_mode: WaveMode::Linear,
-                particle: ThemeParticleEffect::default(),
+                particle: ThemeParticleEffect {
+                    enabled: true,
+                    layer_mode: ParticleLayerMode::Foreground,
+                    profile: ParticleProfile::BlackHole,
+                    density: 0.05,
+                    speed: 1.0,
+                    intensity: 0.9,
+                },
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(234, 234, 234),
@@ -3933,6 +3941,7 @@ mod tests {
         let matrix = Theme::builtin(ThemeName::Matrix);
         let diamond = Theme::builtin(ThemeName::Diamond);
         let reef = Theme::builtin(ThemeName::BioluminescentReef);
+        let black_hole = Theme::builtin(ThemeName::BlackHole);
 
         assert!(sakura.effects.particle.enabled);
         assert_eq!(sakura.effects.particle.profile, ParticleProfile::Sakura);
@@ -3963,6 +3972,16 @@ mod tests {
         assert_eq!(
             reef.effects.particle.layer_mode,
             ParticleLayerMode::Background
+        );
+
+        assert!(black_hole.effects.particle.enabled);
+        assert_eq!(
+            black_hole.effects.particle.profile,
+            ParticleProfile::BlackHole
+        );
+        assert_eq!(
+            black_hole.effects.particle.layer_mode,
+            ParticleLayerMode::Foreground
         );
     }
 

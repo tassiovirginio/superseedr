@@ -47,6 +47,11 @@ fn render_particles(
     let phase = ctx.frame_time * particle.speed.max(0.1) as f64;
     let glow = (particle.intensity as f64).clamp(0.1, 1.0);
 
+    if matches!(particle.profile, ParticleProfile::BlackHole) {
+        render_black_hole_particles(f, phase, density, glow, is_foreground);
+        return;
+    }
+
     let buf = f.buffer_mut();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -72,6 +77,154 @@ fn render_particles(
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlackHoleBurst {
+    active: bool,
+    cx: f64,
+    cy: f64,
+    inner_radius: f64,
+    outer_radius: f64,
+    ring_radius: f64,
+    spin_speed: f64,
+    arm_count: f64,
+    color_seed: f64,
+}
+
+fn render_black_hole_particles(
+    f: &mut Frame,
+    phase: f64,
+    density: f64,
+    glow: f64,
+    is_foreground: bool,
+) {
+    if !is_foreground {
+        return;
+    }
+    let area = f.area();
+    let width = area.width as f64;
+    let height = area.height as f64;
+    if width <= 2.0 || height <= 2.0 {
+        return;
+    }
+
+    let burst = black_hole_burst_state(width, height, phase);
+    if !burst.active {
+        return;
+    }
+
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let local_x = x as f64 - area.left() as f64;
+            let local_y = y as f64 - area.top() as f64;
+            let dx = local_x - burst.cx;
+            let dy = local_y - burst.cy;
+            let radius = (dx * dx + dy * dy).sqrt();
+
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if radius <= burst.inner_radius {
+                    cell.set_symbol(" ");
+                    cell.bg = Color::Rgb(0, 0, 0);
+                    cell.fg = Color::Rgb(0, 0, 0);
+                    continue;
+                }
+
+                if radius <= burst.ring_radius {
+                    let ring_mix = (1.0
+                        - ((radius - burst.inner_radius)
+                            / (burst.ring_radius - burst.inner_radius + 0.0001)))
+                        .clamp(0.0, 1.0);
+                    let hue = (burst.color_seed + phase * 0.06 + ring_mix * 0.18).fract();
+                    let ring_color = glow_color(
+                        color_from_hsv(hue, 0.85, 0.92),
+                        Color::White,
+                        (0.24 * glow * ring_mix).clamp(0.0, 0.40),
+                    );
+                    cell.set_symbol("◌");
+                    cell.fg = ring_color;
+                    continue;
+                }
+
+                if radius > burst.outer_radius {
+                    continue;
+                }
+
+                let theta = dy.atan2(dx);
+                let normalized_r = (radius / burst.outer_radius).clamp(0.0, 1.0);
+                let inward = 1.0 - normalized_r;
+                let spiral = ((theta * burst.arm_count) + (radius * 0.34)
+                    - (phase * burst.spin_speed))
+                    .sin()
+                    .abs();
+                let trail = (spiral * 0.75) + (inward * 0.25);
+                let jitter = hash01(local_x, local_y, phase * 0.8, 911.0);
+                let threshold = (0.82 - density * 4.8 - inward * 0.25).clamp(0.25, 0.93);
+                if trail + jitter * 0.2 < threshold {
+                    continue;
+                }
+
+                let glyph = if inward > 0.8 && jitter > 0.7 {
+                    "✦"
+                } else if inward > 0.55 {
+                    "•"
+                } else if jitter > 0.66 {
+                    "·"
+                } else {
+                    "."
+                };
+
+                let hue = (burst.color_seed
+                    + hash01(local_x, local_y, phase, 919.0) * 0.35
+                    + phase * 0.035
+                    + (1.0 - normalized_r) * 0.18)
+                    .fract();
+                let sat = (0.72 + inward * 0.25).clamp(0.0, 1.0);
+                let val = (0.66 + inward * 0.30).clamp(0.0, 1.0);
+                let base = color_from_hsv(hue, sat, val);
+                let color = glow_color(base, Color::White, (0.10 + inward * 0.22) * glow);
+                cell.set_symbol(glyph);
+                cell.fg = color;
+            }
+        }
+    }
+}
+
+fn black_hole_burst_state(width: f64, height: f64, phase: f64) -> BlackHoleBurst {
+    const WINDOW_SECS: f64 = 10.0;
+    let slot = (phase / WINDOW_SECS).floor();
+    let t = phase - slot * WINDOW_SECS;
+    let active_len = 2.2 + hash01(slot, 0.0, 0.0, 801.0) * 3.1;
+    let latest_start = (WINDOW_SECS - active_len).max(0.4);
+    let start = hash01(slot, 0.0, 0.0, 809.0) * latest_start;
+    let active = t >= start && t <= start + active_len;
+
+    let min_dim = width.min(height).max(8.0);
+    let outer_radius =
+        (min_dim * (0.14 + hash01(slot, 0.0, 0.0, 817.0) * 0.20)).clamp(3.0, min_dim * 0.42);
+    let inner_radius = (outer_radius * (0.30 + hash01(slot, 0.0, 0.0, 821.0) * 0.22))
+        .clamp(1.8, outer_radius - 0.8);
+    let ring_radius = inner_radius + (0.9 + hash01(slot, 0.0, 0.0, 823.0) * 1.8);
+
+    let margin_x = outer_radius + 2.0;
+    let margin_y = outer_radius + 1.5;
+    let usable_w = (width - margin_x * 2.0).max(1.0);
+    let usable_h = (height - margin_y * 2.0).max(1.0);
+    let cx = margin_x + hash01(slot, 0.0, 0.0, 827.0) * usable_w;
+    let cy = margin_y + hash01(slot, 0.0, 0.0, 829.0) * usable_h;
+
+    BlackHoleBurst {
+        active,
+        cx,
+        cy,
+        inner_radius,
+        outer_radius,
+        ring_radius,
+        spin_speed: 2.2 + hash01(slot, 0.0, 0.0, 839.0) * 2.4,
+        arm_count: 2.0 + (hash01(slot, 0.0, 0.0, 853.0) * 3.0).floor(),
+        color_seed: hash01(slot, 0.0, 0.0, 857.0),
     }
 }
 
@@ -124,6 +277,7 @@ fn sample_particle(
             glow,
             underlying_fg,
         ),
+        ParticleProfile::BlackHole => None,
         ParticleProfile::None => None,
     }
 }
@@ -501,4 +655,22 @@ fn glow_color(base: Color, highlight: Color, amount: f64) -> Color {
         color_to_rgb(highlight),
         amount.clamp(0.0, 0.65),
     )
+}
+
+fn color_from_hsv(h: f64, s: f64, v: f64) -> Color {
+    let hue = (h.fract() * 6.0).clamp(0.0, 5.999_999);
+    let i = hue.floor() as i32;
+    let f = hue - i as f64;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    let (r, g, b) = match i {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    Color::Rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
