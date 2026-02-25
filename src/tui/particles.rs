@@ -111,6 +111,17 @@ fn sample_particle(
             glow,
             underlying_fg,
         ),
+        ParticleProfile::BioluminescentReef => sample_bioluminescent_reef(
+            ctx,
+            x,
+            y,
+            width,
+            height,
+            phase,
+            density,
+            glow,
+            underlying_fg,
+        ),
         ParticleProfile::None => None,
     }
 }
@@ -241,6 +252,68 @@ fn sample_matrix(
             base,
             ctx.theme.semantic.white,
             (glow * 0.18).clamp(0.0, 0.24),
+        ),
+    ))
+}
+
+fn sample_bioluminescent_reef(
+    ctx: &ThemeContext,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    phase: f64,
+    density: f64,
+    glow: f64,
+    underlying_fg: Color,
+) -> Option<(&'static str, Color)> {
+    let _ = underlying_fg;
+    let w = width.max(2.0);
+    let h = height.max(2.0);
+    let nx = x / (w - 1.0);
+    let ny = y / (h - 1.0);
+
+    // Slow multi-layer drift suggests plankton depth and current.
+    let drift_x = x - (phase * 0.9) + ((ny * 9.0) + phase * 0.25).sin() * 1.4;
+    let drift_y = y + (phase * 0.45) + ((nx * 7.0) - phase * 0.22).cos() * 0.9;
+    let field_a = ((drift_x * 0.16) + (drift_y * 0.11)).sin().abs();
+    let field_b = ((drift_x * 0.07) - (drift_y * 0.19) + phase * 0.31)
+        .cos()
+        .abs();
+    let field = (field_a * 0.62) + (field_b * 0.38);
+
+    let sparse = hash01(drift_x, drift_y, phase, 149.0);
+    let threshold = 0.92 + ((1.0 - density).clamp(0.0, 1.0) * 0.06);
+    if field < threshold || sparse < 0.58 {
+        return None;
+    }
+
+    let pick = hash01(x, y, phase, 163.0);
+    let glyph = if pick > 0.88 {
+        "·"
+    } else if pick > 0.64 {
+        "."
+    } else if pick > 0.40 {
+        "•"
+    } else {
+        "·"
+    };
+
+    let depth = hash01(x * 0.41, y * 0.73, phase, 173.0);
+    let base = if depth > 0.88 {
+        ctx.theme.scale.categorical.sky
+    } else if depth > 0.62 {
+        ctx.theme.scale.categorical.teal
+    } else {
+        ctx.theme.scale.categorical.green
+    };
+
+    Some((
+        glyph,
+        glow_color(
+            base,
+            ctx.theme.semantic.white,
+            (glow * (0.10 + depth * 0.18)).clamp(0.0, 0.30),
         ),
     ))
 }

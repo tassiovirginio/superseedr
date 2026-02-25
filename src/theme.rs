@@ -417,6 +417,7 @@ pub enum ParticleProfile {
     None,
     Sakura,
     Matrix,
+    BioluminescentReef,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3403,7 +3404,14 @@ impl Theme {
                 wave_wavelength: 46.0,
                 wave_angle_degrees: -55.0,
                 wave_mode: WaveMode::Linear,
-                particle: ThemeParticleEffect::default(),
+                particle: ThemeParticleEffect {
+                    enabled: true,
+                    layer_mode: ParticleLayerMode::Background,
+                    profile: ParticleProfile::BioluminescentReef,
+                    density: 0.017,
+                    speed: 0.24,
+                    intensity: 0.58,
+                },
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(213, 245, 239),
@@ -3915,6 +3923,7 @@ mod tests {
     fn test_particle_themes_enable_particle_profiles() {
         let sakura = Theme::builtin(ThemeName::Sakura);
         let matrix = Theme::builtin(ThemeName::Matrix);
+        let reef = Theme::builtin(ThemeName::BioluminescentReef);
 
         assert!(sakura.effects.particle.enabled);
         assert_eq!(sakura.effects.particle.profile, ParticleProfile::Sakura);
@@ -3927,6 +3936,16 @@ mod tests {
         assert_eq!(matrix.effects.particle.profile, ParticleProfile::Matrix);
         assert_eq!(
             matrix.effects.particle.layer_mode,
+            ParticleLayerMode::Background
+        );
+
+        assert!(reef.effects.particle.enabled);
+        assert_eq!(
+            reef.effects.particle.profile,
+            ParticleProfile::BioluminescentReef
+        );
+        assert_eq!(
+            reef.effects.particle.layer_mode,
             ParticleLayerMode::Background
         );
     }
