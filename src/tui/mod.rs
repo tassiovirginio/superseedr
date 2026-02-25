@@ -5,6 +5,7 @@ pub mod effects;
 pub mod events;
 pub mod formatters;
 pub mod layout;
+pub mod particles;
 pub mod screen_context;
 pub mod screens;
 pub mod tree;

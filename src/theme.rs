@@ -92,6 +92,8 @@ pub enum ThemeName {
     Vesper,
     #[strum(serialize = "Zenburn")]
     Zenburn,
+    #[strum(serialize = "Sakura")]
+    Sakura,
 }
 
 impl ThemeName {
@@ -148,6 +150,7 @@ impl Serialize for ThemeName {
             ThemeName::TokyoNight => "tokyo_night",
             ThemeName::Vesper => "vesper",
             ThemeName::Zenburn => "zenburn",
+            ThemeName::Sakura => "sakura",
         };
         serializer.serialize_str(s)
     }
@@ -329,6 +332,7 @@ fn resolve_theme_name(raw: &str) -> ThemeResolution {
         "tokyo_night" => Some(ThemeName::TokyoNight),
         "vesper" => Some(ThemeName::Vesper),
         "zenburn" => Some(ThemeName::Zenburn),
+        "sakura" => Some(ThemeName::Sakura),
         _ => None,
     };
 
@@ -340,6 +344,7 @@ fn resolve_theme_name(raw: &str) -> ThemeResolution {
         "catppuccin" => Some(("catppuccin", ThemeName::CatppuccinMocha)),
         "synthwave84" => Some(("synthwave84", ThemeName::Synthwave84)),
         "tokyonight" => Some(("tokyonight", ThemeName::TokyoNight)),
+        "flowers" => Some(("flowers", ThemeName::Sakura)),
         _ => None,
     };
 
@@ -376,6 +381,7 @@ pub struct ThemeEffects {
     pub wave_wavelength: f32,
     pub wave_angle_degrees: f32,
     pub wave_mode: WaveMode,
+    pub particle: ThemeParticleEffect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +390,55 @@ pub enum WaveMode {
     RadialOut,
     #[allow(dead_code)]
     RadialIn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticleLayerMode {
+    None,
+    Background,
+    #[allow(dead_code)]
+    Foreground,
+    #[allow(dead_code)]
+    Both,
+}
+
+impl ParticleLayerMode {
+    pub fn has_background(self) -> bool {
+        matches!(self, Self::Background | Self::Both)
+    }
+
+    pub fn has_foreground(self) -> bool {
+        matches!(self, Self::Foreground | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticleProfile {
+    None,
+    Sakura,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThemeParticleEffect {
+    pub enabled: bool,
+    pub layer_mode: ParticleLayerMode,
+    pub profile: ParticleProfile,
+    pub density: f32,
+    pub speed: f32,
+    pub intensity: f32,
+}
+
+impl Default for ThemeParticleEffect {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            layer_mode: ParticleLayerMode::None,
+            profile: ParticleProfile::None,
+            density: 0.0,
+            speed: 0.0,
+            intensity: 0.0,
+        }
+    }
 }
 
 impl Default for ThemeEffects {
@@ -403,13 +458,14 @@ impl Default for ThemeEffects {
             wave_wavelength: 0.0,
             wave_angle_degrees: 0.0,
             wave_mode: WaveMode::Linear,
+            particle: ThemeParticleEffect::default(),
         }
     }
 }
 
 impl ThemeEffects {
     pub fn enabled(&self) -> bool {
-        self.local_enabled || self.wave_enabled
+        self.local_enabled || self.wave_enabled || self.particle.enabled
     }
 }
 
@@ -800,6 +856,7 @@ impl Theme {
             ThemeName::TokyoNight => Self::tokyo_night(),
             ThemeName::Vesper => Self::vesper(),
             ThemeName::Zenburn => Self::zenburn(),
+            ThemeName::Sakura => Self::sakura(),
         }
     }
 
@@ -1179,6 +1236,7 @@ impl Theme {
                 wave_wavelength: 34.0,
                 wave_angle_degrees: 22.0,
                 wave_mode: WaveMode::Linear,
+                particle: ThemeParticleEffect::default(),
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(255, 236, 175),
@@ -3030,6 +3088,7 @@ impl Theme {
                 wave_wavelength: 64.0,
                 wave_angle_degrees: -34.0,
                 wave_mode: WaveMode::Linear,
+                particle: ThemeParticleEffect::default(),
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(234, 234, 234),
@@ -3172,6 +3231,7 @@ impl Theme {
                 wave_wavelength: 64.0,
                 wave_angle_degrees: -35.0,
                 wave_mode: WaveMode::Linear,
+                particle: ThemeParticleEffect::default(),
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(34, 56, 88),
@@ -3245,6 +3305,7 @@ impl Theme {
                 wave_wavelength: 52.0,
                 wave_angle_degrees: 74.0,
                 wave_mode: WaveMode::Linear,
+                particle: ThemeParticleEffect::default(),
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(228, 240, 255),
@@ -3333,6 +3394,7 @@ impl Theme {
                 wave_wavelength: 46.0,
                 wave_angle_degrees: -55.0,
                 wave_mode: WaveMode::Linear,
+                particle: ThemeParticleEffect::default(),
             },
             semantic: ThemeSemantic {
                 text: Color::Rgb(213, 245, 239),
@@ -3366,6 +3428,75 @@ impl Theme {
                 stream: ThemeStream {
                     inflow: categorical.sky,
                     outflow: categorical.green,
+                },
+                categorical,
+            },
+        }
+    }
+
+    pub fn sakura() -> Self {
+        let categorical = ThemeCategorical {
+            rosewater: Color::Rgb(255, 236, 244),
+            flamingo: Color::Rgb(250, 207, 224),
+            pink: Color::Rgb(244, 174, 205),
+            mauve: Color::Rgb(214, 160, 198),
+            red: Color::Rgb(201, 118, 141),
+            maroon: Color::Rgb(151, 98, 84),
+            peach: Color::Rgb(224, 165, 145),
+            yellow: Color::Rgb(236, 211, 174),
+            green: Color::Rgb(152, 188, 156),
+            teal: Color::Rgb(128, 182, 189),
+            sky: Color::Rgb(145, 196, 236),
+            sapphire: Color::Rgb(116, 171, 214),
+            blue: Color::Rgb(98, 145, 196),
+            lavender: Color::Rgb(198, 188, 226),
+        };
+
+        Self {
+            name: ThemeName::Sakura,
+            effects: ThemeEffects {
+                particle: ThemeParticleEffect {
+                    enabled: true,
+                    layer_mode: ParticleLayerMode::Both,
+                    profile: ParticleProfile::Sakura,
+                    density: 0.020,
+                    speed: 0.9,
+                    intensity: 0.75,
+                },
+                ..ThemeEffects::default()
+            },
+            semantic: ThemeSemantic {
+                text: Color::Rgb(248, 241, 245),
+                subtext1: Color::Rgb(222, 204, 212),
+                subtext0: Color::Rgb(188, 165, 171),
+                overlay0: Color::Rgb(128, 105, 112),
+                surface2: Color::Rgb(96, 76, 88),
+                surface1: Color::Rgb(73, 55, 67),
+                surface0: Color::Rgb(52, 38, 49),
+                border: Color::Rgb(162, 135, 122),
+                white: Color::White,
+            },
+            scale: ThemeScale {
+                speed: [
+                    categorical.sky,
+                    categorical.sapphire,
+                    categorical.blue,
+                    categorical.teal,
+                    categorical.pink,
+                    categorical.mauve,
+                    categorical.peach,
+                    categorical.rosewater,
+                ],
+                ip_hash: categorical_ip_hash(categorical),
+                heatmap: ThemeHeatmap {
+                    low: categorical.sky,
+                    medium: categorical.pink,
+                    high: categorical.maroon,
+                    empty: Color::Rgb(73, 55, 67),
+                },
+                stream: ThemeStream {
+                    inflow: categorical.sky,
+                    outflow: categorical.teal,
                 },
                 categorical,
             },
@@ -3444,6 +3575,7 @@ mod tests {
             ThemeName::TokyoNight,
             ThemeName::Vesper,
             ThemeName::Zenburn,
+            ThemeName::Sakura,
         ]
     }
 
@@ -3522,6 +3654,7 @@ mod tests {
             ("tokyo_night", ThemeName::TokyoNight),
             ("vesper", ThemeName::Vesper),
             ("zenburn", ThemeName::Zenburn),
+            ("sakura", ThemeName::Sakura),
         ];
 
         for (input, expected) in themes {
@@ -3573,6 +3706,7 @@ mod tests {
             ("Tokyo Night", ThemeName::TokyoNight),
             ("Vesper", ThemeName::Vesper),
             ("Zenburn", ThemeName::Zenburn),
+            ("Sakura", ThemeName::Sakura),
         ];
 
         for (input, expected) in themes {
@@ -3611,6 +3745,7 @@ mod tests {
             ("catppuccin", ThemeName::CatppuccinMocha),
             ("synthwave84", ThemeName::Synthwave84),
             ("tokyonight", ThemeName::TokyoNight),
+            ("flowers", ThemeName::Sakura),
         ];
 
         for (input, expected) in aliases {
@@ -3765,5 +3900,22 @@ mod tests {
             effect_theme.effects.enabled(),
             "Diamond should report effects enabled"
         );
+    }
+
+    #[test]
+    fn test_particle_themes_enable_particle_profiles() {
+        let sakura = Theme::builtin(ThemeName::Sakura);
+
+        assert!(sakura.effects.particle.enabled);
+        assert_eq!(sakura.effects.particle.profile, ParticleProfile::Sakura);
+        assert_eq!(sakura.effects.particle.layer_mode, ParticleLayerMode::Both);
+    }
+
+    #[test]
+    fn test_non_particle_theme_keeps_particle_effects_disabled() {
+        let nord = Theme::builtin(ThemeName::Nord);
+        assert!(!nord.effects.particle.enabled);
+        assert_eq!(nord.effects.particle.layer_mode, ParticleLayerMode::None);
+        assert_eq!(nord.effects.particle.profile, ParticleProfile::None);
     }
 }

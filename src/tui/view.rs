@@ -11,6 +11,9 @@ use crate::theme::ThemeContext;
 
 use crate::tui::effects::apply_theme_effects_to_frame;
 use crate::tui::layout::normal::{calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT};
+use crate::tui::particles::{
+    apply_theme_particles_background_to_frame, apply_theme_particles_foreground_to_frame,
+};
 
 use crate::config::Settings;
 
@@ -22,8 +25,10 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     match &app_state.mode {
         AppMode::Help => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             help::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         AppMode::Welcome => {
@@ -32,11 +37,14 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             return;
         }
         AppMode::PowerSaving => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             power::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         AppMode::Config => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             config::draw(
                 f,
                 &screen,
@@ -46,14 +54,18 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
                 &app_state.ui.config.editing,
             );
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         AppMode::DeleteConfirm => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             delete_confirm::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         AppMode::FileBrowser => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             browser::draw(
                 f,
                 &screen,
@@ -62,16 +74,20 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
                 &app_state.ui.file_browser.browser_mode,
             );
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         AppMode::Rss => {
+            apply_theme_particles_background_to_frame(f, &ctx);
             rss::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
             return;
         }
         _ => {}
     }
 
+    apply_theme_particles_background_to_frame(f, &ctx);
     let layout_ctx = LayoutContext::new(area, app_state, DEFAULT_SIDEBAR_PERCENT);
     let plan = calculate_layout(area, &layout_ctx);
 
@@ -95,6 +111,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     }
 
     apply_theme_effects_to_frame(f, &ctx);
+    apply_theme_particles_foreground_to_frame(f, &ctx);
 }
 
 pub(crate) fn calculate_player_stats(app_state: &AppState) -> (u32, f64) {

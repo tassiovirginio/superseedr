@@ -4,6 +4,7 @@
 - `src/tui/view.rs`: top-level draw dispatcher.
 - `src/tui/events.rs`: top-level input dispatcher and cross-cutting key handling.
 - `src/tui/effects.rs`: post-draw theme effect pass + effect activity speed helper.
+- `src/tui/particles.rs`: theme-driven background/foreground particle rendering.
 - `src/tui/screen_context.rs`: read-only draw context (`ScreenContext`, `AppViewModel`).
 - `src/tui/screens/*.rs`: per-screen draw + event handling.
 - `src/tui/layout.rs`: layout module root.
@@ -17,7 +18,8 @@
 1. `App::run` receives events and manager updates.
 2. Input is routed through `tui::events::handle_event(event, &mut app)`.
 3. Draw loop ticks UI effects clock in `App`, then calls `tui::view::draw(f, &app_state, &settings)`.
-4. In power-saving mode, drawing is gated by `app_state.ui.needs_redraw`.
+4. For non-welcome screens, draw order is: optional particle background -> screen widgets -> theme color effects -> optional particle foreground.
+5. In power-saving mode, drawing is gated by `app_state.ui.needs_redraw`.
 
 ## State Ownership Matrix
 - `AppState` (domain/application core):
