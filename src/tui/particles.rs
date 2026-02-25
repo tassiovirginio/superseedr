@@ -100,6 +100,17 @@ fn sample_particle(
             underlying_fg,
             reactive_tint,
         ),
+        ParticleProfile::Matrix => sample_matrix(
+            ctx,
+            x,
+            y,
+            width,
+            height,
+            phase,
+            density,
+            glow,
+            underlying_fg,
+        ),
         ParticleProfile::None => None,
     }
 }
@@ -151,6 +162,86 @@ fn sample_sakura(
     Some((
         glyph,
         glow_color(base, ctx.theme.semantic.white, glow * 0.10),
+    ))
+}
+
+fn sample_matrix(
+    ctx: &ThemeContext,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    phase: f64,
+    density: f64,
+    glow: f64,
+    underlying_fg: Color,
+) -> Option<(&'static str, Color)> {
+    let _ = (width, underlying_fg);
+    let h = height.max(2.0);
+    let col = x.floor();
+
+    // Columns randomly phase in/out over time windows.
+    let window_t = (phase * 1.35).floor();
+    let col_seed = hash01(col, window_t, 0.0, 101.0);
+    let active = col_seed > (0.32 + (1.0 - density).clamp(0.0, 1.0) * 0.28);
+    if !active {
+        return None;
+    }
+
+    // Per-column falling head and string length.
+    let speed = 3.0 + hash01(col, 0.0, phase, 17.0) * 3.2;
+    let head = (phase * speed + hash01(col, 0.0, 0.0, 23.0) * h).rem_euclid(h);
+    let len = (4.0 + hash01(col, 0.0, phase, 29.0) * (h * 0.28)).clamp(4.0, h * 0.45);
+    let dy = (head - y).rem_euclid(h);
+    if dy > len {
+        return None;
+    }
+
+    // Random dropout inside active strings creates hacking in/out behavior.
+    let dropout = hash01(col, y.floor(), (phase * 8.0).floor(), 59.0);
+    if dropout < 0.18 {
+        return None;
+    }
+
+    let pick = hash01(col, (y * 0.61).floor(), (phase * 12.0).floor(), 53.0);
+    let glyph = if pick > 0.88 {
+        "1"
+    } else if pick > 0.76 {
+        "0"
+    } else if pick > 0.64 {
+        "7"
+    } else if pick > 0.52 {
+        "3"
+    } else if pick > 0.40 {
+        "9"
+    } else if pick > 0.30 {
+        "|"
+    } else {
+        ":"
+    };
+
+    let tail_ratio = if len <= 0.001 {
+        0.0
+    } else {
+        (dy / len).clamp(0.0, 1.0)
+    };
+    let base = if tail_ratio < 0.08 {
+        ctx.theme.semantic.white
+    } else if tail_ratio < 0.24 {
+        ctx.theme.scale.categorical.sky
+    } else if tail_ratio < 0.55 {
+        ctx.theme.scale.categorical.teal
+    } else {
+        ctx.theme.scale.categorical.green
+    };
+
+    Some((
+        glyph,
+        glow_color(
+            base,
+            ctx.theme.semantic.white,
+            (glow * 0.18).clamp(0.0, 0.24),
+        ),
     ))
 }
 

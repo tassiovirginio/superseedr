@@ -416,6 +416,7 @@ impl ParticleLayerMode {
 pub enum ParticleProfile {
     None,
     Sakura,
+    Matrix,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1949,6 +1950,14 @@ impl Theme {
                 local_enabled: true,
                 flicker_hz: 5.0,
                 flicker_intensity: 0.16,
+                particle: ThemeParticleEffect {
+                    enabled: true,
+                    layer_mode: ParticleLayerMode::Background,
+                    profile: ParticleProfile::Matrix,
+                    density: 0.026,
+                    speed: 0.82,
+                    intensity: 0.62,
+                },
                 ..ThemeEffects::default()
             },
             semantic: ThemeSemantic {
@@ -3905,11 +3914,19 @@ mod tests {
     #[test]
     fn test_particle_themes_enable_particle_profiles() {
         let sakura = Theme::builtin(ThemeName::Sakura);
+        let matrix = Theme::builtin(ThemeName::Matrix);
 
         assert!(sakura.effects.particle.enabled);
         assert_eq!(sakura.effects.particle.profile, ParticleProfile::Sakura);
         assert_eq!(
             sakura.effects.particle.layer_mode,
+            ParticleLayerMode::Background
+        );
+
+        assert!(matrix.effects.particle.enabled);
+        assert_eq!(matrix.effects.particle.profile, ParticleProfile::Matrix);
+        assert_eq!(
+            matrix.effects.particle.layer_mode,
             ParticleLayerMode::Background
         );
     }
