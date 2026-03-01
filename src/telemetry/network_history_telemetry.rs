@@ -3,8 +3,9 @@
 
 use crate::app::AppState;
 use crate::persistence::network_history::{
-    enforce_retention_caps, NetworkHistoryPersistedState, NetworkHistoryPoint, NetworkHistoryTiers,
-    HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
+    enforce_retention_caps, NetworkHistoryPersistedState, NetworkHistoryPoint,
+    NetworkHistoryRollupState, NetworkHistoryTiers, HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP,
+    SECOND_1S_CAP,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,6 +44,8 @@ impl NetworkHistoryTelemetry {
     ) {
         let was_dirty = app_state.network_history_dirty;
         let merged = merge_state_for_late_restore(&app_state.network_history_state, state);
+        let rollup_source =
+            densify_state_for_restore(merged.clone(), rollup_rebuild_cutoff_unix(&merged));
         let densified = densify_state_for_restore(merged, now_unix);
 
         app_state.avg_download_history = densified
@@ -88,6 +91,8 @@ impl NetworkHistoryTelemetry {
         );
 
         app_state.network_history_state = densified;
+        app_state.network_history_rollups =
+            NetworkHistoryRollupState::rebuild_from_state(&rollup_source);
         // Preserve dirty state if live samples were already pending flush.
         app_state.network_history_dirty = was_dirty;
     }
@@ -98,6 +103,19 @@ fn current_unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn rollup_rebuild_cutoff_unix(state: &NetworkHistoryPersistedState) -> u64 {
+    state
+        .updated_at_unix
+        .max(latest_point_timestamp(&state.tiers.second_1s))
+        .max(latest_point_timestamp(&state.tiers.minute_1m))
+        .max(latest_point_timestamp(&state.tiers.minute_15m))
+        .max(latest_point_timestamp(&state.tiers.hour_1h))
+}
+
+fn latest_point_timestamp(points: &[NetworkHistoryPoint]) -> u64 {
+    points.last().map(|point| point.ts_unix).unwrap_or(0)
 }
 
 fn merge_tier_points(
@@ -394,6 +412,132 @@ mod tests {
         assert_eq!(
             app_state.disk_backoff_history_ms,
             VecDeque::from(vec![4, 0, 2, 0])
+        );
+    }
+
+    #[test]
+    fn apply_loaded_state_rebuilds_second_to_minute_rollup() {
+        let mut app_state = AppState::default();
+        let mut loaded = NetworkHistoryPersistedState {
+            updated_at_unix: 59,
+            ..Default::default()
+        };
+        loaded.tiers.second_1s = (1_u64..=59)
+            .map(|ts| NetworkHistoryPoint {
+                ts_unix: ts,
+                download_bps: 10,
+                upload_bps: 1,
+                backoff_ms_max: 1,
+            })
+            .collect();
+
+        NetworkHistoryTelemetry::apply_loaded_state_at(&mut app_state, loaded, 59);
+
+        assert!(app_state.network_history_rollups.ingest_second_sample(
+            &mut app_state.network_history_state,
+            60,
+            70,
+            7,
+            9,
+        ));
+        assert_eq!(app_state.network_history_state.tiers.minute_1m.len(), 1);
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_1m[0].download_bps,
+            11
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_1m[0].upload_bps,
+            1
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_1m[0].backoff_ms_max,
+            9
+        );
+    }
+
+    #[test]
+    fn apply_loaded_state_rebuilds_minute_to_15m_rollup() {
+        let mut app_state = AppState::default();
+        let mut loaded = NetworkHistoryPersistedState {
+            updated_at_unix: 14 * 60,
+            ..Default::default()
+        };
+        loaded.tiers.minute_1m = (1_u64..=14)
+            .map(|idx| NetworkHistoryPoint {
+                ts_unix: idx * 60,
+                download_bps: 10,
+                upload_bps: 2,
+                backoff_ms_max: 3,
+            })
+            .collect();
+
+        NetworkHistoryTelemetry::apply_loaded_state_at(&mut app_state, loaded, 14 * 60);
+
+        for ts in (14 * 60 + 1)..=(15 * 60) {
+            assert!(app_state.network_history_rollups.ingest_second_sample(
+                &mut app_state.network_history_state,
+                ts,
+                40,
+                4,
+                5,
+            ));
+        }
+
+        assert_eq!(app_state.network_history_state.tiers.minute_15m.len(), 1);
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_15m[0].download_bps,
+            12
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_15m[0].upload_bps,
+            2
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.minute_15m[0].backoff_ms_max,
+            5
+        );
+    }
+
+    #[test]
+    fn apply_loaded_state_rebuilds_15m_to_hour_rollup() {
+        let mut app_state = AppState::default();
+        let mut loaded = NetworkHistoryPersistedState {
+            updated_at_unix: 3 * 15 * 60,
+            ..Default::default()
+        };
+        loaded.tiers.minute_15m = (1_u64..=3)
+            .map(|idx| NetworkHistoryPoint {
+                ts_unix: idx * 15 * 60,
+                download_bps: 20,
+                upload_bps: 3,
+                backoff_ms_max: 4,
+            })
+            .collect();
+
+        NetworkHistoryTelemetry::apply_loaded_state_at(&mut app_state, loaded, 3 * 15 * 60);
+
+        for ts in (3 * 15 * 60 + 1)..=(4 * 15 * 60) {
+            assert!(app_state.network_history_rollups.ingest_second_sample(
+                &mut app_state.network_history_state,
+                ts,
+                80,
+                8,
+                9,
+            ));
+        }
+
+        assert_eq!(app_state.network_history_state.tiers.hour_1h.len(), 1);
+        assert_eq!(
+            app_state.network_history_state.tiers.hour_1h[0].download_bps,
+            35
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.hour_1h[0].upload_bps,
+            4
+        );
+        assert_eq!(
+            app_state.network_history_state.tiers.hour_1h[0].backoff_ms_max,
+            9
         );
     }
 }

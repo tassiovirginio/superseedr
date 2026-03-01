@@ -407,6 +407,10 @@ pub enum AppCommand {
     RssDownloadSelected(RssHistoryEntry),
     RssDownloadPreview(RssPreviewItem),
     NetworkHistoryLoaded(NetworkHistoryPersistedState),
+    NetworkHistoryPersisted {
+        request_id: u64,
+        success: bool,
+    },
     UpdateConfig(Settings),
     UpdateVersionAvailable(String),
 }
@@ -716,6 +720,9 @@ pub struct AppState {
     pub network_history_state: NetworkHistoryPersistedState,
     pub network_history_rollups: NetworkHistoryRollupState,
     pub network_history_dirty: bool,
+    pub network_history_restore_pending: bool,
+    pub next_network_history_persist_request_id: u64,
+    pub pending_network_history_persist_request_id: Option<u64>,
 
     pub last_tuning_score: u64,
     pub current_tuning_score: u64,
@@ -770,10 +777,16 @@ pub struct App {
 }
 
 #[derive(Clone)]
+pub struct NetworkHistoryPersistRequest {
+    pub request_id: u64,
+    pub state: NetworkHistoryPersistedState,
+}
+
+#[derive(Clone)]
 pub struct PersistPayload {
     pub settings: Settings,
     pub rss_state: RssPersistedState,
-    pub network_history_state: NetworkHistoryPersistedState,
+    pub network_history: Option<NetworkHistoryPersistRequest>,
 }
 impl App {
     pub async fn new(client_configs: Settings) -> Result<Self, Box<dyn std::error::Error>> {
@@ -790,28 +803,67 @@ impl App {
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (persistence_tx, mut persistence_rx) = watch::channel::<Option<PersistPayload>>(None);
+        let persistence_app_command_tx = app_command_tx.clone();
         let persistence_task = tokio::spawn(async move {
             while persistence_rx.changed().await.is_ok() {
                 let Some(payload) = persistence_rx.borrow().clone() else {
                     continue;
                 };
+                let network_history_request_id = payload
+                    .network_history
+                    .as_ref()
+                    .map(|request| request.request_id);
                 let write_result = tokio::task::spawn_blocking(move || {
                     save_settings(&payload.settings)
                         .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
                     save_rss_state(&payload.rss_state)
                         .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
-                    save_network_history_state(&payload.network_history_state)
-                        .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
+                    if let Some(network_history) = payload.network_history {
+                        save_network_history_state(&network_history.state).map_err(|e| {
+                            format!("Failed to auto-save network history state: {}", e)
+                        })?;
+                    }
                     Ok::<(), String>(())
                 })
                 .await;
 
                 match write_result {
                     Ok(Ok(())) => {
-                        tracing_event!(Level::DEBUG, "Settings/RSS state auto-saved successfully.");
+                        tracing_event!(
+                            Level::DEBUG,
+                            "Persistence payload auto-saved successfully."
+                        );
+                        if let Some(request_id) = network_history_request_id {
+                            let _ = persistence_app_command_tx
+                                .send(AppCommand::NetworkHistoryPersisted {
+                                    request_id,
+                                    success: true,
+                                })
+                                .await;
+                        }
                     }
-                    Ok(Err(e)) => tracing_event!(Level::ERROR, "{}", e),
-                    Err(e) => tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e),
+                    Ok(Err(e)) => {
+                        tracing_event!(Level::ERROR, "{}", e);
+                        if let Some(request_id) = network_history_request_id {
+                            let _ = persistence_app_command_tx
+                                .send(AppCommand::NetworkHistoryPersisted {
+                                    request_id,
+                                    success: false,
+                                })
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
+                        if let Some(request_id) = network_history_request_id {
+                            let _ = persistence_app_command_tx
+                                .send(AppCommand::NetworkHistoryPersisted {
+                                    request_id,
+                                    success: false,
+                                })
+                                .await;
+                        }
+                    }
                 }
             }
         });
@@ -1890,7 +1942,14 @@ impl App {
             }
             AppCommand::NetworkHistoryLoaded(state) => {
                 NetworkHistoryTelemetry::apply_loaded_state(&mut self.app_state, state);
+                self.app_state.network_history_restore_pending = false;
                 self.app_state.ui.needs_redraw = true;
+            }
+            AppCommand::NetworkHistoryPersisted {
+                request_id,
+                success,
+            } => {
+                apply_network_history_persist_result(&mut self.app_state, request_id, success);
             }
             AppCommand::UpdateConfig(new_settings) => {
                 let old_settings = self.client_configs.clone();
@@ -2272,7 +2331,8 @@ impl App {
         self.sync_tuning_state_from_controller();
     }
 
-    fn startup_network_history_restore(&self) {
+    fn startup_network_history_restore(&mut self) {
+        self.app_state.network_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
         tokio::spawn(async move {
             let load_result = tokio::task::spawn_blocking(load_network_history_state).await;
@@ -2286,6 +2346,11 @@ impl App {
                         "Network history restore task failed to join: {}",
                         e
                     );
+                    let _ = tx
+                        .send(AppCommand::NetworkHistoryLoaded(
+                            NetworkHistoryPersistedState::default(),
+                        ))
+                        .await;
                 }
             }
         });
@@ -2381,75 +2446,14 @@ impl App {
     }
 
     fn save_state_to_disk(&mut self) {
-        self.client_configs.lifetime_downloaded = self.app_state.lifetime_downloaded_from_config
-            + self.app_state.session_total_downloaded;
-        self.client_configs.lifetime_uploaded =
-            self.app_state.lifetime_uploaded_from_config + self.app_state.session_total_uploaded;
-
-        self.client_configs.torrent_sort_column = self.app_state.torrent_sort.0;
-        self.client_configs.torrent_sort_direction = self.app_state.torrent_sort.1;
-        self.client_configs.peer_sort_column = self.app_state.peer_sort.0;
-        self.client_configs.peer_sort_direction = self.app_state.peer_sort.1;
-        let old_validation_statuses: HashMap<String, bool> = self
-            .client_configs
-            .torrents
-            .iter()
-            .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
-            .collect();
-
-        self.client_configs.torrents = self
-            .app_state
-            .torrents
-            .values()
-            .map(|torrent| {
-                let torrent_state = &torrent.latest_state;
-                let previous_validation_status = old_validation_statuses
-                    .get(&torrent_state.torrent_or_magnet)
-                    .copied()
-                    .unwrap_or(false);
-
-                let final_validation_status = persisted_validation_status_from_piece_completion(
-                    torrent_state.number_of_pieces_total,
-                    torrent_state.number_of_pieces_completed,
-                    previous_validation_status,
-                );
-
-                TorrentSettings {
-                    torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
-                    name: torrent_state.torrent_name.clone(),
-                    validation_status: final_validation_status,
-                    download_path: torrent_state.download_path.clone(),
-                    container_name: torrent_state.container_name.clone(),
-                    torrent_control_state: torrent_state.torrent_control_state.clone(),
-                    file_priorities: torrent_state.file_priorities.clone(),
-                }
-            })
-            .collect();
-
-        const RSS_HISTORY_LIMIT: usize = 1000;
-        if self.app_state.rss_runtime.history.len() > RSS_HISTORY_LIMIT {
-            let overflow = self.app_state.rss_runtime.history.len() - RSS_HISTORY_LIMIT;
-            self.app_state.rss_runtime.history.drain(0..overflow);
-        }
-
-        let rss_state = RssPersistedState {
-            history: self.app_state.rss_runtime.history.clone(),
-            last_sync_at: self.app_state.rss_runtime.last_sync_at.clone(),
-            feed_errors: self.app_state.rss_runtime.feed_errors.clone(),
-        };
-        self.app_state.network_history_state.updated_at_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let payload = PersistPayload {
-            settings: self.client_configs.clone(),
-            rss_state,
-            network_history_state: self.app_state.network_history_state.clone(),
-        };
+        let payload = build_persist_payload(&mut self.client_configs, &mut self.app_state);
+        let network_history_request_id = payload
+            .network_history
+            .as_ref()
+            .map(|request| request.request_id);
 
         if queue_persistence_payload(self.persistence_tx.as_ref(), payload).is_ok() {
-            self.app_state.network_history_dirty = false;
+            self.app_state.pending_network_history_persist_request_id = network_history_request_id;
         } else {
             tracing_event!(
                 Level::ERROR,
@@ -3550,6 +3554,95 @@ fn rss_settings_changed(old_settings: &Settings, new_settings: &Settings) -> boo
     new_settings.rss != old_settings.rss
 }
 
+fn build_persist_payload(
+    client_configs: &mut Settings,
+    app_state: &mut AppState,
+) -> PersistPayload {
+    client_configs.lifetime_downloaded =
+        app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded;
+    client_configs.lifetime_uploaded =
+        app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded;
+
+    client_configs.torrent_sort_column = app_state.torrent_sort.0;
+    client_configs.torrent_sort_direction = app_state.torrent_sort.1;
+    client_configs.peer_sort_column = app_state.peer_sort.0;
+    client_configs.peer_sort_direction = app_state.peer_sort.1;
+    let old_validation_statuses: HashMap<String, bool> = client_configs
+        .torrents
+        .iter()
+        .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
+        .collect();
+
+    client_configs.torrents = app_state
+        .torrents
+        .values()
+        .map(|torrent| {
+            let torrent_state = &torrent.latest_state;
+            let previous_validation_status = old_validation_statuses
+                .get(&torrent_state.torrent_or_magnet)
+                .copied()
+                .unwrap_or(false);
+
+            let final_validation_status = persisted_validation_status_from_piece_completion(
+                torrent_state.number_of_pieces_total,
+                torrent_state.number_of_pieces_completed,
+                previous_validation_status,
+            );
+
+            TorrentSettings {
+                torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
+                name: torrent_state.torrent_name.clone(),
+                validation_status: final_validation_status,
+                download_path: torrent_state.download_path.clone(),
+                container_name: torrent_state.container_name.clone(),
+                torrent_control_state: torrent_state.torrent_control_state.clone(),
+                file_priorities: torrent_state.file_priorities.clone(),
+            }
+        })
+        .collect();
+
+    const RSS_HISTORY_LIMIT: usize = 1000;
+    if app_state.rss_runtime.history.len() > RSS_HISTORY_LIMIT {
+        let overflow = app_state.rss_runtime.history.len() - RSS_HISTORY_LIMIT;
+        app_state.rss_runtime.history.drain(0..overflow);
+    }
+
+    let rss_state = RssPersistedState {
+        history: app_state.rss_runtime.history.clone(),
+        last_sync_at: app_state.rss_runtime.last_sync_at.clone(),
+        feed_errors: app_state.rss_runtime.feed_errors.clone(),
+    };
+
+    let network_history = if app_state.network_history_restore_pending {
+        None
+    } else {
+        app_state.network_history_state.updated_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        app_state.next_network_history_persist_request_id = app_state
+            .next_network_history_persist_request_id
+            .saturating_add(1);
+        Some(NetworkHistoryPersistRequest {
+            request_id: app_state.next_network_history_persist_request_id,
+            state: app_state.network_history_state.clone(),
+        })
+    };
+
+    PersistPayload {
+        settings: client_configs.clone(),
+        rss_state,
+        network_history,
+    }
+}
+
+fn apply_network_history_persist_result(app_state: &mut AppState, request_id: u64, success: bool) {
+    if success && app_state.pending_network_history_persist_request_id == Some(request_id) {
+        app_state.network_history_dirty = false;
+        app_state.pending_network_history_persist_request_id = None;
+    }
+}
+
 fn should_persist_network_history_on_interval(app_state: &AppState) -> bool {
     app_state.network_history_dirty
 }
@@ -3598,6 +3691,7 @@ fn prune_rss_feed_errors(
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_network_history_persist_result, build_persist_payload,
         clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
         flush_persistence_writer_parts, parse_hybrid_hashes,
         persisted_validation_status_from_piece_completion, prune_rss_feed_errors,
@@ -3894,6 +3988,56 @@ mod tests {
         assert!(should_persist_network_history_on_interval(&app_state));
     }
 
+    #[test]
+    fn build_persist_payload_skips_network_history_while_restore_is_pending() {
+        let mut settings = crate::config::Settings::default();
+        let mut app_state = AppState {
+            network_history_restore_pending: true,
+            ..Default::default()
+        };
+        app_state.network_history_state.tiers.second_1s.push(
+            crate::persistence::network_history::NetworkHistoryPoint {
+                ts_unix: 41,
+                download_bps: 1000,
+                upload_bps: 100,
+                backoff_ms_max: 0,
+            },
+        );
+
+        let payload = build_persist_payload(&mut settings, &mut app_state);
+
+        assert!(payload.network_history.is_none());
+        assert_eq!(app_state.network_history_state.updated_at_unix, 0);
+        assert_eq!(app_state.next_network_history_persist_request_id, 0);
+    }
+
+    #[test]
+    fn apply_network_history_persist_result_clears_dirty_only_for_latest_success() {
+        let mut app_state = AppState {
+            network_history_dirty: true,
+            pending_network_history_persist_request_id: Some(2),
+            ..Default::default()
+        };
+
+        apply_network_history_persist_result(&mut app_state, 1, true);
+        assert!(app_state.network_history_dirty);
+        assert_eq!(
+            app_state.pending_network_history_persist_request_id,
+            Some(2)
+        );
+
+        apply_network_history_persist_result(&mut app_state, 2, false);
+        assert!(app_state.network_history_dirty);
+        assert_eq!(
+            app_state.pending_network_history_persist_request_id,
+            Some(2)
+        );
+
+        apply_network_history_persist_result(&mut app_state, 2, true);
+        assert!(!app_state.network_history_dirty);
+        assert_eq!(app_state.pending_network_history_persist_request_id, None);
+    }
+
     #[tokio::test]
     async fn queue_persistence_payload_carries_network_history_state() {
         let (tx, mut rx) = tokio::sync::watch::channel::<Option<PersistPayload>>(None);
@@ -3914,19 +4058,26 @@ mod tests {
         let payload = PersistPayload {
             settings: crate::config::Settings::default(),
             rss_state: crate::persistence::rss::RssPersistedState::default(),
-            network_history_state: network_history_state.clone(),
+            network_history: Some(super::NetworkHistoryPersistRequest {
+                request_id: 7,
+                state: network_history_state.clone(),
+            }),
         };
 
         assert!(queue_persistence_payload(Some(&tx), payload).is_ok());
         assert!(rx.changed().await.is_ok());
 
         let received = rx.borrow().clone().expect("payload should be present");
+        let network_history = received
+            .network_history
+            .expect("network history payload should be present");
+        assert_eq!(network_history.request_id, 7);
         assert_eq!(
-            received.network_history_state.updated_at_unix,
+            network_history.state.updated_at_unix,
             network_history_state.updated_at_unix
         );
         assert_eq!(
-            received.network_history_state.tiers.second_1s,
+            network_history.state.tiers.second_1s,
             network_history_state.tiers.second_1s
         );
     }

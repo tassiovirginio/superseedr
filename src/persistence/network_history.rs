@@ -82,6 +82,14 @@ pub struct NetworkHistoryRollupState {
 }
 
 impl NetworkHistoryRollupState {
+    pub fn rebuild_from_state(state: &NetworkHistoryPersistedState) -> Self {
+        Self {
+            second_to_minute: rebuild_accumulator(&state.tiers.second_1s, 60),
+            minute_to_15m: rebuild_accumulator(&state.tiers.minute_1m, 15),
+            m15_to_hour: rebuild_accumulator(&state.tiers.minute_15m, 4),
+        }
+    }
+
     pub fn ingest_second_sample(
         &mut self,
         state: &mut NetworkHistoryPersistedState,
@@ -132,6 +140,20 @@ impl NetworkHistoryRollupState {
 
         should_persist
     }
+}
+
+fn rebuild_accumulator(points: &[NetworkHistoryPoint], bucket_size: usize) -> RollupAccumulator {
+    if bucket_size == 0 || points.is_empty() {
+        return RollupAccumulator::default();
+    }
+
+    let remainder = points.len() % bucket_size;
+    let start = points.len().saturating_sub(remainder);
+    let mut accumulator = RollupAccumulator::default();
+    for point in &points[start..] {
+        accumulator.push(point);
+    }
+    accumulator
 }
 
 fn make_rollup_point(acc: &RollupAccumulator, ts_unix: u64) -> NetworkHistoryPoint {
@@ -575,5 +597,80 @@ mod tests {
         assert_eq!(hour.download_bps, 1800);
         assert_eq!(hour.upload_bps, 3601);
         assert_eq!(hour.backoff_ms_max, 99);
+    }
+
+    #[test]
+    fn rebuild_from_state_restores_partial_rollup_accumulators() {
+        let mut state = NetworkHistoryPersistedState::default();
+        state.tiers.second_1s = (1_u64..=61)
+            .map(|ts| NetworkHistoryPoint {
+                ts_unix: ts,
+                download_bps: ts,
+                upload_bps: ts * 2,
+                backoff_ms_max: ts,
+            })
+            .collect();
+        state.tiers.minute_1m = (1_u64..=16)
+            .map(|idx| NetworkHistoryPoint {
+                ts_unix: idx * 60,
+                download_bps: idx,
+                upload_bps: idx * 3,
+                backoff_ms_max: idx,
+            })
+            .collect();
+        state.tiers.minute_15m = (1_u64..=5)
+            .map(|idx| NetworkHistoryPoint {
+                ts_unix: idx * 15 * 60,
+                download_bps: idx,
+                upload_bps: idx * 4,
+                backoff_ms_max: idx,
+            })
+            .collect();
+
+        let rollups = NetworkHistoryRollupState::rebuild_from_state(&state);
+
+        assert_eq!(rollups.second_to_minute.count, 1);
+        assert_eq!(rollups.second_to_minute.dl_sum, 61);
+        assert_eq!(rollups.second_to_minute.ul_sum, 122);
+        assert_eq!(rollups.second_to_minute.backoff_max, 61);
+
+        assert_eq!(rollups.minute_to_15m.count, 1);
+        assert_eq!(rollups.minute_to_15m.dl_sum, 16);
+        assert_eq!(rollups.minute_to_15m.ul_sum, 48);
+        assert_eq!(rollups.minute_to_15m.backoff_max, 16);
+
+        assert_eq!(rollups.m15_to_hour.count, 1);
+        assert_eq!(rollups.m15_to_hour.dl_sum, 5);
+        assert_eq!(rollups.m15_to_hour.ul_sum, 20);
+        assert_eq!(rollups.m15_to_hour.backoff_max, 5);
+    }
+
+    #[test]
+    fn rebuild_from_state_keeps_zero_filled_points_in_partial_bucket() {
+        let state = NetworkHistoryPersistedState {
+            tiers: NetworkHistoryTiers {
+                second_1s: vec![
+                    NetworkHistoryPoint {
+                        ts_unix: 58,
+                        download_bps: 10,
+                        upload_bps: 1,
+                        backoff_ms_max: 2,
+                    },
+                    NetworkHistoryPoint {
+                        ts_unix: 59,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rollups = NetworkHistoryRollupState::rebuild_from_state(&state);
+
+        assert_eq!(rollups.second_to_minute.count, 2);
+        assert_eq!(rollups.second_to_minute.dl_sum, 10);
+        assert_eq!(rollups.second_to_minute.ul_sum, 1);
+        assert_eq!(rollups.second_to_minute.backoff_max, 2);
     }
 }
