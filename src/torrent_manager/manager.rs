@@ -3182,8 +3182,14 @@ mod resource_tests {
             crate::resource_manager::ResourceType::PeerConnection,
             (1000, 1000),
         );
-        limits.insert(crate::resource_manager::ResourceType::DiskRead, (1000, 1000));
-        limits.insert(crate::resource_manager::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskRead,
+            (1000, 1000),
+        );
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskWrite,
+            (1000, 1000),
+        );
         limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, resource_manager_client) =
@@ -3281,10 +3287,7 @@ mod resource_tests {
         );
 
         torrent_tx
-            .send(TorrentCommand::MetadataTorrent(
-                Box::new(torrent),
-                109,
-            ))
+            .send(TorrentCommand::MetadataTorrent(Box::new(torrent), 109))
             .await
             .unwrap();
 

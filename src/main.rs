@@ -12,12 +12,12 @@ mod resource_manager;
 mod storage;
 mod telemetry;
 mod theme;
-mod tuning;
 mod token_bucket;
 mod torrent_file;
 mod torrent_manager;
 mod tracker;
 mod tui;
+mod tuning;
 
 use app::App;
 use rand::Rng;

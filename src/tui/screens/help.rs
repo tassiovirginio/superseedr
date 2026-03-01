@@ -500,9 +500,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                         "Best Score",
                         ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
                     )),
-                    Cell::from(
-                        "Score measuring if randomized changes resulted in optimal speeds.",
-                    ),
+                    Cell::from("Score measuring if randomized changes resulted in optimal speeds."),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
@@ -516,9 +514,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                         "Resource Rows",
                         ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
                     )),
-                    Cell::from(
-                        "Current limits shown as numbers for Peers/Reads/Writes/Reserve.",
-                    ),
+                    Cell::from("Current limits shown as numbers for Peers/Reads/Writes/Reserve."),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(

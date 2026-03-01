@@ -1494,17 +1494,14 @@ pub fn draw_network_chart(
             app_state
                 .graph_mode
                 .as_seconds()
-                .min(SECONDS_HISTORY_MAX)
-                .max(1),
+                .clamp(1, SECONDS_HISTORY_MAX),
             1_u64,
             &app_state.network_history_state.tiers.second_1s,
         ),
         GraphDisplayMode::ThreeHours
         | GraphDisplayMode::TwelveHours
         | GraphDisplayMode::TwentyFourHours => (
-            (app_state.graph_mode.as_seconds() / 60)
-                .min(MINUTES_HISTORY_MAX)
-                .max(1),
+            (app_state.graph_mode.as_seconds() / 60).clamp(1, MINUTES_HISTORY_MAX),
             60_u64,
             &app_state.network_history_state.tiers.minute_1m,
         ),
@@ -4291,7 +4288,11 @@ mod tests {
             let ctx = ThemeContext::new(Theme::builtin(theme_name), 0.0);
             assert_eq!(
                 disk_health_status_color(&ctx, 0),
-                ctx.theme.semantic.subtext0
+                if theme_name == ThemeName::BlackHole {
+                    ctx.theme.semantic.subtext1
+                } else {
+                    ctx.theme.semantic.subtext0
+                }
             );
             assert_eq!(disk_health_status_color(&ctx, 1), ctx.state_info());
             assert_eq!(disk_health_status_color(&ctx, 2), ctx.state_warning());
@@ -4306,7 +4307,11 @@ mod tests {
             let ctx = ThemeContext::new(Theme::builtin(theme_name), 0.0);
             assert_eq!(
                 disk_health_title_color(&ctx, 0),
-                ctx.theme.semantic.subtext0
+                if theme_name == ThemeName::BlackHole {
+                    ctx.theme.semantic.subtext1
+                } else {
+                    ctx.theme.semantic.subtext0
+                }
             );
             assert_eq!(disk_health_title_color(&ctx, 1), ctx.state_info());
             assert_eq!(disk_health_title_color(&ctx, 2), ctx.state_warning());

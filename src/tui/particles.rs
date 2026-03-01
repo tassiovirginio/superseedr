@@ -49,6 +49,13 @@ fn render_particles(
     let density = (base_density / area_scale).clamp(0.001, 0.20);
     let phase = ctx.frame_time * particle.speed.max(0.1) as f64;
     let glow = (particle.intensity as f64).clamp(0.1, 1.0);
+    let field = ParticleField {
+        width,
+        height,
+        phase,
+        density,
+        glow,
+    };
 
     if matches!(particle.profile, ParticleProfile::BlackHole) {
         render_black_hole_particles(f, phase, density, glow, is_foreground);
@@ -62,19 +69,15 @@ fn render_particles(
             let local_y = y - area.top();
             if let Some(cell) = buf.cell_mut((x, y)) {
                 let underlying_fg = cell.fg;
-                if let Some((glyph, color)) = sample_particle(
+                let sample = field.sample(
                     ctx,
                     particle.profile,
                     local_x as f64,
                     local_y as f64,
-                    width,
-                    height,
-                    phase,
-                    density,
-                    glow,
                     underlying_fg,
                     is_foreground,
-                ) {
+                );
+                if let Some((glyph, color)) = sample_particle(sample) {
                     cell.set_symbol(glyph);
                     cell.fg = color;
                 }
@@ -94,6 +97,48 @@ struct BlackHoleBurst {
     spin_speed: f64,
     arm_count: f64,
     color_seed: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ParticleField {
+    width: f64,
+    height: f64,
+    phase: f64,
+    density: f64,
+    glow: f64,
+}
+
+impl ParticleField {
+    fn sample<'a>(
+        self,
+        ctx: &'a ThemeContext,
+        profile: ParticleProfile,
+        x: f64,
+        y: f64,
+        underlying_fg: Color,
+        reactive_tint: bool,
+    ) -> ParticleSample<'a> {
+        ParticleSample {
+            ctx,
+            profile,
+            field: self,
+            x,
+            y,
+            underlying_fg,
+            reactive_tint,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ParticleSample<'a> {
+    ctx: &'a ThemeContext,
+    profile: ParticleProfile,
+    field: ParticleField,
+    x: f64,
+    y: f64,
+    underlying_fg: Color,
+    reactive_tint: bool,
 }
 
 fn render_black_hole_particles(
@@ -232,70 +277,26 @@ fn black_hole_burst_state(width: f64, height: f64, phase: f64) -> BlackHoleBurst
     }
 }
 
-fn sample_particle(
-    ctx: &ThemeContext,
-    profile: ParticleProfile,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    phase: f64,
-    density: f64,
-    glow: f64,
-    underlying_fg: Color,
-    reactive_tint: bool,
-) -> Option<(&'static str, Color)> {
-    match profile {
-        ParticleProfile::Sakura => sample_sakura(
-            ctx,
-            x,
-            y,
-            width,
-            height,
-            phase,
-            density,
-            glow,
-            underlying_fg,
-            reactive_tint,
-        ),
-        ParticleProfile::Matrix => sample_matrix(
-            ctx,
-            x,
-            y,
-            width,
-            height,
-            phase,
-            density,
-            glow,
-            underlying_fg,
-        ),
-        ParticleProfile::Diamond => sample_diamond(ctx, x, y, width, height, phase, density, glow),
-        ParticleProfile::BioluminescentReef => sample_bioluminescent_reef(
-            ctx,
-            x,
-            y,
-            width,
-            height,
-            phase,
-            density,
-            glow,
-            underlying_fg,
-        ),
+fn sample_particle(sample: ParticleSample<'_>) -> Option<(&'static str, Color)> {
+    match sample.profile {
+        ParticleProfile::Sakura => sample_sakura(sample),
+        ParticleProfile::Matrix => sample_matrix(sample),
+        ParticleProfile::Diamond => sample_diamond(sample),
+        ParticleProfile::BioluminescentReef => sample_bioluminescent_reef(sample),
         ParticleProfile::BlackHole => None,
         ParticleProfile::None => None,
     }
 }
 
-fn sample_diamond(
-    ctx: &ThemeContext,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    phase: f64,
-    density: f64,
-    glow: f64,
-) -> Option<(&'static str, Color)> {
+fn sample_diamond(sample: ParticleSample<'_>) -> Option<(&'static str, Color)> {
+    let ctx = sample.ctx;
+    let x = sample.x;
+    let y = sample.y;
+    let width = sample.field.width;
+    let height = sample.field.height;
+    let phase = sample.field.phase;
+    let density = sample.field.density;
+    let glow = sample.field.glow;
     let w = width.max(2.0);
     let h = height.max(2.0);
     let nx = x / (w - 1.0);
@@ -424,18 +425,17 @@ fn sample_diamond(
     ))
 }
 
-fn sample_sakura(
-    ctx: &ThemeContext,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    phase: f64,
-    density: f64,
-    glow: f64,
-    underlying_fg: Color,
-    reactive_tint: bool,
-) -> Option<(&'static str, Color)> {
+fn sample_sakura(sample: ParticleSample<'_>) -> Option<(&'static str, Color)> {
+    let ctx = sample.ctx;
+    let x = sample.x;
+    let y = sample.y;
+    let width = sample.field.width;
+    let height = sample.field.height;
+    let phase = sample.field.phase;
+    let density = sample.field.density;
+    let glow = sample.field.glow;
+    let underlying_fg = sample.underlying_fg;
+    let reactive_tint = sample.reactive_tint;
     let _ = (width, height);
     // Sakura intentionally reuses the original flowers-style motion profile.
     let drift = ((x * 0.12) - (phase * 1.9)).sin() + ((y * 0.07) - (phase * 1.2)).cos();
@@ -474,18 +474,14 @@ fn sample_sakura(
     ))
 }
 
-fn sample_matrix(
-    ctx: &ThemeContext,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    phase: f64,
-    density: f64,
-    glow: f64,
-    underlying_fg: Color,
-) -> Option<(&'static str, Color)> {
-    let _ = (width, underlying_fg);
+fn sample_matrix(sample: ParticleSample<'_>) -> Option<(&'static str, Color)> {
+    let ctx = sample.ctx;
+    let x = sample.x;
+    let y = sample.y;
+    let height = sample.field.height;
+    let phase = sample.field.phase;
+    let density = sample.field.density;
+    let glow = sample.field.glow;
     let h = height.max(2.0);
     let col = x.floor();
 
@@ -554,18 +550,15 @@ fn sample_matrix(
     ))
 }
 
-fn sample_bioluminescent_reef(
-    ctx: &ThemeContext,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    phase: f64,
-    density: f64,
-    glow: f64,
-    underlying_fg: Color,
-) -> Option<(&'static str, Color)> {
-    let _ = underlying_fg;
+fn sample_bioluminescent_reef(sample: ParticleSample<'_>) -> Option<(&'static str, Color)> {
+    let ctx = sample.ctx;
+    let x = sample.x;
+    let y = sample.y;
+    let width = sample.field.width;
+    let height = sample.field.height;
+    let phase = sample.field.phase;
+    let density = sample.field.density;
+    let glow = sample.field.glow;
     let w = width.max(2.0);
     let h = height.max(2.0);
     let nx = x / (w - 1.0);
@@ -616,9 +609,7 @@ fn sample_bioluminescent_reef(
     let pick = hash01(x, y, 0.0, 163.0);
     let glyph = if blob > 0.78 && pick > 0.74 {
         "•"
-    } else if blob > 0.56 && pick > 0.62 {
-        "·"
-    } else if pick > 0.88 {
+    } else if (blob > 0.56 && pick > 0.62) || pick > 0.88 {
         "·"
     } else if pick > 0.56 {
         "."

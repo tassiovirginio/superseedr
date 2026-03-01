@@ -18,7 +18,11 @@ impl NetworkHistoryTelemetry {
             .as_secs();
         let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0);
         let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0);
-        let backoff_ms_max = app_state.disk_backoff_history_ms.back().copied().unwrap_or(0);
+        let backoff_ms_max = app_state
+            .disk_backoff_history_ms
+            .back()
+            .copied()
+            .unwrap_or(0);
         if app_state.network_history_rollups.ingest_second_sample(
             &mut app_state.network_history_state,
             now_unix,
@@ -82,7 +86,10 @@ impl NetworkHistoryTelemetry {
     }
 }
 
-fn merge_tier_points(loaded: Vec<NetworkHistoryPoint>, live: Vec<NetworkHistoryPoint>) -> Vec<NetworkHistoryPoint> {
+fn merge_tier_points(
+    loaded: Vec<NetworkHistoryPoint>,
+    live: Vec<NetworkHistoryPoint>,
+) -> Vec<NetworkHistoryPoint> {
     let mut by_ts = BTreeMap::<u64, NetworkHistoryPoint>::new();
     for point in loaded {
         by_ts.insert(point.ts_unix, point);
@@ -163,12 +170,16 @@ mod tests {
             network_history_dirty: true,
             ..Default::default()
         };
-        app_state.network_history_state.tiers.second_1s.push(NetworkHistoryPoint {
-            ts_unix: 2,
-            download_bps: 100,
-            upload_bps: 10,
-            backoff_ms_max: 1,
-        });
+        app_state
+            .network_history_state
+            .tiers
+            .second_1s
+            .push(NetworkHistoryPoint {
+                ts_unix: 2,
+                download_bps: 100,
+                upload_bps: 10,
+                backoff_ms_max: 1,
+            });
 
         let mut loaded = NetworkHistoryPersistedState::default();
         loaded.tiers.second_1s.push(NetworkHistoryPoint {
@@ -189,7 +200,10 @@ mod tests {
         // ts=2 should come from live value (100), not loaded overlap (150).
         assert_eq!(app_state.avg_download_history, vec![200, 100]);
         assert_eq!(app_state.avg_upload_history, vec![20, 10]);
-        assert_eq!(app_state.disk_backoff_history_ms, VecDeque::from(vec![2, 1]));
+        assert_eq!(
+            app_state.disk_backoff_history_ms,
+            VecDeque::from(vec![2, 1])
+        );
         assert!(app_state.network_history_dirty);
     }
 

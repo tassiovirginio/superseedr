@@ -11,7 +11,9 @@ pub(crate) const MIN_STEP_RATE: f64 = 0.01;
 pub(crate) const MAX_STEP_RATE: f64 = 0.10;
 pub(crate) const BASELINE_ALPHA: f64 = 0.1;
 pub(crate) const REALITY_CHECK_FACTOR: f64 = 2.0;
+#[cfg(test)]
 pub(crate) const DEFAULT_TUNING_CADENCE_SECS: u64 = 90;
+#[cfg(test)]
 pub(crate) const DEFAULT_TUNING_LOOKBACK_SECS: usize = 60;
 pub(crate) const MIN_TUNING_CADENCE_SECS: u64 = 15;
 pub(crate) const MAX_TUNING_CADENCE_SECS: u64 = 180;
@@ -76,6 +78,7 @@ pub(crate) struct TuningController {
 }
 
 impl TuningController {
+    #[cfg(test)]
     pub(crate) fn new_fixed(initial_limits: CalculatedLimits) -> Self {
         Self {
             cadence_secs: DEFAULT_TUNING_CADENCE_SECS,
@@ -266,7 +269,7 @@ impl TuningController {
                 STAGNATION_BACKOFF_FACTOR,
                 ScaleDirection::Up,
             );
-            self.cadence_change_pressure = self.cadence_change_pressure / 2;
+            self.cadence_change_pressure /= 2;
         }
 
         // Decay stale best score toward baseline after sustained non-improvement.
@@ -395,6 +398,7 @@ pub(crate) fn compute_tuning_score(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn evaluate_tuning_cycle(
     current_limits: &CalculatedLimits,
     last_tuning_limits: &CalculatedLimits,
@@ -819,7 +823,6 @@ mod tests {
             assert!(limits.max_connected_peers >= MIN_PEERS);
             assert!(limits.disk_read_permits >= MIN_DISK);
             assert!(limits.disk_write_permits >= MIN_DISK);
-            assert!(limits.reserve_permits >= MIN_RESERVE);
         }
     }
 

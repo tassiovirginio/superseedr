@@ -261,8 +261,8 @@ impl ResourceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -290,7 +290,11 @@ mod tests {
         (client, handle)
     }
 
-    fn create_trial_limits(resource: ResourceType, limit: usize, queue: usize) -> HashMap<ResourceType, (usize, usize)> {
+    fn create_trial_limits(
+        resource: ResourceType,
+        limit: usize,
+        queue: usize,
+    ) -> HashMap<ResourceType, (usize, usize)> {
         let mut limits = create_limits((1, 0), (1, 0), (1, 0));
         match resource {
             ResourceType::PeerConnection => {
@@ -330,7 +334,9 @@ mod tests {
                     }
 
                     let permit_result = match resource {
-                        ResourceType::PeerConnection => worker_client.acquire_peer_connection().await,
+                        ResourceType::PeerConnection => {
+                            worker_client.acquire_peer_connection().await
+                        }
                         ResourceType::DiskRead => worker_client.acquire_disk_read().await,
                         ResourceType::DiskWrite => worker_client.acquire_disk_write().await,
                         ResourceType::Reserve => unreachable!("Reserve is not acquirable"),
@@ -674,9 +680,13 @@ mod tests {
         let baseline_limit = 16;
         let half_limit = baseline_limit / 2;
 
-        let read_baseline = measure_throughput_for_resource(ResourceType::DiskRead, baseline_limit).await;
+        let read_baseline =
+            measure_throughput_for_resource(ResourceType::DiskRead, baseline_limit).await;
         let read_half = measure_throughput_for_resource(ResourceType::DiskRead, half_limit).await;
-        assert!(read_baseline > 0, "Read baseline throughput should be non-zero");
+        assert!(
+            read_baseline > 0,
+            "Read baseline throughput should be non-zero"
+        );
         let read_ratio = read_half as f64 / read_baseline as f64;
         assert!(
             (0.35..=0.75).contains(&read_ratio),
@@ -686,9 +696,13 @@ mod tests {
             read_ratio
         );
 
-        let write_baseline = measure_throughput_for_resource(ResourceType::DiskWrite, baseline_limit).await;
+        let write_baseline =
+            measure_throughput_for_resource(ResourceType::DiskWrite, baseline_limit).await;
         let write_half = measure_throughput_for_resource(ResourceType::DiskWrite, half_limit).await;
-        assert!(write_baseline > 0, "Write baseline throughput should be non-zero");
+        assert!(
+            write_baseline > 0,
+            "Write baseline throughput should be non-zero"
+        );
         let write_ratio = write_half as f64 / write_baseline as f64;
         assert!(
             (0.35..=0.75).contains(&write_ratio),
@@ -704,7 +718,8 @@ mod tests {
         let baseline_limit = 16;
         let half_limit = baseline_limit / 2;
 
-        let baseline = measure_throughput_for_resource(ResourceType::PeerConnection, baseline_limit).await;
+        let baseline =
+            measure_throughput_for_resource(ResourceType::PeerConnection, baseline_limit).await;
         let half = measure_throughput_for_resource(ResourceType::PeerConnection, half_limit).await;
         assert!(baseline > 0, "Peer baseline throughput should be non-zero");
 

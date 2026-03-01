@@ -3881,8 +3881,10 @@ mod tests {
 
     #[test]
     fn network_history_interval_persistence_only_when_dirty() {
-        let mut app_state = AppState::default();
-        app_state.network_history_dirty = false;
+        let mut app_state = AppState {
+            network_history_dirty: false,
+            ..Default::default()
+        };
         assert!(!should_persist_network_history_on_interval(&app_state));
 
         app_state.network_history_dirty = true;
@@ -3893,8 +3895,10 @@ mod tests {
     async fn queue_persistence_payload_carries_network_history_state() {
         let (tx, mut rx) = tokio::sync::watch::channel::<Option<PersistPayload>>(None);
         let mut network_history_state =
-            crate::persistence::network_history::NetworkHistoryPersistedState::default();
-        network_history_state.updated_at_unix = 42;
+            crate::persistence::network_history::NetworkHistoryPersistedState {
+                updated_at_unix: 42,
+                ..Default::default()
+            };
         network_history_state.tiers.second_1s.push(
             crate::persistence::network_history::NetworkHistoryPoint {
                 ts_unix: 41,
