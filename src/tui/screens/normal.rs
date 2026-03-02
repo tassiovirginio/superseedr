@@ -2235,7 +2235,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface1))
         }
     };
-    let use_compact_legend = should_use_compact_peer_activity_legend(
+    let use_compact_legend = should_use_compact_peer_stream_legend(
         area.width.saturating_sub(2) as usize,
         connected_count,
         discovered_count,
@@ -2420,7 +2420,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             Block::default()
                 .title_top(
                     Line::from(Span::styled(
-                        " Peer Activity Stream ",
+                        " Peer Stream ",
                         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                     ))
                     .alignment(Alignment::Left),
@@ -2435,7 +2435,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     f.render_widget(chart, area);
 }
 
-fn should_use_compact_peer_activity_legend(
+fn should_use_compact_peer_stream_legend(
     available_width: usize,
     connected: u64,
     discovered: u64,
@@ -4340,13 +4340,13 @@ mod tests {
     }
 
     #[test]
-    fn peer_activity_legend_compacts_when_width_is_tight() {
-        assert!(should_use_compact_peer_activity_legend(32, 5, 182, 104));
+    fn peer_stream_legend_compacts_when_width_is_tight() {
+        assert!(should_use_compact_peer_stream_legend(32, 5, 182, 104));
     }
 
     #[test]
-    fn peer_activity_legend_stays_verbose_when_width_allows() {
-        assert!(!should_use_compact_peer_activity_legend(90, 5, 182, 104));
+    fn peer_stream_legend_stays_verbose_when_width_allows() {
+        assert!(!should_use_compact_peer_stream_legend(90, 5, 182, 104));
     }
 
     #[tokio::test]

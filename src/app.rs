@@ -774,6 +774,7 @@ pub struct App {
     pub notify_rx: mpsc::Receiver<Result<Event, NotifyError>>,
     pub watcher: RecommendedWatcher,
     pub tuning_controller: TuningController,
+    pub next_tuning_at: time::Instant,
 }
 
 #[derive(Clone)]
@@ -980,6 +981,8 @@ impl App {
 
         let (notify_tx, notify_rx) = mpsc::channel::<Result<Event, NotifyError>>(100);
         let watcher = watcher::create_watcher(&client_configs, notify_tx)?;
+        let initial_tuning_deadline =
+            time::Instant::now() + Duration::from_secs(tuning_controller.cadence_secs());
 
         let mut app = Self {
             app_state,
@@ -1011,6 +1014,7 @@ impl App {
             watcher,
             notify_rx,
             tuning_controller,
+            next_tuning_at: initial_tuning_deadline,
         };
         app.refresh_system_warning();
 
@@ -1092,8 +1096,7 @@ impl App {
         let mut dht_bootstrap_retry_interval = time::interval(Duration::from_secs(60));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
-        let mut next_tuning_at =
-            time::Instant::now() + Duration::from_secs(self.tuning_controller.cadence_secs());
+        self.reschedule_tuning_deadline();
         dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         network_history_persist_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -1112,6 +1115,7 @@ impl App {
                 AppMode::PowerSaving => Duration::from_secs(1), // Force 1 FPS for Zen mode
                 _ => Duration::from_millis(self.app_state.data_rate.as_ms()), // User-defined FPS
             };
+            let next_tuning_at = self.next_tuning_at;
 
             tokio::select! {
                 _ = signal::ctrl_c() => {
@@ -1147,8 +1151,7 @@ impl App {
 
                 _ = time::sleep_until(next_tuning_at) => {
                     self.tuning_resource_limits().await;
-                    next_tuning_at = time::Instant::now()
-                        + Duration::from_secs(self.tuning_controller.cadence_secs());
+                    self.reschedule_tuning_deadline();
                 }
 
                 _ = status_dump_timer.tick(), if output_status_interval > 0 => {
@@ -2311,11 +2314,7 @@ impl App {
         self.tuning_controller.on_second_tick();
         self.app_state.tuning_countdown = self.tuning_controller.countdown_secs();
         if was_seeding != self.app_state.is_seeding {
-            self.app_state.limits =
-                normalize_limits_for_mode(&self.app_state.limits, self.app_state.is_seeding);
-            self.tuning_controller
-                .reset_for_objective_change(&self.app_state.limits);
-            self.sync_tuning_state_from_controller();
+            self.reset_tuning_for_objective_change();
 
             let rm = self.resource_manager.clone();
             let limits_map = self.app_state.limits.clone().into_map();
@@ -2442,6 +2441,20 @@ impl App {
             .resource_manager
             .update_limits(self.app_state.limits.clone().into_map())
             .await;
+    }
+
+    fn reschedule_tuning_deadline(&mut self) {
+        self.next_tuning_at =
+            time::Instant::now() + Duration::from_secs(self.tuning_controller.cadence_secs());
+    }
+
+    fn reset_tuning_for_objective_change(&mut self) {
+        self.app_state.limits =
+            normalize_limits_for_mode(&self.app_state.limits, self.app_state.is_seeding);
+        self.tuning_controller
+            .reset_for_objective_change(&self.app_state.limits);
+        self.sync_tuning_state_from_controller();
+        self.reschedule_tuning_deadline();
     }
 
     fn sync_tuning_state_from_controller(&mut self) {
@@ -3717,6 +3730,9 @@ mod tests {
     };
     use crate::config::TorrentSettings;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::time;
+
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
         let mut display = TorrentDisplayState::default();
         display.latest_state.torrent_name = name.to_string();
@@ -4009,6 +4025,32 @@ mod tests {
         assert!(should_load_persisted_torrent(&running));
         assert!(should_load_persisted_torrent(&paused));
         assert!(!should_load_persisted_torrent(&deleting));
+    }
+
+    #[tokio::test]
+    async fn reset_tuning_for_objective_change_reschedules_deadline() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings).await.expect("build app");
+        app.tuning_controller.on_second_tick();
+        app.app_state.tuning_countdown = app.tuning_controller.countdown_secs();
+        let stale_deadline = time::Instant::now() + Duration::from_secs(300);
+        app.next_tuning_at = stale_deadline;
+
+        app.reset_tuning_for_objective_change();
+
+        let reset_cadence = app.tuning_controller.cadence_secs();
+        let remaining = app
+            .next_tuning_at
+            .saturating_duration_since(time::Instant::now());
+
+        assert_eq!(app.app_state.tuning_countdown, reset_cadence);
+        assert!(app.next_tuning_at < stale_deadline);
+        assert!(remaining <= Duration::from_secs(reset_cadence));
+
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]
