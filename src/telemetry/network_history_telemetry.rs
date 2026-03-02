@@ -174,40 +174,71 @@ fn densify_tier_points(
         return Vec::new();
     }
 
-    let mut dense = Vec::with_capacity(points.len());
-    let mut prev_ts = points[0].ts_unix;
-    dense.push(points[0].clone());
+    let dense_end_ts = densified_end_ts(points[points.len() - 1].ts_unix, step_secs, now_unix);
+    let max_window_span = step_secs.saturating_mul(max_points.saturating_sub(1) as u64);
+    let dense_start_ts = points[0]
+        .ts_unix
+        .max(dense_end_ts.saturating_sub(max_window_span));
 
-    for point in &points[1..] {
-        let mut next_ts = prev_ts.saturating_add(step_secs);
-        while next_ts < point.ts_unix {
+    let mut start_idx = 0;
+    while start_idx < points.len() && points[start_idx].ts_unix < dense_start_ts {
+        start_idx += 1;
+    }
+
+    let mut dense = Vec::with_capacity(max_points);
+    let mut next_ts = dense_start_ts;
+
+    for point in &points[start_idx..] {
+        while next_ts < point.ts_unix && next_ts <= dense_end_ts {
             dense.push(NetworkHistoryPoint {
                 ts_unix: next_ts,
                 ..Default::default()
             });
-            prev_ts = next_ts;
-            next_ts = prev_ts.saturating_add(step_secs);
+            let advanced_ts = next_ts.saturating_add(step_secs);
+            if advanced_ts == next_ts {
+                return dense;
+            }
+            next_ts = advanced_ts;
         }
+
+        if next_ts > dense_end_ts {
+            break;
+        }
+
         dense.push(point.clone());
-        prev_ts = point.ts_unix;
+        if point.ts_unix >= dense_end_ts {
+            return dense;
+        }
+
+        let advanced_ts = point.ts_unix.saturating_add(step_secs);
+        if advanced_ts == point.ts_unix {
+            return dense;
+        }
+        next_ts = advanced_ts;
     }
 
-    let mut next_ts = prev_ts.saturating_add(step_secs);
-    while next_ts <= now_unix {
+    while next_ts <= dense_end_ts {
         dense.push(NetworkHistoryPoint {
             ts_unix: next_ts,
             ..Default::default()
         });
-        prev_ts = next_ts;
-        next_ts = prev_ts.saturating_add(step_secs);
-    }
-
-    if dense.len() > max_points {
-        let overflow = dense.len() - max_points;
-        dense.drain(0..overflow);
+        let advanced_ts = next_ts.saturating_add(step_secs);
+        if advanced_ts == next_ts {
+            break;
+        }
+        next_ts = advanced_ts;
     }
 
     dense
+}
+
+fn densified_end_ts(last_point_ts: u64, step_secs: u64, now_unix: u64) -> u64 {
+    if last_point_ts >= now_unix {
+        return last_point_ts;
+    }
+
+    let trailing_steps = (now_unix - last_point_ts) / step_secs;
+    last_point_ts.saturating_add(trailing_steps.saturating_mul(step_secs))
 }
 
 fn densify_state_for_restore(
@@ -236,8 +267,8 @@ fn densify_state_for_restore(
 #[cfg(test)]
 mod tests {
     use super::{
-        densify_state_for_restore, merge_state_for_late_restore, merge_tier_points,
-        NetworkHistoryTelemetry,
+        densify_state_for_restore, densify_tier_points, merge_state_for_late_restore,
+        merge_tier_points, NetworkHistoryTelemetry,
     };
     use crate::app::AppState;
     use crate::persistence::network_history::{NetworkHistoryPersistedState, NetworkHistoryPoint};
@@ -387,6 +418,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![600, 0, 300, 0]
         );
+    }
+
+    #[test]
+    fn densify_tier_points_limits_sparse_tail_fill_to_retention_window() {
+        let dense = densify_tier_points(
+            &[NetworkHistoryPoint {
+                ts_unix: 1,
+                download_bps: 200,
+                upload_bps: 20,
+                backoff_ms_max: 2,
+            }],
+            1,
+            4,
+            1_000_000,
+        );
+
+        assert_eq!(
+            dense.iter().map(|point| point.ts_unix).collect::<Vec<_>>(),
+            vec![999_997, 999_998, 999_999, 1_000_000]
+        );
+        assert!(dense.iter().all(|point| point.download_bps == 0));
+        assert!(dense.iter().all(|point| point.upload_bps == 0));
+        assert!(dense.iter().all(|point| point.backoff_ms_max == 0));
     }
 
     #[test]
