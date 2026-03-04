@@ -2147,6 +2147,7 @@ impl TorrentManager {
                 torrent_name: torrent_name_clone,
                 download_path: self.state.torrent_data_path.clone(),
                 container_name: self.state.container_name.clone(),
+                file_count: Some(multi_file_info.files.len()),
                 data_available: self.state.data_available,
                 number_of_successfully_connected_peers,
                 number_of_pieces_total,

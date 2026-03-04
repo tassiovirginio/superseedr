@@ -155,6 +155,7 @@ impl UiTelemetry {
             display_state.latest_state.torrent_name = message.torrent_name;
         }
         display_state.latest_state.container_name = message.container_name;
+        display_state.latest_state.file_count = message.file_count;
         display_state.latest_state.total_size = message.total_size;
         display_state.latest_state.bytes_written = message.bytes_written;
 
@@ -581,6 +582,7 @@ mod tests {
         let mut message = TorrentMetrics {
             info_hash: vec![7; 20],
             torrent_name: "test".to_string(),
+            file_count: Some(3),
             number_of_pieces_total: 10,
             number_of_pieces_completed: 3,
             download_speed_bps: 512,
@@ -601,6 +603,7 @@ mod tests {
         assert_eq!(app_state.session_total_uploaded, 16);
 
         let state = app_state.torrents.get(&vec![7; 20]).unwrap();
+        assert_eq!(state.latest_state.file_count, Some(3));
         assert_eq!(state.latest_state.download_speed_bps, 512);
         assert_eq!(state.latest_state.upload_speed_bps, 128);
         assert_eq!(state.download_history.len(), 1);

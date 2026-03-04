@@ -1240,9 +1240,12 @@ pub fn draw_details_panel(
     f.render_widget(details_block, details_text_chunk);
 
     if let Some(panel) = critical_panel {
-        let mut text_parts = panel.text.splitn(2, "\n\n");
+        let mut text_parts = panel.text.splitn(2, '\n');
         let headline = text_parts.next().unwrap_or_default();
-        let body = text_parts.next().unwrap_or_default();
+        let body = text_parts
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches('\n');
         let critical_chunks = ratatui::layout::Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1251,7 +1254,7 @@ pub fn draw_details_panel(
         .split(details_inner_chunk);
 
         f.render_widget(
-            Paragraph::new(headline).alignment(Alignment::Center).style(
+            Paragraph::new(headline).style(
                 ctx.apply(
                     Style::default()
                         .fg(ctx.state_error())
@@ -1558,7 +1561,15 @@ fn selected_torrent_critical_details(
 
     Some(CriticalDetailsPanel {
         title: "Critical",
-        text: format!("DATA UNAVAILABLE ({})\n\n{}", issue_count, display_path),
+        text: format!(
+            "DATA UNAVAILABLE ({})\nFiles Check: {}\n\n{}",
+            issue_count,
+            torrent
+                .integrity_next_probe_in
+                .map(format_countdown)
+                .unwrap_or_else(|| "-".to_string()),
+            display_path
+        ),
     })
 }
 
@@ -3939,6 +3950,7 @@ mod tests {
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
     use crate::theme::{Theme, ThemeContext, ThemeName};
+    use std::time::Duration;
 
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
         let mut metrics = TorrentMetrics::default();
@@ -4286,6 +4298,7 @@ mod tests {
     fn critical_details_panel_returns_simple_text_for_unavailable_data() {
         let mut torrent = create_mock_display_state(0);
         torrent.latest_state.data_available = false;
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(5));
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
@@ -4305,6 +4318,7 @@ mod tests {
             .expect("critical panel should be present for unavailable data");
         assert_eq!(panel.title, "Critical");
         assert!(panel.text.contains("DATA UNAVAILABLE (1)"));
+        assert!(panel.text.contains("Files Check: 5s"));
         assert!(panel.text.contains("/downloads/sample/missing.bin"));
     }
 
@@ -4312,6 +4326,7 @@ mod tests {
     fn critical_details_panel_masks_path_when_anonymized() {
         let mut torrent = create_mock_display_state(0);
         torrent.latest_state.data_available = false;
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(5));
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
@@ -4331,6 +4346,7 @@ mod tests {
             .expect("critical panel should be present for unavailable data");
         assert_eq!(panel.title, "Critical");
         assert!(panel.text.contains("DATA UNAVAILABLE (1)"));
+        assert!(panel.text.contains("Files Check: 5s"));
         assert!(panel.text.contains("/path/to/torrent/file"));
         assert!(!panel.text.contains("/downloads/sample/missing.bin"));
     }

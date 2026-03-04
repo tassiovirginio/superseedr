@@ -13,8 +13,10 @@ const MAX_IN_FLIGHT_PROBE_BATCHES: usize = 2;
 const PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const PENDING_METADATA_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const SMALL_MANIFEST_FILE_COUNT_THRESHOLD: usize = 1_000;
+const SMALL_MANIFEST_HEALTHY_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const ACTIVE_HEALTHY_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const IDLE_HEALTHY_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const IDLE_HEALTHY_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DISPATCH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,7 @@ pub enum IntegrityPriorityClass {
 pub struct TorrentIntegritySnapshot {
     pub info_hash: Vec<u8>,
     pub data_available: bool,
+    pub file_count: Option<usize>,
     pub download_path: Option<PathBuf>,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
@@ -64,6 +67,7 @@ struct IntegrityTorrentState {
     availability: DataAvailabilityState,
     has_completed_probe: bool,
     is_active: bool,
+    file_count: Option<usize>,
     download_path: Option<PathBuf>,
     next_due_at: Instant,
     last_probe_started_at: Option<Instant>,
@@ -82,6 +86,7 @@ impl IntegrityTorrentState {
             availability: DataAvailabilityState::Unknown,
             has_completed_probe: false,
             is_active: false,
+            file_count: None,
             download_path: None,
             next_due_at: now,
             last_probe_started_at: None,
@@ -104,9 +109,23 @@ impl IntegrityTorrentState {
         self.next_due_at = now
             + match self.priority_class() {
                 IntegrityPriorityClass::Recovery => RECOVERY_RETRY_INTERVAL,
-                IntegrityPriorityClass::ActiveHealthy => ACTIVE_HEALTHY_RETRY_INTERVAL,
-                IntegrityPriorityClass::IdleHealthy => IDLE_HEALTHY_RETRY_INTERVAL,
+                IntegrityPriorityClass::ActiveHealthy | IntegrityPriorityClass::IdleHealthy => {
+                    self.healthy_retry_interval()
+                }
             };
+    }
+
+    fn healthy_retry_interval(&self) -> Duration {
+        if self
+            .file_count
+            .is_some_and(|count| count < SMALL_MANIFEST_FILE_COUNT_THRESHOLD)
+        {
+            SMALL_MANIFEST_HEALTHY_RETRY_INTERVAL
+        } else if self.is_active {
+            ACTIVE_HEALTHY_RETRY_INTERVAL
+        } else {
+            IDLE_HEALTHY_RETRY_INTERVAL
+        }
     }
 }
 
@@ -144,6 +163,7 @@ impl IntegrityScheduler {
                 .or_insert_with(|| IntegrityTorrentState::new(self.now));
 
             state.is_active = snapshot.download_speed_bps > 0 || snapshot.upload_speed_bps > 0;
+            state.file_count = snapshot.file_count;
             state.download_path = snapshot.download_path;
 
             if !snapshot.data_available {
@@ -169,6 +189,16 @@ impl IntegrityScheduler {
             .values()
             .filter(|state| state.in_flight)
             .count();
+    }
+
+    pub fn next_probe_in(&self, info_hash: &[u8]) -> Option<Duration> {
+        self.torrents.get(info_hash).map(|state| {
+            if state.in_flight || state.next_due_at <= self.now {
+                Duration::ZERO
+            } else {
+                state.next_due_at.saturating_duration_since(self.now)
+            }
+        })
     }
 
     pub fn on_metadata_loaded(&mut self, info_hash: &[u8]) {
@@ -356,6 +386,7 @@ mod tests {
     fn snapshot(
         info_hash: &[u8],
         data_available: bool,
+        file_count: Option<usize>,
         download_path: Option<&str>,
         download_speed_bps: u64,
         upload_speed_bps: u64,
@@ -363,6 +394,7 @@ mod tests {
         TorrentIntegritySnapshot {
             info_hash: info_hash.to_vec(),
             data_available,
+            file_count,
             download_path: download_path.map(PathBuf::from),
             download_speed_bps,
             upload_speed_bps,
@@ -387,8 +419,8 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
         scheduler.sync_torrents([
-            snapshot(b"healthy", true, Some("/downloads/a"), 0, 0),
-            snapshot(b"recovery", false, Some("/downloads/b"), 0, 0),
+            snapshot(b"healthy", true, None, Some("/downloads/a"), 0, 0),
+            snapshot(b"recovery", false, None, Some("/downloads/b"), 0, 0),
         ]);
 
         let requests = scheduler.drain_due_probe_requests();
@@ -402,7 +434,7 @@ mod tests {
     fn partial_batch_keeps_sweep_in_progress() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
-        scheduler.sync_torrents([snapshot(b"sample", false, Some("/downloads"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(b"sample", false, None, Some("/downloads"), 0, 0)]);
 
         let request = scheduler
             .drain_due_probe_requests()
@@ -436,7 +468,7 @@ mod tests {
     fn completed_healthy_sweep_waits_for_retry_interval() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
-        scheduler.sync_torrents([snapshot(b"idle", true, Some("/downloads"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(b"idle", true, None, Some("/downloads"), 0, 0)]);
 
         let request = scheduler
             .drain_due_probe_requests()
@@ -475,7 +507,14 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
         let total_files = 1_000_000usize;
-        scheduler.sync_torrents([snapshot(b"large", false, Some("/downloads/large"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(
+            b"large",
+            false,
+            Some(total_files),
+            Some("/downloads/large"),
+            0,
+            0,
+        )]);
 
         let mut expected_start = 0usize;
         let mut completed = false;
@@ -522,9 +561,9 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
         scheduler.sync_torrents([
-            snapshot(b"faulted", true, Some("/downloads/shared"), 0, 0),
-            snapshot(b"sibling", true, Some("/downloads/shared"), 0, 0),
-            snapshot(b"other", true, Some("/downloads/other"), 0, 0),
+            snapshot(b"faulted", true, None, Some("/downloads/shared"), 0, 0),
+            snapshot(b"sibling", true, None, Some("/downloads/shared"), 0, 0),
+            snapshot(b"other", true, None, Some("/downloads/other"), 0, 0),
         ]);
 
         let mut settled = HashSet::new();
@@ -566,7 +605,14 @@ mod tests {
     fn stale_batch_result_is_ignored_after_fault_epoch_bump() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
-        scheduler.sync_torrents([snapshot(b"faulted", true, Some("/downloads/shared"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(
+            b"faulted",
+            true,
+            None,
+            Some("/downloads/shared"),
+            0,
+            0,
+        )]);
 
         let request = scheduler
             .drain_due_probe_requests()
@@ -602,7 +648,14 @@ mod tests {
     fn timed_out_probe_batch_is_reclaimed_and_reissued_from_start() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
-        scheduler.sync_torrents([snapshot(b"stalled", true, Some("/downloads/shared"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(
+            b"stalled",
+            true,
+            None,
+            Some("/downloads/shared"),
+            0,
+            0,
+        )]);
 
         let request = scheduler
             .drain_due_probe_requests()
@@ -630,7 +683,14 @@ mod tests {
     fn stale_batch_result_is_ignored_after_timeout_epoch_bump() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
-        scheduler.sync_torrents([snapshot(b"stalled", true, Some("/downloads/shared"), 0, 0)]);
+        scheduler.sync_torrents([snapshot(
+            b"stalled",
+            true,
+            None,
+            Some("/downloads/shared"),
+            0,
+            0,
+        )]);
 
         let request = scheduler
             .drain_due_probe_requests()
@@ -676,5 +736,93 @@ mod tests {
                 problem_files: Vec::new()
             })
         );
+    }
+
+    #[test]
+    fn small_manifest_healthy_sweep_retries_after_sixty_seconds() {
+        let now = Instant::now();
+        let mut scheduler = IntegrityScheduler::new(now);
+        scheduler.sync_torrents([snapshot(
+            b"small",
+            true,
+            Some(SMALL_MANIFEST_FILE_COUNT_THRESHOLD - 1),
+            Some("/downloads/small"),
+            0,
+            0,
+        )]);
+
+        let request = scheduler
+            .drain_due_probe_requests()
+            .into_iter()
+            .next()
+            .expect("expected initial request");
+
+        let outcome = scheduler.on_probe_batch_result(
+            b"small",
+            FileProbeBatchResult {
+                epoch: request.epoch,
+                scanned_files: 1,
+                next_file_index: 0,
+                reached_end_of_manifest: true,
+                pending_metadata: false,
+                problem_files: Vec::new(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            Some(ProbeBatchOutcome::CompletedSweep {
+                problem_files: Vec::new()
+            })
+        );
+
+        scheduler.advance_time(SMALL_MANIFEST_HEALTHY_RETRY_INTERVAL - Duration::from_secs(1));
+        assert!(scheduler.drain_due_probe_requests().is_empty());
+
+        scheduler.advance_time(Duration::from_secs(1));
+        assert_eq!(scheduler.drain_due_probe_requests().len(), 1);
+    }
+
+    #[test]
+    fn large_active_manifest_keeps_standard_healthy_retry_interval() {
+        let now = Instant::now();
+        let mut scheduler = IntegrityScheduler::new(now);
+        scheduler.sync_torrents([snapshot(
+            b"active-large",
+            true,
+            Some(SMALL_MANIFEST_FILE_COUNT_THRESHOLD),
+            Some("/downloads/large"),
+            1,
+            0,
+        )]);
+
+        let request = scheduler
+            .drain_due_probe_requests()
+            .into_iter()
+            .next()
+            .expect("expected initial request");
+
+        let outcome = scheduler.on_probe_batch_result(
+            b"active-large",
+            FileProbeBatchResult {
+                epoch: request.epoch,
+                scanned_files: 1,
+                next_file_index: 0,
+                reached_end_of_manifest: true,
+                pending_metadata: false,
+                problem_files: Vec::new(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            Some(ProbeBatchOutcome::CompletedSweep {
+                problem_files: Vec::new()
+            })
+        );
+
+        scheduler.advance_time(ACTIVE_HEALTHY_RETRY_INTERVAL - Duration::from_secs(1));
+        assert!(scheduler.drain_due_probe_requests().is_empty());
+
+        scheduler.advance_time(Duration::from_secs(1));
+        assert_eq!(scheduler.drain_due_probe_requests().len(), 1);
     }
 }

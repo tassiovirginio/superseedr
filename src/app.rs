@@ -490,6 +490,7 @@ pub struct TorrentMetrics {
     pub torrent_name: String,
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
+    pub file_count: Option<usize>,
     pub file_priorities: HashMap<usize, FilePriority>,
     pub data_available: bool,
     pub number_of_successfully_connected_peers: usize,
@@ -529,6 +530,7 @@ impl Default for TorrentMetrics {
             torrent_name: String::new(),
             download_path: None,
             container_name: None,
+            file_count: None,
             file_priorities: HashMap::new(),
             data_available: true,
             number_of_successfully_connected_peers: 0,
@@ -558,6 +560,7 @@ impl Default for TorrentMetrics {
 pub struct TorrentDisplayState {
     pub latest_state: TorrentMetrics,
     pub latest_file_probe_status: Option<TorrentFileProbeStatus>,
+    pub integrity_next_probe_in: Option<Duration>,
     pub download_history: Vec<u64>,
     pub upload_history: Vec<u64>,
 
@@ -2316,6 +2319,10 @@ impl App {
                 self.integrity_scheduler.on_metadata_loaded(&info_hash);
                 self.dispatch_integrity_probe_batches();
 
+                if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
+                    display.latest_state.file_count = Some(torrent_file_count(&torrent));
+                }
+
                 if let FileBrowserMode::DownloadLocSelection {
                     preview_tree,
                     preview_state,
@@ -2729,6 +2736,7 @@ impl App {
                 Some(TorrentIntegritySnapshot {
                     info_hash: info_hash.clone(),
                     data_available: torrent.latest_state.data_available,
+                    file_count: torrent.latest_state.file_count,
                     download_path: torrent.latest_state.download_path.clone(),
                     download_speed_bps: torrent.latest_state.download_speed_bps,
                     upload_speed_bps: torrent.latest_state.upload_speed_bps,
@@ -2760,11 +2768,32 @@ impl App {
                     .on_dispatch_failed(&request.info_hash),
             }
         }
+
+        self.sync_integrity_probe_deadlines();
     }
 
     fn advance_integrity_scheduler(&mut self, dt: Duration) {
         self.integrity_scheduler.advance_time(dt);
         self.dispatch_integrity_probe_batches();
+    }
+
+    fn sync_integrity_probe_deadlines(&mut self) {
+        let probe_deadlines: Vec<(Vec<u8>, Option<Duration>)> = self
+            .app_state
+            .torrents
+            .keys()
+            .cloned()
+            .map(|info_hash| {
+                let next_probe_in = self.integrity_scheduler.next_probe_in(&info_hash);
+                (info_hash, next_probe_in)
+            })
+            .collect();
+
+        for (info_hash, next_probe_in) in probe_deadlines {
+            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                torrent.integrity_next_probe_in = next_probe_in;
+            }
+        }
     }
 
     // Constantly ensures all table selected indices are in-bounds
@@ -2989,6 +3018,7 @@ impl App {
                 torrent_name: torrent.info.name.clone(),
                 download_path: download_path.clone(),
                 container_name: container_name.clone(),
+                file_count: Some(torrent_file_count(&torrent)),
                 number_of_pieces_total,
                 file_priorities: file_priorities.clone(),
                 ..Default::default()
@@ -3115,6 +3145,7 @@ impl App {
                 torrent_name: resolved_name,
                 download_path: download_path.clone(),
                 container_name: container_name.clone(),
+                file_count: None,
                 ..Default::default()
             },
             ..Default::default()
@@ -3724,6 +3755,14 @@ fn resolve_magnet_torrent_name(
 
     extract_magnet_display_name(magnet_link)
         .unwrap_or_else(|| format!("Magnet {}", hex::encode(info_hash)))
+}
+
+fn torrent_file_count(torrent: &crate::torrent_file::Torrent) -> usize {
+    if torrent.info.files.is_empty() {
+        1
+    } else {
+        torrent.info.files.len()
+    }
 }
 
 fn extract_magnet_display_name(magnet_link: &str) -> Option<String> {
