@@ -937,12 +937,13 @@ pub fn draw_footer(
     let mut used_width = 0usize;
 
     let manual_key = "[m]";
+    let manual_fallback_suffix = "anual";
     let manual_suffix = if app_state.system_warning.is_some() {
         "anual (warning)"
     } else {
-        "anual"
+        manual_fallback_suffix
     };
-    let manual_min_width = footer_command_len(manual_key, "");
+    let manual_min_width = footer_command_len(manual_key, manual_fallback_suffix);
 
     let mut push_if_fits = |key: &'static str, suffix: &'static str, key_style: Style| {
         let separator_width = if used_width == 0 { 0 } else { 3 };
@@ -1078,7 +1079,7 @@ pub fn draw_footer(
             &mut used_width,
             max_width,
             manual_key,
-            "anual",
+            manual_fallback_suffix,
             ctx.apply(Style::default().fg(ctx.accent_teal())),
         );
     }
