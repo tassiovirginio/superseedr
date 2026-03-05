@@ -23,6 +23,27 @@ This design also leaves a clear path for future random small hash audits:
 - No user-facing scheduler config section in `settings.toml`.
 - No separate background-read permit class for now.
 
+## Progress Update (March 5, 2026)
+
+### Implemented
+- Phases 1-3 are complete and releaseable.
+- App-owned integrity scheduler is in place with explicit scheduler time and bounded batch dispatch.
+- Manager probe API is batch-based (`ProbeFileBatch` / `FileProbeBatchResult`) and returns problem files only.
+- Availability is computed on completed full-manifest passes (partial clean batches do not clear unavailable state).
+- Transition-only availability logging is in place (unavailable/recovered).
+- Foreground read faults now trigger immediate scheduler recovery handling and same-download-path fanout probing.
+- In-flight probe batch lease timeout reclaim is in place (with epoch bump to ignore stale late results).
+- Small-manifest healthy cadence rule is in place (`file_count < 1000` uses `60s` healthy revisit).
+- `file_count` is now plumbed through `TorrentMetrics` so scheduler policy can use it.
+
+### Implemented But Out Of Original Phase Scope
+- Critical details panel in TUI now shows unavailable state with a live `Files Check` countdown.
+
+### Remaining
+- Phase 4: load-aware throttling (suppress/deprioritize healthy background probes under heavy foreground activity).
+- Phase 5: hash audit extension (`HashAuditBatch`, byte budgets, and scheduler policy for hash sampling).
+- Optional follow-up hardening: per-storage-root fairness and richer scheduler observability metrics.
+
 ## High-Level Design
 
 ### 1. Add a dedicated integrity scheduler module
@@ -325,29 +346,29 @@ Rules:
 
 ## Implementation Steps
 
-### Phase 1. Introduce scheduler scaffolding
+### Phase 1. Introduce scheduler scaffolding (Status: Done)
 - Add `integrity_scheduler` module.
 - Add app-owned per-torrent scheduler state.
 - Keep current availability policy and logs.
 - Replace `request_torrent_file_probes()` timer behavior with scheduler tick wiring.
 
-### Phase 2. Convert manager API to batch probing
+### Phase 2. Convert manager API to batch probing (Status: Done)
 - Replace `ManagerCommand::ProbeFiles` with `ProbeFileBatch`.
 - Replace `ManagerEvent::FileProbeStatus` with `FileProbeBatchResult`.
 - Refactor manager probing to return bounded slices and cursor progress.
 - Preserve current problem-file detection logic and `StorageError` payloads.
 
-### Phase 3. Add completed-sweep availability semantics
+### Phase 3. Add completed-sweep availability semantics (Status: Done)
 - Accumulate problem files over a full pass.
 - Only update availability on completed-pass boundaries.
 - Preserve transition-only logging.
 
-### Phase 4. Add load-aware throttling
+### Phase 4. Add load-aware throttling (Status: Not Started)
 - Feed scheduler recent app/system activity signals.
 - Suppress healthy probing under heavy load.
 - Guarantee a small minimum budget for recovery class.
 
-### Phase 5. Future hash audit extension
+### Phase 5. Future hash audit extension (Status: Not Started)
 - Add `HashAuditBatch`.
 - Use existing `DiskRead` permits in manager.
 - Add scheduler byte budgets and idle-only policy.
