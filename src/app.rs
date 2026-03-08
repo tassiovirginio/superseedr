@@ -114,6 +114,7 @@ pub const RSS_MAX_TORRENT_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
+const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
 #[derive(serde::Deserialize)]
 struct CratesResponse {
@@ -1600,7 +1601,7 @@ impl App {
         let resource_manager_clone = self.resource_manager.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let _session_permit = tokio::select! {
+            let Some(_session_permit) = (tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
                         Ok(permit) => Some(permit),
@@ -1613,9 +1614,18 @@ impl App {
                 _ = permit_shutdown_rx.recv() => {
                     None
                 }
+            }) else {
+                return;
             };
             let mut buffer = vec![0u8; 68];
-            if (stream.read_exact(&mut buffer).await).is_ok() {
+            if matches!(
+                time::timeout(
+                    Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
+                    stream.read_exact(&mut buffer)
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
                 let peer_info_hash = &buffer[28..48];
 
                 if let Some(torrent_manager_tx) =
