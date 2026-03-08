@@ -19,11 +19,8 @@ pub struct ActivityHistoryTelemetry;
 impl ActivityHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
         let now_unix = current_unix_time();
-        let active_torrent_keys: HashSet<String> = app_state
-            .torrents
-            .keys()
-            .map(|info_hash| hex::encode(info_hash))
-            .collect();
+        let active_torrent_keys: HashSet<String> =
+            app_state.torrents.keys().map(hex::encode).collect();
         let torrent_samples: Vec<(String, u64, u64)> = app_state
             .torrents
             .iter()
@@ -668,14 +665,18 @@ mod tests {
         let hidden_hash = vec![2; 20];
         let hidden_key = hex::encode(&hidden_hash);
 
-        let mut visible = TorrentDisplayState::default();
-        visible.smoothed_download_speed_bps = 10;
-        visible.smoothed_upload_speed_bps = 5;
+        let visible = TorrentDisplayState {
+            smoothed_download_speed_bps: 10,
+            smoothed_upload_speed_bps: 5,
+            ..Default::default()
+        };
         app_state.torrents.insert(visible_hash.clone(), visible);
 
-        let mut hidden = TorrentDisplayState::default();
-        hidden.smoothed_download_speed_bps = 20;
-        hidden.smoothed_upload_speed_bps = 8;
+        let hidden = TorrentDisplayState {
+            smoothed_download_speed_bps: 20,
+            smoothed_upload_speed_bps: 8,
+            ..Default::default()
+        };
         app_state.torrents.insert(hidden_hash.clone(), hidden);
 
         app_state.torrent_list_order = vec![visible_hash];
