@@ -38,7 +38,7 @@ pub struct TorrentIntegritySnapshot {
     pub info_hash: Vec<u8>,
     pub data_available: bool,
     pub file_count: Option<usize>,
-    pub download_path: Option<PathBuf>,
+    pub saved_location: Option<PathBuf>,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
 }
@@ -68,7 +68,7 @@ struct IntegrityTorrentState {
     has_completed_probe: bool,
     is_active: bool,
     file_count: Option<usize>,
-    download_path: Option<PathBuf>,
+    saved_location: Option<PathBuf>,
     next_due_at: Instant,
     last_probe_started_at: Option<Instant>,
     last_probe_completed_at: Option<Instant>,
@@ -87,7 +87,7 @@ impl IntegrityTorrentState {
             has_completed_probe: false,
             is_active: false,
             file_count: None,
-            download_path: None,
+            saved_location: None,
             next_due_at: now,
             last_probe_started_at: None,
             last_probe_completed_at: None,
@@ -191,7 +191,7 @@ impl IntegrityScheduler {
 
             state.is_active = snapshot.download_speed_bps > 0 || snapshot.upload_speed_bps > 0;
             state.file_count = snapshot.file_count;
-            state.download_path = snapshot.download_path;
+            state.saved_location = snapshot.saved_location;
 
             if !snapshot.data_available {
                 state.availability = DataAvailabilityState::Unavailable;
@@ -242,18 +242,18 @@ impl IntegrityScheduler {
     }
 
     pub fn on_data_availability_fault(&mut self, info_hash: &[u8]) {
-        let shared_download_path = self
+        let shared_saved_location = self
             .torrents
             .get(info_hash)
-            .and_then(|state| state.download_path.clone());
+            .and_then(|state| state.saved_location.clone());
 
         for (torrent_info_hash, state) in &mut self.torrents {
             let same_torrent = torrent_info_hash.as_slice() == info_hash;
-            let same_download_path = shared_download_path
+            let same_saved_location = shared_saved_location
                 .as_ref()
-                .is_some_and(|path| state.download_path.as_ref() == Some(path));
+                .is_some_and(|path| state.saved_location.as_ref() == Some(path));
 
-            if same_torrent || same_download_path {
+            if same_torrent || same_saved_location {
                 state.probe_epoch = state.probe_epoch.saturating_add(1);
                 if state.in_flight {
                     state.in_flight = false;
@@ -418,7 +418,7 @@ mod tests {
         info_hash: &[u8],
         data_available: bool,
         file_count: Option<usize>,
-        download_path: Option<&str>,
+        saved_location: Option<&str>,
         download_speed_bps: u64,
         upload_speed_bps: u64,
     ) -> TorrentIntegritySnapshot {
@@ -426,7 +426,7 @@ mod tests {
             info_hash: info_hash.to_vec(),
             data_available,
             file_count,
-            download_path: download_path.map(PathBuf::from),
+            saved_location: saved_location.map(PathBuf::from),
             download_speed_bps,
             upload_speed_bps,
         }
@@ -588,13 +588,27 @@ mod tests {
     }
 
     #[test]
-    fn data_fault_schedules_same_download_path_immediately() {
+    fn data_fault_schedules_same_saved_location_immediately() {
         let now = Instant::now();
         let mut scheduler = IntegrityScheduler::new(now);
         scheduler.sync_torrents([
-            snapshot(b"faulted", true, None, Some("/downloads/shared"), 0, 0),
-            snapshot(b"sibling", true, None, Some("/downloads/shared"), 0, 0),
-            snapshot(b"other", true, None, Some("/downloads/other"), 0, 0),
+            snapshot(
+                b"faulted",
+                true,
+                None,
+                Some("/downloads/shared/faulted"),
+                0,
+                0,
+            ),
+            snapshot(
+                b"sibling",
+                true,
+                None,
+                Some("/downloads/shared/faulted"),
+                0,
+                0,
+            ),
+            snapshot(b"other", true, None, Some("/downloads/shared/other"), 0, 0),
         ]);
 
         let mut settled = HashSet::new();
@@ -630,6 +644,56 @@ mod tests {
         assert!(!follow_up
             .iter()
             .any(|request| request.info_hash == b"other".to_vec()));
+    }
+
+    #[test]
+    fn data_fault_does_not_schedule_other_torrents_with_only_shared_root() {
+        let now = Instant::now();
+        let mut scheduler = IntegrityScheduler::new(now);
+        scheduler.sync_torrents([
+            snapshot(
+                b"faulted",
+                true,
+                None,
+                Some("/downloads/shared/faulted"),
+                0,
+                0,
+            ),
+            snapshot(
+                b"sibling",
+                true,
+                None,
+                Some("/downloads/shared/sibling"),
+                0,
+                0,
+            ),
+        ]);
+
+        let mut settled = HashSet::new();
+        while settled.len() < 2 {
+            let requests = scheduler.drain_due_probe_requests();
+            assert!(!requests.is_empty());
+
+            for request in requests {
+                settled.insert(request.info_hash.clone());
+                let _ = scheduler.on_probe_batch_result(
+                    &request.info_hash,
+                    FileProbeBatchResult {
+                        epoch: request.epoch,
+                        scanned_files: 1,
+                        next_file_index: 0,
+                        reached_end_of_manifest: true,
+                        pending_metadata: false,
+                        problem_files: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        scheduler.on_data_availability_fault(b"faulted");
+        let follow_up = scheduler.drain_due_probe_requests();
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(follow_up[0].info_hash, b"faulted".to_vec());
     }
 
     #[test]

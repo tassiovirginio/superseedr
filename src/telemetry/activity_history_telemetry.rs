@@ -20,9 +20,20 @@ impl ActivityHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
         let now_unix = current_unix_time();
         let active_torrent_keys: HashSet<String> = app_state
-            .torrent_list_order
+            .torrents
+            .keys()
+            .map(|info_hash| hex::encode(info_hash))
+            .collect();
+        let torrent_samples: Vec<(String, u64, u64)> = app_state
+            .torrents
             .iter()
-            .map(hex::encode)
+            .map(|(info_hash, torrent)| {
+                (
+                    hex::encode(info_hash),
+                    torrent.smoothed_download_speed_bps,
+                    torrent.smoothed_upload_speed_bps,
+                )
+            })
             .collect();
 
         retain_only_torrent_series_for_keys(
@@ -68,19 +79,7 @@ impl ActivityHistoryTelemetry {
                 tuning_best,
             );
 
-        for info_hash in &app_state.torrent_list_order {
-            let key = hex::encode(info_hash);
-            let (dl_bps, ul_bps) = app_state
-                .torrents
-                .get(info_hash)
-                .map(|torrent| {
-                    (
-                        torrent.smoothed_download_speed_bps,
-                        torrent.smoothed_upload_speed_bps,
-                    )
-                })
-                .unwrap_or((0, 0));
-
+        for (key, dl_bps, ul_bps) in torrent_samples {
             let series = app_state
                 .activity_history_state
                 .torrents
@@ -258,7 +257,7 @@ mod tests {
         densify_state_for_restore, densify_tier_points, merge_state_for_late_restore,
         ActivityHistoryTelemetry,
     };
-    use crate::app::AppState;
+    use crate::app::{AppState, TorrentDisplayState};
     use crate::persistence::activity_history::{
         ActivityHistoryPersistedState, ActivityHistoryPoint, ActivityHistoryRollupSnapshot,
         ActivityHistorySeries, ActivityHistoryTiers, PersistedRollupAccumulator,
@@ -660,5 +659,56 @@ mod tests {
             app_state.activity_history_state.cpu.tiers.hour_1h[0].secondary,
             4
         );
+    }
+
+    #[test]
+    fn second_tick_keeps_hidden_torrent_history_when_ui_filter_is_active() {
+        let mut app_state = AppState::default();
+        let visible_hash = vec![1; 20];
+        let hidden_hash = vec![2; 20];
+        let hidden_key = hex::encode(&hidden_hash);
+
+        let mut visible = TorrentDisplayState::default();
+        visible.smoothed_download_speed_bps = 10;
+        visible.smoothed_upload_speed_bps = 5;
+        app_state.torrents.insert(visible_hash.clone(), visible);
+
+        let mut hidden = TorrentDisplayState::default();
+        hidden.smoothed_download_speed_bps = 20;
+        hidden.smoothed_upload_speed_bps = 8;
+        app_state.torrents.insert(hidden_hash.clone(), hidden);
+
+        app_state.torrent_list_order = vec![visible_hash];
+        app_state.activity_history_state.torrents.insert(
+            hidden_key.clone(),
+            ActivityHistorySeries {
+                tiers: ActivityHistoryTiers {
+                    second_1s: vec![ActivityHistoryPoint {
+                        ts_unix: 1,
+                        primary: 1,
+                        secondary: 2,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        ActivityHistoryTelemetry::on_second_tick(&mut app_state);
+
+        let hidden_series = app_state
+            .activity_history_state
+            .torrents
+            .get(&hidden_key)
+            .expect("hidden torrent history should be preserved");
+        assert_eq!(hidden_series.tiers.second_1s.len(), 2);
+
+        let latest_point = hidden_series
+            .tiers
+            .second_1s
+            .last()
+            .expect("latest point should exist");
+        assert_eq!(latest_point.primary, 20);
+        assert_eq!(latest_point.secondary, 8);
     }
 }

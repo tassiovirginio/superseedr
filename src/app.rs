@@ -2894,7 +2894,21 @@ impl App {
                     info_hash: info_hash.clone(),
                     data_available: torrent.latest_state.data_available,
                     file_count: torrent.latest_state.file_count,
-                    download_path: torrent.latest_state.download_path.clone(),
+                    saved_location: torrent.latest_state.download_path.as_ref().map(
+                        |download_path| {
+                            if let Some(container_name) =
+                                torrent.latest_state.container_name.as_deref()
+                            {
+                                if !container_name.is_empty() {
+                                    download_path.join(container_name)
+                                } else {
+                                    download_path.clone()
+                                }
+                            } else {
+                                download_path.clone()
+                            }
+                        },
+                    ),
                     download_speed_bps: torrent.latest_state.download_speed_bps,
                     upload_speed_bps: torrent.latest_state.upload_speed_bps,
                 })
@@ -4776,7 +4790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_availability_fault_marks_torrent_unavailable_and_schedules_same_path() {
+    async fn data_availability_fault_does_not_fan_out_across_shared_download_root() {
         let settings = crate::config::Settings {
             client_port: 0,
             ..Default::default()
@@ -4790,6 +4804,7 @@ mod tests {
         faulted.latest_state.torrent_name = "faulted probe torrent".to_string();
         faulted.latest_state.torrent_control_state = TorrentControlState::Running;
         faulted.latest_state.download_path = Some("/downloads/shared".into());
+        faulted.latest_state.container_name = Some("faulted".to_string());
         app.app_state
             .torrents
             .insert(faulted_info_hash.clone(), faulted);
@@ -4799,6 +4814,7 @@ mod tests {
         sibling.latest_state.torrent_name = "sibling probe torrent".to_string();
         sibling.latest_state.torrent_control_state = TorrentControlState::Running;
         sibling.latest_state.download_path = Some("/downloads/shared".into());
+        sibling.latest_state.container_name = Some("sibling".to_string());
         app.app_state
             .torrents
             .insert(sibling_info_hash.clone(), sibling);
@@ -4811,6 +4827,19 @@ mod tests {
             .insert(sibling_info_hash.clone(), sibling_tx);
         app.integrity_scheduler
             .sync_torrents(app.current_integrity_snapshots());
+        for request in app.integrity_scheduler.drain_due_probe_requests() {
+            let _ = app.integrity_scheduler.on_probe_batch_result(
+                &request.info_hash,
+                FileProbeBatchResult {
+                    epoch: request.epoch,
+                    scanned_files: 1,
+                    next_file_index: 0,
+                    reached_end_of_manifest: true,
+                    pending_metadata: false,
+                    problem_files: Vec::new(),
+                },
+            );
+        }
 
         app.handle_manager_event(ManagerEvent::DataAvailabilityFault {
             info_hash: faulted_info_hash.clone(),
@@ -4829,10 +4858,6 @@ mod tests {
             .recv()
             .await
             .expect("expected second faulted torrent command");
-        let sibling_cmd = sibling_rx
-            .recv()
-            .await
-            .expect("expected sibling torrent probe command");
         assert!(matches!(
             faulted_first,
             ManagerCommand::SetDataAvailability(false)
@@ -4845,11 +4870,8 @@ mod tests {
             }
         ));
         assert!(matches!(
-            sibling_cmd,
-            ManagerCommand::ProbeFileBatch {
-                start_file_index: 0,
-                ..
-            }
+            sibling_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
         let faulted_torrent = app
