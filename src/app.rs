@@ -4796,6 +4796,7 @@ mod tests {
         display.latest_state.info_hash = info_hash.clone();
         display.latest_state.torrent_name = "dispatch probe torrent".to_string();
         display.latest_state.torrent_control_state = TorrentControlState::Running;
+        display.latest_state.is_complete = true;
         app.app_state.torrents.insert(info_hash.clone(), display);
 
         let (manager_tx, mut manager_rx) = mpsc::channel(4);
@@ -4804,7 +4805,10 @@ mod tests {
 
         app.dispatch_integrity_probe_batches();
 
-        let command = manager_rx.recv().await.expect("expected probe command");
+        let command = tokio::time::timeout(std::time::Duration::from_secs(1), manager_rx.recv())
+            .await
+            .expect("probe command timed out")
+            .expect("expected probe command");
         assert!(matches!(
             command,
             ManagerCommand::ProbeFileBatch {
@@ -4830,6 +4834,7 @@ mod tests {
         display.latest_state.info_hash = info_hash.clone();
         display.latest_state.torrent_name = "metadata probe torrent".to_string();
         display.latest_state.torrent_control_state = TorrentControlState::Running;
+        display.latest_state.is_complete = true;
         app.app_state.torrents.insert(info_hash.clone(), display);
 
         let (manager_tx, mut manager_rx) = mpsc::channel(4);
@@ -4837,10 +4842,11 @@ mod tests {
             .insert(info_hash.clone(), manager_tx);
         app.dispatch_integrity_probe_batches();
 
-        let first_command = manager_rx
-            .recv()
-            .await
-            .expect("expected initial probe command");
+        let first_command =
+            tokio::time::timeout(std::time::Duration::from_secs(1), manager_rx.recv())
+                .await
+                .expect("initial probe command timed out")
+                .expect("expected initial probe command");
         assert!(matches!(
             first_command,
             ManagerCommand::ProbeFileBatch { .. }
@@ -4864,10 +4870,11 @@ mod tests {
             torrent: Box::new(torrent),
         });
 
-        let second_command = manager_rx
-            .recv()
-            .await
-            .expect("expected immediate post-metadata probe command");
+        let second_command =
+            tokio::time::timeout(std::time::Duration::from_secs(1), manager_rx.recv())
+                .await
+                .expect("post-metadata probe command timed out")
+                .expect("expected immediate post-metadata probe command");
         assert!(matches!(
             second_command,
             ManagerCommand::ProbeFileBatch { .. }

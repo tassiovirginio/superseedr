@@ -162,6 +162,17 @@ pub struct PeerSession {
 
     #[cfg(test)]
     testing_window_monitor: Option<Arc<AtomicUsize>>,
+
+    #[cfg(test)]
+    testing_window_events: Option<mpsc::UnboundedSender<WindowAdaptationEvent>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAdaptationEvent {
+    Grew { new_size: usize },
+    Shrunk { new_size: usize },
+    Reset { new_size: usize },
 }
 
 impl PeerSession {
@@ -201,6 +212,9 @@ impl PeerSession {
 
             #[cfg(test)]
             testing_window_monitor: None,
+
+            #[cfg(test)]
+            testing_window_events: None,
         }
     }
 
@@ -395,6 +409,11 @@ impl PeerSession {
                             if let Some(monitor) = &self.testing_window_monitor {
                                 monitor.store(self.current_window_size, Ordering::Relaxed);
                             }
+
+                            #[cfg(test)]
+                            self.emit_window_event(WindowAdaptationEvent::Reset {
+                                new_size: self.current_window_size,
+                            });
 
                             let current = self.block_request_limit_semaphore.available_permits();
                             if current < self.current_window_size {
@@ -834,6 +853,11 @@ impl PeerSession {
                     self.current_window_size += 1;
                     self.block_request_limit_semaphore.add_permits(1);
 
+                    #[cfg(test)]
+                    self.emit_window_event(WindowAdaptationEvent::Grew {
+                        new_size: self.current_window_size,
+                    });
+
                     tracing::debug!(
                         "Speed Up: Peer {} -> {:.2} blocks/s (was {:.2}). Window: {}",
                         self.peer_ip_port,
@@ -864,6 +888,12 @@ impl PeerSession {
     fn shrink_window(&mut self) {
         if self.current_window_size > PEER_BLOCK_IN_FLIGHT_LIMIT {
             self.current_window_size -= 1;
+
+            #[cfg(test)]
+            self.emit_window_event(WindowAdaptationEvent::Shrunk {
+                new_size: self.current_window_size,
+            });
+
             if let Ok(permit) = self.block_request_limit_semaphore.try_acquire() {
                 permit.forget();
             } else {
@@ -879,8 +909,24 @@ impl PeerSession {
     }
 
     #[cfg(test)]
+    fn emit_window_event(&self, event: WindowAdaptationEvent) {
+        if let Some(window_events) = &self.testing_window_events {
+            let _ = window_events.send(event);
+        }
+    }
+
+    #[cfg(test)]
     pub fn with_window_monitor(mut self, monitor: Arc<AtomicUsize>) -> Self {
         self.testing_window_monitor = Some(monitor);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_window_events(
+        mut self,
+        window_events: mpsc::UnboundedSender<WindowAdaptationEvent>,
+    ) -> Self {
+        self.testing_window_events = Some(window_events);
         self
     }
 }
@@ -926,11 +972,24 @@ mod tests {
         mpsc::Receiver<TorrentCommand>, // Manager Event Rx
         Arc<AtomicUsize>,               // <--- The Window Monitor
     ) {
+        let (network, cmd_tx, manager_rx, window_monitor, _window_event_rx) =
+            spawn_test_session_with_window_events().await;
+        (network, cmd_tx, manager_rx, window_monitor)
+    }
+
+    async fn spawn_test_session_with_window_events() -> (
+        tokio::io::DuplexStream,        // Network (Mock Peer)
+        mpsc::Sender<TorrentCommand>,   // Client Command Tx
+        mpsc::Receiver<TorrentCommand>, // Manager Event Rx
+        Arc<AtomicUsize>,               // <--- The Window Monitor
+        mpsc::UnboundedReceiver<WindowAdaptationEvent>,
+    ) {
         let (client_socket, mock_peer_socket) = duplex(64 * 1024 * 1024);
         let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let (manager_tx, manager_rx) = mpsc::channel(1000);
         let (cmd_tx, cmd_rx) = mpsc::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let (window_event_tx, window_event_rx) = mpsc::unbounded_channel();
 
         let params = PeerSessionParameters {
             info_hash: [0u8; 20].to_vec(),
@@ -951,14 +1010,72 @@ mod tests {
 
         tokio::spawn(async move {
             // Inject monitor using the builder pattern
-            let session = PeerSession::new(params).with_window_monitor(monitor_clone);
+            let session = PeerSession::new(params)
+                .with_window_monitor(monitor_clone)
+                .with_window_events(window_event_tx);
 
             if let Err(e) = session.run(client_socket, vec![], Some(vec![])).await {
                 eprintln!("Test Session ended: {:?}", e);
             }
         });
 
-        (mock_peer_socket, cmd_tx, manager_rx, window_monitor)
+        (
+            mock_peer_socket,
+            cmd_tx,
+            manager_rx,
+            window_monitor,
+            window_event_rx,
+        )
+    }
+
+    struct WindowDriveHarness<'a> {
+        client_cmd_tx: &'a mpsc::Sender<TorrentCommand>,
+        manager_event_rx: &'a mut mpsc::Receiver<TorrentCommand>,
+        window_event_rx: &'a mut mpsc::UnboundedReceiver<WindowAdaptationEvent>,
+        request_id: u32,
+        inflight: usize,
+    }
+
+    impl WindowDriveHarness<'_> {
+        async fn drive_until(
+            &mut self,
+            step: Duration,
+            max_steps: usize,
+            predicate: impl Fn(WindowAdaptationEvent) -> bool,
+        ) -> Option<WindowAdaptationEvent> {
+            for _ in 0..max_steps {
+                while self.inflight < 150 {
+                    self.client_cmd_tx
+                        .send(TorrentCommand::BulkRequest(vec![(
+                            self.request_id,
+                            0,
+                            16384,
+                        )]))
+                        .await
+                        .expect("failed to send bulk request");
+                    self.request_id += 1;
+                    self.inflight += 1;
+                }
+
+                tokio::task::yield_now().await;
+                tokio::time::advance(step).await;
+                tokio::task::yield_now().await;
+
+                while let Ok(command) = self.manager_event_rx.try_recv() {
+                    if matches!(command, TorrentCommand::Block(..)) && self.inflight > 0 {
+                        self.inflight = self.inflight.saturating_sub(1);
+                    }
+                }
+
+                while let Ok(event) = self.window_event_rx.try_recv() {
+                    if predicate(event) {
+                        return Some(event);
+                    }
+                }
+            }
+
+            None
+        }
     }
 
     // --- Standard Handshake Helper ---
@@ -1590,13 +1707,12 @@ mod tests {
 
     // TEST 1: ROCKET (Growth to Max)
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_dynamic_window_growth_to_max() {
-        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor) =
-            spawn_test_session().await;
+        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor, mut window_event_rx) =
+            spawn_test_session_with_window_events().await;
         perform_handshake(&mut network).await;
 
-        // Mock Peer: Instant Responder
         let (mut peer_read, mut peer_write) = tokio::io::split(network);
         tokio::spawn(async move {
             let dummy_data = vec![0xAA; 16384];
@@ -1610,7 +1726,6 @@ mod tests {
                             .await;
                     }
                     Message::Request(i, b, _) => {
-                        // FIX: Add small delay to simulate network latency and force queue buildup
                         tokio::time::sleep(Duration::from_millis(2)).await;
                         let piece =
                             generate_message(Message::Piece(i, b, dummy_data.clone())).unwrap();
@@ -1621,42 +1736,44 @@ mod tests {
             }
         });
 
-        let _ = client_cmd_tx.send(TorrentCommand::ClientInterested).await;
-        loop {
-            match timeout(Duration::from_secs(1), manager_event_rx.recv()).await {
-                Ok(Some(TorrentCommand::Unchoke(_))) => break,
-                Ok(Some(_)) => continue,
-                _ => panic!("Startup failed"),
+        client_cmd_tx
+            .send(TorrentCommand::ClientInterested)
+            .await
+            .expect("failed to send interested command");
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if let Ok(TorrentCommand::Unchoke(_)) = manager_event_rx.try_recv() {
+                break;
             }
+            tokio::time::advance(Duration::from_millis(100)).await;
         }
 
-        // Blast Data
-        let mut completed = 0;
-        let mut inflight = 0;
+        let mut drive = WindowDriveHarness {
+            client_cmd_tx: &client_cmd_tx,
+            manager_event_rx: &mut manager_event_rx,
+            window_event_rx: &mut window_event_rx,
+            request_id: 0,
+            inflight: 0,
+        };
+        let growth_event = drive
+            .drive_until(Duration::from_millis(100), 120, |event| {
+                matches!(event, WindowAdaptationEvent::Grew { .. })
+            })
+            .await;
 
-        // We need enough duration/blocks for the 3s timer to tick multiple times
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) && completed < 1000 {
-            while inflight < 150 {
-                let _ = client_cmd_tx
-                    .send(TorrentCommand::BulkRequest(vec![(
-                        completed + inflight,
-                        0,
-                        16384,
-                    )]))
-                    .await;
-                inflight += 1;
-            }
-
-            if let Ok(Some(TorrentCommand::Block(..))) =
-                timeout(Duration::from_millis(100), manager_event_rx.recv()).await
-            {
-                completed += 1;
-                if inflight > 0 {
-                    inflight = inflight.saturating_sub(1);
-                }
-            }
+        match growth_event {
+            Some(WindowAdaptationEvent::Grew { .. }) => {}
+            _ => panic!(
+                "Window never grew under paused-time load (observed={}, base={})",
+                window_monitor.load(Ordering::Relaxed),
+                PEER_BLOCK_IN_FLIGHT_LIMIT
+            ),
         }
+
+        let _ = drive
+            .drive_until(Duration::from_millis(100), 20, |_| false)
+            .await;
 
         let final_window = window_monitor.load(Ordering::Relaxed);
         println!("Rocket Test: Final Window Size = {}", final_window);
@@ -1671,10 +1788,10 @@ mod tests {
 
     // TEST 2: CONGESTION (Increase then Decrease)
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_dynamic_window_congestion_control() {
-        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor) =
-            spawn_test_session().await;
+        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor, mut window_event_rx) =
+            spawn_test_session_with_window_events().await;
         perform_handshake(&mut network).await;
 
         let is_congested = Arc::new(AtomicBool::new(false));
@@ -1695,17 +1812,13 @@ mod tests {
                     }
                     Message::Request(i, b, _) => {
                         if is_congested_clone.load(Ordering::Relaxed) {
-                            // SIMULATE CONGESTION: 50ms delay per block (approx 320KB/s)
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else if start_time.elapsed() < Duration::from_secs(2) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         } else {
-                            // Ramp speed up after warm-up so speed(t+1) > speed(t)
-                            // and window growth logic can deterministically trigger.
-                            if start_time.elapsed() < Duration::from_secs(2) {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            } else {
-                                tokio::time::sleep(Duration::from_millis(2)).await;
-                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
                         }
+
                         let piece =
                             generate_message(Message::Piece(i, b, dummy_data.clone())).unwrap();
                         let _ = peer_write.write_all(&piece).await;
@@ -1715,42 +1828,48 @@ mod tests {
             }
         });
 
-        let _ = client_cmd_tx.send(TorrentCommand::ClientInterested).await;
-        loop {
-            if let Ok(Some(TorrentCommand::Unchoke(_))) =
-                timeout(Duration::from_secs(1), manager_event_rx.recv()).await
-            {
+        client_cmd_tx
+            .send(TorrentCommand::ClientInterested)
+            .await
+            .expect("failed to send interested command");
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if let Ok(TorrentCommand::Unchoke(_)) = manager_event_rx.try_recv() {
                 break;
             }
+            tokio::time::advance(Duration::from_millis(100)).await;
         }
 
-        // PHASE 1: GROW
-        // We must run for at least >3s to allow the adjustment timer to tick.
-        let start = Instant::now();
-        let mut request_id = 0;
-        let mut inflight: usize = 0;
+        let mut drive = WindowDriveHarness {
+            client_cmd_tx: &client_cmd_tx,
+            manager_event_rx: &mut manager_event_rx,
+            window_event_rx: &mut window_event_rx,
+            request_id: 0,
+            inflight: 0,
+        };
+        let growth_event = drive
+            .drive_until(Duration::from_millis(100), 120, |event| {
+                matches!(event, WindowAdaptationEvent::Grew { .. })
+            })
+            .await;
 
-        while start.elapsed() < Duration::from_secs(8) {
-            // Keep pipe full to ensure saturation logic triggers
-            while inflight < 150 {
-                let _ = client_cmd_tx
-                    .send(TorrentCommand::BulkRequest(vec![(request_id, 0, 16384)]))
-                    .await;
-                request_id += 1;
-                inflight += 1;
-            }
-
-            // Consume blocks as they come in
-            if let Ok(Some(TorrentCommand::Block(..))) =
-                timeout(Duration::from_millis(50), manager_event_rx.recv()).await
-            {
-                if inflight > 0 {
-                    inflight = inflight.saturating_sub(1);
-                }
-            }
+        match growth_event {
+            Some(WindowAdaptationEvent::Grew { .. }) => {}
+            _ => panic!(
+                "Window never grew under paused-time load (observed={}, base={})",
+                window_monitor.load(Ordering::Relaxed),
+                PEER_BLOCK_IN_FLIGHT_LIMIT
+            ),
         }
+
+        let _ = drive
+            .drive_until(Duration::from_millis(100), 20, |_| false)
+            .await;
 
         let peak_window = window_monitor.load(Ordering::Relaxed);
+        while drive.window_event_rx.try_recv().is_ok() {}
+
         println!("Phase 1 Peak Window: {}", peak_window);
         assert!(
             peak_window > PEER_BLOCK_IN_FLIGHT_LIMIT,
@@ -1759,32 +1878,24 @@ mod tests {
             PEER_BLOCK_IN_FLIGHT_LIMIT
         );
 
-        // PHASE 2: TRIGGER CONGESTION
         is_congested.store(true, Ordering::Relaxed);
 
-        // Run for another 5 seconds to allow reaction
-        let start_p2 = Instant::now();
-        while start_p2.elapsed() < Duration::from_secs(5) {
-            while inflight < 150 {
-                let _ = client_cmd_tx
-                    .send(TorrentCommand::BulkRequest(vec![(request_id, 0, 16384)]))
-                    .await;
-                request_id += 1;
-                inflight += 1;
-            }
+        let shrink_event = drive
+            .drive_until(Duration::from_millis(100), 200, |event| {
+                matches!(event, WindowAdaptationEvent::Shrunk { new_size } if new_size < peak_window)
+            })
+            .await;
 
-            if let Ok(Some(TorrentCommand::Block(..))) =
-                timeout(Duration::from_millis(50), manager_event_rx.recv()).await
-            {
-                if inflight > 0 {
-                    inflight = inflight.saturating_sub(1);
-                }
-            }
-        }
+        let final_window = match shrink_event {
+            Some(WindowAdaptationEvent::Shrunk { new_size }) => new_size,
+            _ => panic!(
+                "Window never shrank after congestion under paused time (observed={}, peak={})",
+                window_monitor.load(Ordering::Relaxed),
+                peak_window
+            ),
+        };
 
-        let final_window = window_monitor.load(Ordering::Relaxed);
         println!("Phase 2 Final Window: {}", final_window);
-
         assert!(
             final_window < peak_window,
             "Window failed to shrink on congestion (Peak: {}, Final: {})",

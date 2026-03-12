@@ -60,9 +60,9 @@ impl PasteBurst {
     where
         F: FnOnce(&str) -> bool,
     {
-        if !self
+        if self
             .last_plain_char_at
-            .is_some_and(|last| now.duration_since(last) > PASTE_BURST_CHAR_INTERVAL)
+            .is_none_or(|last| now.duration_since(last) <= PASTE_BURST_CHAR_INTERVAL)
         {
             return FlushResult::None;
         }

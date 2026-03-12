@@ -281,8 +281,10 @@ mod tests {
     // --- NAVIGATION TESTS ---
 
     async fn build_test_app() -> App {
-        let mut settings = Settings::default();
-        settings.client_port = 0;
+        let settings = Settings {
+            client_port: 0,
+            ..Settings::default()
+        };
         let mut app = App::new(settings).await.expect("build app");
         app.app_state.mode = AppMode::Normal;
         app
