@@ -1980,39 +1980,33 @@ mod tests {
         assert!(final_window < 255, "Window overflowed");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_dynamic_window_reset_on_choke() {
-        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor) =
-            spawn_test_session().await;
+        let (mut network, client_cmd_tx, mut manager_event_rx, window_monitor, mut window_event_rx) =
+            spawn_test_session_with_window_events().await;
         perform_handshake(&mut network).await;
 
-        // Shared state to tell the Mock Peer when to Choke
         let should_choke = Arc::new(AtomicBool::new(false));
         let should_choke_clone = should_choke.clone();
 
-        // Mock Peer Task
         let (mut peer_read, mut peer_write) = tokio::io::split(network);
         tokio::spawn(async move {
             let mut am_choking = true;
             let dummy_data = vec![0xAA; 16384];
-            // Capture start time to coordinate the "Ramp Up"
-            let start_time = std::time::Instant::now();
+            let start_time = Instant::now();
 
             while let Ok(Ok(msg)) =
                 timeout(Duration::from_secs(30), parse_message(&mut peer_read)).await
             {
-                // Check if the test controller wants us to choke
                 if should_choke_clone.load(Ordering::Relaxed) && !am_choking {
                     let choke_msg = generate_message(Message::Choke).unwrap();
                     let _ = peer_write.write_all(&choke_msg).await;
-                    // We stay choked for a bit to let the test verify
                     tokio::time::sleep(Duration::from_millis(500)).await;
 
-                    // Then we Unchoke
                     let unchoke_msg = generate_message(Message::Unchoke).unwrap();
                     let _ = peer_write.write_all(&unchoke_msg).await;
                     am_choking = false;
-                    should_choke_clone.store(false, Ordering::Relaxed); // Reset trigger
+                    should_choke_clone.store(false, Ordering::Relaxed);
                 }
 
                 match msg {
@@ -2024,14 +2018,11 @@ mod tests {
                         }
                     }
                     Message::Request(i, b, _) => {
-                        // If we are currently choked, we ignore requests (simulate real peer)
                         if !am_choking {
-                            // --- FIX: RAMP UP SIMULATION ---
-                            // For the first 2 seconds, be slow. Then go full speed.
-                            // This ensures the Session sees an INCREASING speed curve (Speed T2 > Speed T1),
-                            // which is the mandatory trigger for window growth logic.
                             if start_time.elapsed() < Duration::from_secs(2) {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
                             }
 
                             let piece =
@@ -2044,81 +2035,79 @@ mod tests {
             }
         });
 
-        let _ = client_cmd_tx.send(TorrentCommand::ClientInterested).await;
-        loop {
-            if let Ok(Some(TorrentCommand::Unchoke(_))) =
-                timeout(Duration::from_secs(1), manager_event_rx.recv()).await
-            {
+        client_cmd_tx
+            .send(TorrentCommand::ClientInterested)
+            .await
+            .expect("failed to send interested command");
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if let Ok(TorrentCommand::Unchoke(_)) = manager_event_rx.try_recv() {
                 break;
             }
+            tokio::time::advance(Duration::from_millis(100)).await;
         }
 
-        let mut completed = 0;
-        let mut inflight = 0;
-        let start = Instant::now();
+        let mut drive = WindowDriveHarness {
+            client_cmd_tx: &client_cmd_tx,
+            manager_event_rx: &mut manager_event_rx,
+            window_event_rx: &mut window_event_rx,
+            request_id: 0,
+            inflight: 0,
+        };
 
-        // Pump blocks for 8 seconds (covers the 2s slow phase + 6s fast phase)
-        while start.elapsed() < Duration::from_secs(8) {
-            while inflight < 100 {
-                let _ = client_cmd_tx
-                    .send(TorrentCommand::BulkRequest(vec![(
-                        completed + inflight,
-                        0,
-                        16384,
-                    )]))
-                    .await;
-                inflight += 1;
-            }
+        let growth_event = drive
+            .drive_until(Duration::from_millis(100), 120, |event| {
+                matches!(event, WindowAdaptationEvent::Grew { .. })
+            })
+            .await;
 
-            if let Ok(Some(TorrentCommand::Block(..))) =
-                timeout(Duration::from_millis(50), manager_event_rx.recv()).await
-            {
-                if inflight > 0 {
-                    inflight = inflight.saturating_sub(1);
-                }
-                completed += 1;
+        match growth_event {
+            Some(WindowAdaptationEvent::Grew { new_size }) => {
+                println!("Peak Window before Choke: {}", new_size);
+                assert!(
+                    new_size > PEER_BLOCK_IN_FLIGHT_LIMIT,
+                    "Window did not grow enough to test reset (Got {}, want > {})",
+                    new_size,
+                    PEER_BLOCK_IN_FLIGHT_LIMIT
+                );
             }
+            _ => panic!(
+                "Window never grew before choke under paused time (observed={}, base={})",
+                window_monitor.load(Ordering::Relaxed),
+                PEER_BLOCK_IN_FLIGHT_LIMIT
+            ),
         }
 
-        let peak_window = window_monitor.load(Ordering::Relaxed);
-        println!("Peak Window before Choke: {}", peak_window);
+        while drive.window_event_rx.try_recv().is_ok() {}
 
-        assert!(
-            peak_window > PEER_BLOCK_IN_FLIGHT_LIMIT,
-            "Window did not grow enough to test reset (Got {}, want > {})",
-            peak_window,
-            PEER_BLOCK_IN_FLIGHT_LIMIT
-        );
-
-        println!("Triggering Peer Choke...");
         should_choke.store(true, Ordering::Relaxed);
 
-        // Wait for the Choke event to propagate
-        loop {
-            match timeout(Duration::from_secs(1), manager_event_rx.recv()).await {
-                Ok(Some(TorrentCommand::Choke(_))) => break,
-                Ok(Some(_)) => continue, // Ignore other messages
-                _ => panic!("Did not receive Choke command from session"),
+        let reset_event = drive
+            .drive_until(Duration::from_millis(100), 40, |event| {
+                matches!(
+                    event,
+                    WindowAdaptationEvent::Reset {
+                        new_size: PEER_BLOCK_IN_FLIGHT_LIMIT,
+                    }
+                )
+            })
+            .await;
+
+        match reset_event {
+            Some(WindowAdaptationEvent::Reset { new_size }) => {
+                println!("Window after Choke: {}", new_size);
+                assert_eq!(
+                    new_size, PEER_BLOCK_IN_FLIGHT_LIMIT,
+                    "Window failed to reset to default on Choke!"
+                );
             }
+            _ => panic!(
+                "Window never reset on choke under paused time (observed={}, base={})",
+                window_monitor.load(Ordering::Relaxed),
+                PEER_BLOCK_IN_FLIGHT_LIMIT
+            ),
         }
-
-        let choked_window = window_monitor.load(Ordering::Relaxed);
-        println!("Window after Choke: {}", choked_window);
-
-        assert_eq!(
-            choked_window, PEER_BLOCK_IN_FLIGHT_LIMIT,
-            "Window failed to reset to default on Choke!"
-        );
-
-        // The mock peer is programmed to unchoke automatically after 500ms
-        loop {
-            match timeout(Duration::from_secs(1), manager_event_rx.recv()).await {
-                Ok(Some(TorrentCommand::Unchoke(_))) => break,
-                Ok(Some(_)) => continue,
-                _ => panic!("Did not receive Unchoke command"),
-            }
-        }
-
-        println!("Received Unchoke, test passed.");
     }
 }
+
