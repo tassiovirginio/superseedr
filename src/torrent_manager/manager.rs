@@ -15,6 +15,8 @@ use crate::networking::ConnectionType;
 use crate::token_bucket::TokenBucket;
 
 use crate::torrent_manager::DiskIoOperation;
+use crate::torrent_manager::FileProbeBatchResult;
+use crate::torrent_manager::FileProbeEntry;
 
 use crate::config::Settings;
 
@@ -105,6 +107,25 @@ const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
+
+struct PreparedFileProbeEntry {
+    relative_path: std::path::PathBuf,
+    absolute_path: std::path::PathBuf,
+    expected_size: u64,
+}
+
+struct PreparedFileProbeBatch {
+    epoch: u64,
+    scanned_files: usize,
+    next_file_index: usize,
+    reached_end_of_manifest: bool,
+    files: Vec<PreparedFileProbeEntry>,
+}
+
+enum FileProbeBatchPreparation {
+    Ready(FileProbeBatchResult),
+    Scan(PreparedFileProbeBatch),
+}
 
 pub struct TorrentManager {
     state: TorrentState,
@@ -798,6 +819,7 @@ impl TorrentManager {
                         &resource_manager,
                         &mut shutdown_rx,
                         &event_tx,
+                        &info_hash,
                         op,
                         &peer_tx,
                     )
@@ -821,6 +843,9 @@ impl TorrentManager {
                                 bytes: block_info.length as u64,
                             })
                             .await;
+                    } else if matches!(result, Err(ref error) if error.indicates_data_unavailability())
+                    {
+                        let _ = tx.send(TorrentCommand::SetDataAvailability(false)).await;
                     }
 
                     let _ = event_tx.try_send(ManagerEvent::DiskReadFinished);
@@ -1234,7 +1259,7 @@ impl TorrentManager {
 
         let is_fresh_download = tokio::select! {
             biased;
-            _ = shutdown_rx.recv() => return Err(StorageError::Io(std::io::Error::other("Shutdown"))),
+            _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
             res = create_and_allocate_files(&multi_file_info) => res?,
         };
         if is_fresh_download {
@@ -1312,7 +1337,7 @@ impl TorrentManager {
                             )
                             .await?
                         } else {
-                            return Err(StorageError::Io(std::io::Error::other(
+                            return Err(StorageError::from(std::io::Error::other(
                                 "Resource Permit Denied",
                             )));
                         }
@@ -1463,7 +1488,7 @@ impl TorrentManager {
             let metadata = match fs::metadata(&file_info.path).await {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(StorageError::Io(err)),
+                Err(err) => return Err(StorageError::from(err)),
             };
 
             if !metadata.is_file() || metadata.len() != file_info.length {
@@ -1492,7 +1517,7 @@ impl TorrentManager {
         loop {
             let permit_res = tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => return Err(StorageError::Io(std::io::Error::other("Shutdown"))),
+                _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
                 res = resource_manager.acquire_disk_write() => res,
             };
 
@@ -1501,7 +1526,7 @@ impl TorrentManager {
                     let write_future = write_data_to_disk(multi_file_info, op.offset, data);
                     let res = tokio::select! {
                         biased;
-                        _ = shutdown_rx.recv() => return Err(StorageError::Io(std::io::Error::other("Shutdown"))),
+                        _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
                         r = write_future => r,
                     };
 
@@ -1516,7 +1541,9 @@ impl TorrentManager {
                     }
                 }
                 Err(ResourceManagerError::ManagerShutdown) => {
-                    return Err(StorageError::Io(std::io::Error::other("Manager Shutdown")))
+                    return Err(StorageError::from(std::io::Error::other(
+                        "Manager Shutdown",
+                    )))
                 }
                 Err(ResourceManagerError::QueueFull) => {
                     event!(
@@ -1530,7 +1557,7 @@ impl TorrentManager {
             attempt += 1;
             if attempt > MAX_PIECE_WRITE_ATTEMPTS {
                 let _ = event_tx.try_send(ManagerEvent::DiskWriteFinished);
-                return Err(StorageError::Io(std::io::Error::other(
+                return Err(StorageError::from(std::io::Error::other(
                     "Max write attempts exceeded",
                 )));
             }
@@ -1552,7 +1579,7 @@ impl TorrentManager {
 
             tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => return Err(StorageError::Io(std::io::Error::other("Shutdown"))),
+                _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
                 _ = tokio::time::sleep(Duration::from_millis(backoff + jitter)) => {},
             }
         }
@@ -1563,6 +1590,7 @@ impl TorrentManager {
         resource_manager: &ResourceManagerClient,
         shutdown_rx: &mut broadcast::Receiver<()>,
         event_tx: &Sender<ManagerEvent>,
+        info_hash: &[u8],
         op: DiskIoOperation,
         peer_tx: &Sender<TorrentCommand>,
     ) -> Result<Vec<u8>, StorageError> {
@@ -1570,12 +1598,14 @@ impl TorrentManager {
 
         loop {
             if peer_tx.is_closed() {
-                return Err(StorageError::Io(std::io::Error::other("Peer Disconnected")));
+                return Err(StorageError::from(std::io::Error::other(
+                    "Peer Disconnected",
+                )));
             }
 
             let permit_res = tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => { return Err(StorageError::Io(std::io::Error::other("Shutdown"))); }
+                _ = shutdown_rx.recv() => { return Err(StorageError::from(std::io::Error::other("Shutdown"))); }
                 res = resource_manager.acquire_disk_read() => res,
             };
 
@@ -1584,7 +1614,7 @@ impl TorrentManager {
                     let read_future = read_data_from_disk(multi_file_info, op.offset, op.length);
                     let res = tokio::select! {
                         biased;
-                        _ = shutdown_rx.recv() => { return Err(StorageError::Io(std::io::Error::other("Shutdown"))); }
+                        _ = shutdown_rx.recv() => { return Err(StorageError::from(std::io::Error::other("Shutdown"))); }
                         r = read_future => r,
                     };
 
@@ -1593,12 +1623,22 @@ impl TorrentManager {
                             return Ok(data);
                         }
                         Err(e) => {
+                            if e.indicates_data_unavailability() {
+                                let _ = event_tx.try_send(ManagerEvent::DataAvailabilityFault {
+                                    info_hash: info_hash.to_vec(),
+                                    piece_index: op.piece_index,
+                                    error: e.clone(),
+                                });
+                                return Err(e);
+                            }
                             event!(Level::WARN, piece = op.piece_index, error = ?e, "Disk read failed (IO Error).");
                         }
                     }
                 }
                 Err(ResourceManagerError::ManagerShutdown) => {
-                    return Err(StorageError::Io(std::io::Error::other("Manager Shutdown")))
+                    return Err(StorageError::from(std::io::Error::other(
+                        "Manager Shutdown",
+                    )))
                 }
                 Err(ResourceManagerError::QueueFull) => {
                     event!(
@@ -1611,7 +1651,7 @@ impl TorrentManager {
 
             attempt += 1;
             if attempt > MAX_UPLOAD_REQUEST_ATTEMPTS {
-                return Err(StorageError::Io(std::io::Error::other(
+                return Err(StorageError::from(std::io::Error::other(
                     "Max read attempts exceeded",
                 )));
             }
@@ -1632,7 +1672,7 @@ impl TorrentManager {
 
             tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => { return Err(StorageError::Io(std::io::Error::other("Shutdown"))); }
+                _ = shutdown_rx.recv() => { return Err(StorageError::from(std::io::Error::other("Shutdown"))); }
                 _ = tokio::time::sleep(duration) => {},
             }
         }
@@ -1838,7 +1878,7 @@ impl TorrentManager {
                     Level::ERROR,
                     "Cannot validate local file: Metadata not available."
                 );
-                return Err(StorageError::Io(std::io::Error::other(
+                return Err(StorageError::from(std::io::Error::other(
                     "Metadata missing during startup validation",
                 )));
             }
@@ -2128,6 +2168,10 @@ impl TorrentManager {
                 torrent_name: torrent_name_clone,
                 download_path: self.state.torrent_data_path.clone(),
                 container_name: self.state.container_name.clone(),
+                is_multi_file: !torrent.info.files.is_empty(),
+                file_count: Some(multi_file_info.files.len()),
+                data_available: self.state.data_available,
+                is_complete: self.state.torrent_status == TorrentStatus::Done,
                 number_of_successfully_connected_peers,
                 number_of_pieces_total,
                 number_of_pieces_completed,
@@ -2152,6 +2196,212 @@ impl TorrentManager {
         }
     }
 
+    fn file_probe_relative_path(
+        torrent: &Torrent,
+        file_index: usize,
+        absolute_path: &std::path::Path,
+    ) -> std::path::PathBuf {
+        if torrent.info.files.is_empty() {
+            return std::path::PathBuf::from(&torrent.info.name);
+        }
+
+        if let Some(file) = torrent.info.files.get(file_index) {
+            let mut relative_path = std::path::PathBuf::new();
+            for component in &file.path {
+                relative_path.push(component);
+            }
+            return relative_path;
+        }
+
+        absolute_path
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| absolute_path.to_path_buf())
+    }
+
+    fn prepare_file_probe_batch(
+        torrent: &Torrent,
+        multi_file_info: &MultiFileInfo,
+        epoch: u64,
+        start_file_index: usize,
+        max_files: usize,
+    ) -> FileProbeBatchPreparation {
+        if start_file_index >= multi_file_info.files.len() {
+            return FileProbeBatchPreparation::Ready(FileProbeBatchResult {
+                epoch,
+                scanned_files: 0,
+                next_file_index: 0,
+                reached_end_of_manifest: true,
+                pending_metadata: false,
+                problem_files: Vec::new(),
+            });
+        }
+
+        let end_file_index = multi_file_info
+            .files
+            .len()
+            .min(start_file_index.saturating_add(max_files));
+        let mut files = Vec::new();
+
+        for (file_index, file_info) in multi_file_info
+            .files
+            .iter()
+            .enumerate()
+            .skip(start_file_index)
+            .take(end_file_index.saturating_sub(start_file_index))
+        {
+            let relative_path =
+                Self::file_probe_relative_path(torrent, file_index, file_info.path.as_path());
+
+            if file_info.is_padding {
+                continue;
+            }
+
+            if file_info.is_skipped {
+                continue;
+            }
+
+            files.push(PreparedFileProbeEntry {
+                relative_path,
+                absolute_path: file_info.path.clone(),
+                expected_size: file_info.length,
+            });
+        }
+
+        let reached_end_of_manifest = end_file_index >= multi_file_info.files.len();
+
+        FileProbeBatchPreparation::Scan(PreparedFileProbeBatch {
+            epoch,
+            scanned_files: end_file_index.saturating_sub(start_file_index),
+            next_file_index: if reached_end_of_manifest {
+                0
+            } else {
+                end_file_index
+            },
+            reached_end_of_manifest,
+            files,
+        })
+    }
+
+    async fn collect_prepared_file_probe_batch(
+        batch: PreparedFileProbeBatch,
+    ) -> FileProbeBatchResult {
+        let mut problem_files = Vec::new();
+
+        for file in batch.files {
+            let (error, observed_size) = match fs::metadata(&file.absolute_path).await {
+                Ok(metadata) => {
+                    if !metadata.is_file() {
+                        (Some(StorageError::UnexpectedType), None)
+                    } else {
+                        let observed_size = metadata.len();
+                        (
+                            if observed_size == file.expected_size {
+                                None
+                            } else {
+                                Some(StorageError::SizeMismatch {
+                                    expected_size: file.expected_size,
+                                    observed_size,
+                                })
+                            },
+                            Some(observed_size),
+                        )
+                    }
+                }
+                Err(error) => (Some(StorageError::from(error)), None),
+            };
+            let Some(error) = error else {
+                continue;
+            };
+
+            problem_files.push(FileProbeEntry {
+                relative_path: file.relative_path,
+                absolute_path: file.absolute_path,
+                error,
+                expected_size: file.expected_size,
+                observed_size,
+            });
+        }
+
+        FileProbeBatchResult {
+            epoch: batch.epoch,
+            scanned_files: batch.scanned_files,
+            next_file_index: batch.next_file_index,
+            reached_end_of_manifest: batch.reached_end_of_manifest,
+            pending_metadata: false,
+            problem_files,
+        }
+    }
+
+    #[cfg(test)]
+    async fn collect_file_probe_batch(
+        torrent: &Torrent,
+        multi_file_info: &MultiFileInfo,
+        epoch: u64,
+        start_file_index: usize,
+        max_files: usize,
+    ) -> FileProbeBatchResult {
+        match Self::prepare_file_probe_batch(
+            torrent,
+            multi_file_info,
+            epoch,
+            start_file_index,
+            max_files,
+        ) {
+            FileProbeBatchPreparation::Ready(result) => result,
+            FileProbeBatchPreparation::Scan(batch) => {
+                Self::collect_prepared_file_probe_batch(batch).await
+            }
+        }
+    }
+
+    fn spawn_file_probe_batch(&self, epoch: u64, start_file_index: usize, max_files: usize) {
+        let info_hash = self.state.info_hash.clone();
+        let manager_event_tx = self.manager_event_tx.clone();
+        let preparation = if self.state.torrent_status == TorrentStatus::AwaitingMetadata {
+            FileProbeBatchPreparation::Ready(FileProbeBatchResult {
+                epoch,
+                scanned_files: 0,
+                next_file_index: 0,
+                reached_end_of_manifest: false,
+                pending_metadata: true,
+                problem_files: Vec::new(),
+            })
+        } else if let (Some(torrent), Some(multi_file_info)) = (
+            self.state.torrent.as_ref(),
+            self.state.multi_file_info.as_ref(),
+        ) {
+            Self::prepare_file_probe_batch(
+                torrent,
+                multi_file_info,
+                epoch,
+                start_file_index,
+                max_files,
+            )
+        } else {
+            FileProbeBatchPreparation::Ready(FileProbeBatchResult {
+                epoch,
+                scanned_files: 0,
+                next_file_index: 0,
+                reached_end_of_manifest: false,
+                pending_metadata: true,
+                problem_files: Vec::new(),
+            })
+        };
+
+        tokio::spawn(async move {
+            let result = match preparation {
+                FileProbeBatchPreparation::Ready(result) => result,
+                FileProbeBatchPreparation::Scan(batch) => {
+                    Self::collect_prepared_file_probe_batch(batch).await
+                }
+            };
+            let _ = manager_event_tx
+                .send(ManagerEvent::FileProbeBatchResult { info_hash, result })
+                .await;
+        });
+    }
+
     pub async fn run(mut self, is_paused: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
         //    We MUST find peers to get metadata.
 
@@ -2165,11 +2415,7 @@ impl TorrentManager {
 
         if self.state.torrent.is_some() {
             if let Err(error) = self.validate_local_file().await {
-                match error {
-                    StorageError::Io(e) => {
-                        eprintln!("Error calling validate local file: {}", e);
-                    }
-                }
+                event!(Level::ERROR, error = %error, "Error calling validate local file");
             }
         }
 
@@ -2260,6 +2506,16 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        ManagerCommand::ProbeFileBatch {
+                            epoch,
+                            start_file_index,
+                            max_files,
+                        } => {
+                            self.spawn_file_probe_batch(epoch, start_file_index, max_files);
+                        }
+                        ManagerCommand::SetDataAvailability(available) => {
+                            self.apply_action(Action::SetDataAvailability { available });
+                        }
                         ManagerCommand::Pause => self.apply_action(Action::Pause),
                         ManagerCommand::Resume => self.apply_action(Action::Resume),
                         ManagerCommand::DeleteFile => {
@@ -2679,6 +2935,9 @@ impl TorrentManager {
                                 byte_count: bytes
                             });
                         },
+                        TorrentCommand::SetDataAvailability(available) => {
+                            self.apply_action(Action::SetDataAvailability { available });
+                        }
                         TorrentCommand::ValidationProgress(count) => {
                             self.apply_action(Action::ValidationProgress { count });
                         },
@@ -5019,6 +5278,133 @@ mod resource_tests {
             vec![0, 1],
             "V2 skip_hashing should return aligned V2 piece indices"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_file_probe_reports_missing_and_size_mismatch() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "superseedr_probe_missing_{}",
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let files = vec![
+            crate::torrent_file::InfoFile {
+                path: vec!["ok.bin".into()],
+                length: 8,
+                md5sum: None,
+                attr: None,
+            },
+            crate::torrent_file::InfoFile {
+                path: vec!["missing.bin".into()],
+                length: 16,
+                md5sum: None,
+                attr: None,
+            },
+            crate::torrent_file::InfoFile {
+                path: vec!["short.bin".into()],
+                length: 32,
+                md5sum: None,
+                attr: None,
+            },
+        ];
+
+        let multi_file_info = crate::storage::MultiFileInfo::new(
+            &temp_dir,
+            "probe_test",
+            Some(&files),
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "probe_test".to_string(),
+                files: files.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        std::fs::write(temp_dir.join("ok.bin"), vec![0u8; 8]).unwrap();
+        std::fs::write(temp_dir.join("short.bin"), vec![0u8; 4]).unwrap();
+
+        let result =
+            TorrentManager::collect_file_probe_batch(&torrent, &multi_file_info, 0, 0, usize::MAX)
+                .await;
+        let files = result.problem_files;
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|entry| {
+            entry.relative_path.ends_with("missing.bin")
+                && matches!(
+                    entry.error,
+                    StorageError::Io {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }
+                )
+        }));
+        assert!(files.iter().any(|entry| {
+            entry.relative_path.ends_with("short.bin")
+                && matches!(
+                    entry.error,
+                    StorageError::SizeMismatch {
+                        expected_size: 32,
+                        observed_size: 4
+                    }
+                )
+                && entry.observed_size == Some(4)
+        }));
+        assert!(!files
+            .iter()
+            .any(|entry| entry.relative_path.ends_with("ok.bin")));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_file_probe_omits_skipped_files() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "superseedr_probe_skipped_{}",
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let files = vec![crate::torrent_file::InfoFile {
+            path: vec!["skipped.bin".into()],
+            length: 16,
+            md5sum: None,
+            attr: None,
+        }];
+        let mut priorities = HashMap::new();
+        priorities.insert(0usize, crate::app::FilePriority::Skip);
+
+        let multi_file_info = crate::storage::MultiFileInfo::new(
+            &temp_dir,
+            "probe_skip_test",
+            Some(&files),
+            None,
+            &priorities,
+        )
+        .unwrap();
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "probe_skip_test".to_string(),
+                files: files.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result =
+            TorrentManager::collect_file_probe_batch(&torrent, &multi_file_info, 0, 0, usize::MAX)
+                .await;
+        assert!(result.problem_files.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

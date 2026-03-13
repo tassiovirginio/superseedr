@@ -5,17 +5,20 @@ use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::torrent_completion_percent;
 use crate::app::AppCommand;
 use crate::app::BrowserPane;
+use crate::app::ChartPanelView;
 use crate::app::FileBrowserMode;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
 use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
+    TorrentDisplayState,
 };
 use crate::config::Settings;
 use crate::config::SortDirection;
+use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
-use crate::torrent_manager::ManagerCommand;
+use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::formatters::{
     calculate_nice_upper_bound, format_bytes, format_countdown, format_duration, format_iops,
     format_latency, format_limit_bps, format_memory, format_speed, format_time,
@@ -39,12 +42,13 @@ use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-use clipboard::{ClipboardContext, ClipboardProvider};
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::layout::Layout;
 use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
@@ -92,6 +96,241 @@ fn build_time_aligned_window(
     (dl, ul, backoff)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryTier {
+    Second1s,
+    Minute1m,
+    Minute15m,
+    Hour1h,
+}
+
+fn graph_window_spec(mode: GraphDisplayMode) -> (usize, u64, HistoryTier) {
+    match mode {
+        GraphDisplayMode::OneMinute
+        | GraphDisplayMode::FiveMinutes
+        | GraphDisplayMode::TenMinutes
+        | GraphDisplayMode::ThirtyMinutes
+        | GraphDisplayMode::OneHour => (
+            mode.as_seconds().clamp(1, SECONDS_HISTORY_MAX),
+            1_u64,
+            HistoryTier::Second1s,
+        ),
+        GraphDisplayMode::ThreeHours
+        | GraphDisplayMode::TwelveHours
+        | GraphDisplayMode::TwentyFourHours => (
+            (mode.as_seconds() / 60).clamp(1, MINUTES_HISTORY_MAX),
+            60_u64,
+            HistoryTier::Minute1m,
+        ),
+        GraphDisplayMode::SevenDays => (7 * 24 * 4, 15 * 60_u64, HistoryTier::Minute15m),
+        GraphDisplayMode::ThirtyDays => (30 * 24 * 4, 15 * 60_u64, HistoryTier::Minute15m),
+        GraphDisplayMode::OneYear => (365 * 24, 60 * 60_u64, HistoryTier::Hour1h),
+    }
+}
+
+fn build_time_aligned_pair_window(
+    points: &[ActivityHistoryPoint],
+    step_secs: u64,
+    window_points: usize,
+    now_unix: u64,
+) -> (Vec<u64>, Vec<u64>) {
+    if window_points == 0 || step_secs == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut primary = vec![0_u64; window_points];
+    let mut secondary = vec![0_u64; window_points];
+    let end_ts = now_unix.saturating_sub(now_unix % step_secs);
+    let start_ts = end_ts.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
+
+    for point in points {
+        if point.ts_unix < start_ts || point.ts_unix > end_ts {
+            continue;
+        }
+        let idx = ((point.ts_unix - start_ts) / step_secs) as usize;
+        if idx < window_points {
+            primary[idx] = point.primary;
+            secondary[idx] = point.secondary;
+        }
+    }
+
+    (primary, secondary)
+}
+
+fn activity_points_for_tier(
+    series: &ActivityHistorySeries,
+    tier: HistoryTier,
+) -> &[ActivityHistoryPoint] {
+    match tier {
+        HistoryTier::Second1s => &series.tiers.second_1s,
+        HistoryTier::Minute1m => &series.tiers.minute_1m,
+        HistoryTier::Minute15m => &series.tiers.minute_15m,
+        HistoryTier::Hour1h => &series.tiers.hour_1h,
+    }
+}
+
+fn network_points_for_tier(app_state: &AppState, tier: HistoryTier) -> &[NetworkHistoryPoint] {
+    match tier {
+        HistoryTier::Second1s => &app_state.network_history_state.tiers.second_1s,
+        HistoryTier::Minute1m => &app_state.network_history_state.tiers.minute_1m,
+        HistoryTier::Minute15m => &app_state.network_history_state.tiers.minute_15m,
+        HistoryTier::Hour1h => &app_state.network_history_state.tiers.hour_1h,
+    }
+}
+
+fn disk_series_draw_read_last(read: &[u64], write: &[u64]) -> bool {
+    let read_key = (
+        read.iter().rposition(|&value| value > 0),
+        read.iter().copied().max().unwrap_or(0),
+    );
+    let write_key = (
+        write.iter().rposition(|&value| value > 0),
+        write.iter().copied().max().unwrap_or(0),
+    );
+    read_key > write_key
+}
+
+fn torrent_activity_label(app_state: &AppState, info_hash: &[u8]) -> String {
+    let key = hex::encode(info_hash);
+    if app_state.anonymize_torrent_names {
+        format!("torrent-{}", &key[..key.len().min(6)])
+    } else {
+        app_state
+            .torrents
+            .get(info_hash)
+            .map(|torrent| torrent.latest_state.torrent_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("torrent-{}", &key[..key.len().min(6)]))
+    }
+}
+
+fn torrent_period_traffic(
+    app_state: &AppState,
+    info_hash: &[u8],
+    tier: HistoryTier,
+    step_secs: u64,
+    points_to_show: usize,
+    now_unix: u64,
+) -> u64 {
+    let key = hex::encode(info_hash);
+    let points = app_state
+        .activity_history_state
+        .torrents
+        .get(&key)
+        .map(|series| activity_points_for_tier(series, tier))
+        .unwrap_or(&[]);
+    let (dl_hist, ul_hist) =
+        build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+    dl_hist
+        .iter()
+        .zip(ul_hist.iter())
+        .map(|(dl, ul)| dl.saturating_add(*ul))
+        .sum()
+}
+
+fn chart_hidden_legend_constraints(view: ChartPanelView) -> (Constraint, Constraint) {
+    if matches!(
+        view,
+        ChartPanelView::TorrentOverlay | ChartPanelView::MultiTorrentOverlay
+    ) {
+        (Constraint::Percentage(100), Constraint::Percentage(100))
+    } else {
+        (Constraint::Ratio(1, 4), Constraint::Ratio(1, 4))
+    }
+}
+
+fn chart_legend_position(view: ChartPanelView) -> Option<ratatui::widgets::LegendPosition> {
+    if matches!(
+        view,
+        ChartPanelView::TorrentOverlay | ChartPanelView::MultiTorrentOverlay
+    ) {
+        Some(ratatui::widgets::LegendPosition::TopLeft)
+    } else {
+        Some(ratatui::widgets::LegendPosition::TopRight)
+    }
+}
+
+fn selector_content_width(labels: &[&str]) -> usize {
+    labels.iter().map(|label| label.len()).sum::<usize>() + labels.len().saturating_sub(1)
+}
+
+fn selector_window<'a>(labels: &'a [&'a str], active_idx: usize, compact: bool) -> Vec<&'a str> {
+    if !compact || labels.len() <= 3 {
+        return labels.to_vec();
+    }
+
+    if active_idx == 0 {
+        return labels[..3].to_vec();
+    }
+
+    if active_idx >= labels.len().saturating_sub(1) {
+        return labels[labels.len() - 3..].to_vec();
+    }
+
+    vec![
+        labels[active_idx - 1],
+        labels[active_idx],
+        labels[active_idx + 1],
+    ]
+}
+
+fn selector_active_position(labels_len: usize, active_idx: usize, compact: bool) -> usize {
+    if !compact || labels_len <= 3 {
+        return active_idx;
+    }
+
+    if active_idx == 0 {
+        return 0;
+    }
+
+    if active_idx >= labels_len.saturating_sub(1) {
+        return 2;
+    }
+
+    1
+}
+
+fn build_selector_spans(
+    ctx: &ThemeContext,
+    labels: &[&str],
+    active_idx: usize,
+    compact: bool,
+) -> Vec<Span<'static>> {
+    let visible = selector_window(labels, active_idx, compact);
+    let active_pos = selector_active_position(labels.len(), active_idx, compact);
+
+    let mut spans = Vec::with_capacity(visible.len().saturating_mul(2));
+    for (i, label) in visible.iter().enumerate() {
+        let style = if i == active_pos {
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.state_warning())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface0))
+        };
+        spans.push(Span::styled((*label).to_string(), style));
+        if i < visible.len().saturating_sub(1) {
+            spans.push(Span::styled(
+                " ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+    }
+    spans
+}
+
+fn speed_chart_upper_bound(max_displayed_speed: u64) -> u64 {
+    if max_displayed_speed == 0 {
+        return 10_000;
+    }
+
+    let padded = max_displayed_speed.saturating_mul(105).div_ceil(100);
+    let half_step = calculate_nice_upper_bound((padded / 2).max(1));
+    half_step.saturating_mul(2)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
     ClearSystemError,
@@ -100,12 +339,12 @@ pub enum UiAction {
     ToggleAnonymizeNames,
     EnterPowerSaving,
     RequestQuit,
+    ChartViewNext,
+    ChartViewPrev,
     GraphNext,
     GraphPrev,
     OpenAddTorrentBrowser,
-    OpenDeleteConfirm {
-        with_files: bool,
-    },
+    OpenDeleteConfirm { with_files: bool },
     OpenConfig,
     OpenRss,
     DataRateSlower,
@@ -116,8 +355,6 @@ pub enum UiAction {
     SortBySelectedColumn,
     OpenHelp,
     PasteText(String),
-    #[cfg(windows)]
-    PasteFromClipboard,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,8 +371,6 @@ pub enum UiEffect {
     SendResume(Vec<u8>),
     OpenHelpScreen,
     HandlePastedText(String),
-    #[cfg(windows)]
-    ReadClipboardAndPaste,
 }
 
 #[derive(Default)]
@@ -181,6 +416,20 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
         },
         UiAction::RequestQuit => {
             app_state.should_quit = true;
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ChartViewNext => {
+            app_state.chart_panel_view = app_state.chart_panel_view.next();
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ChartViewPrev => {
+            app_state.chart_panel_view = app_state.chart_panel_view.prev();
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -356,21 +605,22 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
             redraw: true,
             effects: vec![UiEffect::HandlePastedText(text)],
         },
-        #[cfg(windows)]
-        UiAction::PasteFromClipboard => ReduceResult {
-            redraw: true,
-            effects: vec![UiEffect::ReadClipboardAndPaste],
-        },
     }
 }
 
-fn map_key_to_ui_action(key_code: KeyCode) -> Option<UiAction> {
-    match key_code {
+fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+
+    match key.code {
         KeyCode::Esc => Some(UiAction::ClearSystemError),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
         KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
         KeyCode::Char('Q') => Some(UiAction::RequestQuit),
+        KeyCode::Char('g') => Some(UiAction::ChartViewNext),
+        KeyCode::Char('G') => Some(UiAction::ChartViewPrev),
         KeyCode::Char('t') => Some(UiAction::GraphNext),
         KeyCode::Char('T') => Some(UiAction::GraphPrev),
         KeyCode::Char('a') => Some(UiAction::OpenAddTorrentBrowser),
@@ -379,8 +629,6 @@ fn map_key_to_ui_action(key_code: KeyCode) -> Option<UiAction> {
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
         KeyCode::Char('r') => Some(UiAction::OpenRss),
         KeyCode::Char('m') => Some(UiAction::OpenHelp),
-        #[cfg(windows)]
-        KeyCode::Char('v') => Some(UiAction::PasteFromClipboard),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
         KeyCode::Char(']') | KeyCode::Char('}') => Some(UiAction::DataRateFaster),
         KeyCode::Char('<') => Some(UiAction::ThemePrev),
@@ -394,7 +642,7 @@ fn map_key_to_ui_action(key_code: KeyCode) -> Option<UiAction> {
         | KeyCode::Left
         | KeyCode::Char('h')
         | KeyCode::Right
-        | KeyCode::Char('l') => Some(UiAction::Navigate(key_code)),
+        | KeyCode::Char('l') => Some(UiAction::Navigate(key.code)),
         _ => None,
     }
 }
@@ -823,12 +1071,13 @@ pub fn draw_footer(
     let mut used_width = 0usize;
 
     let manual_key = "[m]";
+    let manual_fallback_suffix = "anual";
     let manual_suffix = if app_state.system_warning.is_some() {
         "anual (warning)"
     } else {
-        "anual"
+        manual_fallback_suffix
     };
-    let manual_min_width = footer_command_len(manual_key, "");
+    let manual_min_width = footer_command_len(manual_key, manual_fallback_suffix);
 
     let mut push_if_fits = |key: &'static str, suffix: &'static str, key_style: Style| {
         let separator_width = if used_width == 0 { 0 } else { 3 };
@@ -861,7 +1110,7 @@ pub fn draw_footer(
         ctx.apply(Style::default().fg(ctx.state_error())),
     );
     push_if_fits(
-        "[v]",
+        "[Paste]",
         "paste",
         ctx.apply(Style::default().fg(ctx.accent_teal())),
     );
@@ -889,6 +1138,11 @@ pub fn draw_footer(
         "[t]",
         "ime",
         ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+    );
+    push_if_fits(
+        "[g]",
+        "raph",
+        ctx.apply(Style::default().fg(ctx.state_warning())),
     );
     push_if_fits(
         "[<]theme[>]",
@@ -954,7 +1208,7 @@ pub fn draw_footer(
             &mut used_width,
             max_width,
             manual_key,
-            "anual",
+            manual_fallback_suffix,
             ctx.apply(Style::default().fg(ctx.accent_teal())),
         );
     }
@@ -1052,18 +1306,8 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                 Some(torrent) => {
                     let state = &torrent.latest_state;
                     let is_selected = i == app_state.ui.selected_torrent_index;
-
-                    let mut row_style = match state.torrent_control_state {
-                        TorrentControlState::Running => {
-                            ctx.apply(Style::default().fg(ctx.theme.semantic.text))
-                        }
-                        TorrentControlState::Paused => {
-                            ctx.apply(Style::default().fg(ctx.theme.semantic.surface1))
-                        }
-                        TorrentControlState::Deleting => {
-                            ctx.apply(Style::default().fg(ctx.state_error()))
-                        }
-                    };
+                    let row_color = torrent_list_row_color(torrent, ctx);
+                    let mut row_style = ctx.apply(Style::default().fg(row_color));
                     row_style = ctx.apply(row_style);
 
                     if is_selected {
@@ -1081,6 +1325,7 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                                 ColumnId::Status => {
                                     let display_pct = torrent_completion_percent(state);
                                     Cell::from(format!("{:.1}%", display_pct))
+                                        .style(ctx.apply(Style::default().fg(row_color)))
                                 }
                                 ColumnId::Name => {
                                     let name = if app_state.anonymize_torrent_names {
@@ -1090,26 +1335,28 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                                     };
                                     let mut c = Cell::from(name);
                                     if is_selected {
-                                        let s = ctx.apply(
-                                            ctx.apply(Style::default().fg(ctx.state_warning())),
-                                        );
+                                        let s = ctx.apply(Style::default().fg(ctx.state_warning()));
                                         c = c.style(s);
                                     }
                                     c
                                 }
                                 ColumnId::DownSpeed => {
+                                    let style = if state.data_available {
+                                        speed_to_style(ctx, torrent.smoothed_download_speed_bps)
+                                    } else {
+                                        Style::default().fg(row_color)
+                                    };
                                     Cell::from(format_speed(torrent.smoothed_download_speed_bps))
-                                        .style(ctx.apply(speed_to_style(
-                                            ctx,
-                                            torrent.smoothed_download_speed_bps,
-                                        )))
+                                        .style(ctx.apply(style))
                                 }
                                 ColumnId::UpSpeed => {
+                                    let style = if state.data_available {
+                                        speed_to_style(ctx, torrent.smoothed_upload_speed_bps)
+                                    } else {
+                                        Style::default().fg(row_color)
+                                    };
                                     Cell::from(format_speed(torrent.smoothed_upload_speed_bps))
-                                        .style(ctx.apply(speed_to_style(
-                                            ctx,
-                                            torrent.smoothed_upload_speed_bps,
-                                        )))
+                                        .style(ctx.apply(style))
                                 }
                             }
                         })
@@ -1194,7 +1441,7 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                 ),
             )),
             Line::from(Span::styled(
-                "Press [a] to add a file or [v] to paste a magnet link",
+                "Press [a] to add a file or use your terminal paste shortcut",
                 ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
             )),
         ];
@@ -1215,16 +1462,68 @@ pub fn draw_details_panel(
     details_text_chunk: Rect,
     ctx: &ThemeContext,
 ) {
+    let selected_torrent = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|h| app_state.torrents.get(h));
+
+    let critical_panel = selected_torrent.and_then(|torrent| {
+        selected_torrent_critical_details(torrent, app_state.anonymize_torrent_names)
+    });
+
     let details_block = Block::default()
         .title(Span::styled(
-            "Details",
-            ctx.apply(Style::default().fg(ctx.state_selected())),
+            critical_panel
+                .as_ref()
+                .map_or("Details", |panel| panel.title),
+            ctx.apply(Style::default().fg(if critical_panel.is_some() {
+                ctx.state_error()
+            } else {
+                ctx.state_selected()
+            })),
         ))
         .borders(Borders::ALL)
         .borders(Borders::ALL)
-        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
+        .border_style(ctx.apply(Style::default().fg(if critical_panel.is_some() {
+            ctx.state_error()
+        } else {
+            ctx.theme.semantic.border
+        })));
     let details_inner_chunk = details_block.inner(details_text_chunk);
     f.render_widget(details_block, details_text_chunk);
+
+    if let Some(panel) = critical_panel {
+        let mut text_parts = panel.text.splitn(2, '\n');
+        let headline = text_parts.next().unwrap_or_default();
+        let body = text_parts
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches('\n');
+        let critical_chunks = ratatui::layout::Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(details_inner_chunk);
+
+        f.render_widget(
+            Paragraph::new(headline).style(
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_error())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+            critical_chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(body)
+                .wrap(Wrap { trim: true })
+                .style(ctx.apply(Style::default().fg(ctx.state_error()))),
+            critical_chunks[2],
+        );
+        return;
+    }
 
     let detail_rows = ratatui::layout::Layout::vertical([
         Constraint::Length(1),
@@ -1236,11 +1535,6 @@ pub fn draw_details_panel(
         Constraint::Length(1),
     ])
     .split(details_inner_chunk);
-
-    let selected_torrent = app_state
-        .torrent_list_order
-        .get(app_state.ui.selected_torrent_index)
-        .and_then(|h| app_state.torrents.get(h));
 
     if let Some(torrent) = selected_torrent {
         let state = &torrent.latest_state;
@@ -1369,13 +1663,14 @@ pub fn draw_details_panel(
             detail_rows[4],
         );
 
+        let (eta_or_probe_label, eta_or_probe_value) = details_eta_or_probe_text(torrent);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    "ETA:      ",
+                    eta_or_probe_label,
                     ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
                 ),
-                Span::raw(format_duration(state.eta)),
+                Span::raw(eta_or_probe_value),
             ])),
             detail_rows[5],
         );
@@ -1457,6 +1752,98 @@ pub fn draw_details_panel(
     }
 }
 
+fn torrent_list_row_color(torrent: &TorrentDisplayState, ctx: &ThemeContext) -> Color {
+    if !torrent.latest_state.data_available {
+        ctx.state_error()
+    } else {
+        match torrent.latest_state.torrent_control_state {
+            TorrentControlState::Running => ctx.theme.semantic.text,
+            TorrentControlState::Paused => ctx.theme.semantic.surface1,
+            TorrentControlState::Deleting => ctx.state_error(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CriticalDetailsPanel {
+    title: &'static str,
+    text: String,
+}
+
+fn details_eta_or_probe_text(torrent: &TorrentDisplayState) -> (&'static str, String) {
+    let state = &torrent.latest_state;
+    if state.number_of_pieces_total > 0
+        && state.number_of_pieces_completed >= state.number_of_pieces_total
+    {
+        (
+            "Probe:    ",
+            torrent
+                .integrity_next_probe_in
+                .map(format_countdown)
+                .unwrap_or_else(|| "-".to_string()),
+        )
+    } else {
+        ("ETA:      ", format_duration(state.eta))
+    }
+}
+
+fn selected_torrent_critical_details(
+    torrent: &TorrentDisplayState,
+    anonymize_torrent_names: bool,
+) -> Option<CriticalDetailsPanel> {
+    if torrent.latest_state.data_available {
+        return None;
+    }
+
+    let (issue_count, first_issue_path) = match &torrent.latest_file_probe_status {
+        Some(TorrentFileProbeStatus::Files(files)) => (
+            files.len(),
+            files.first().map(|file| file.relative_path.clone()),
+        ),
+        _ => (0, None),
+    };
+
+    let saved_location = if let Some(download_path) = &torrent.latest_state.download_path {
+        if let Some(container_name) = torrent.latest_state.container_name.as_deref() {
+            if !container_name.is_empty() {
+                Some(download_path.join(container_name))
+            } else {
+                Some(download_path.clone())
+            }
+        } else {
+            Some(download_path.clone())
+        }
+    } else {
+        None
+    };
+
+    let display_path = if anonymize_torrent_names {
+        "/path/to/torrent/file".to_string()
+    } else {
+        match (saved_location, first_issue_path) {
+            (Some(saved_location), Some(first_issue_path)) => {
+                saved_location.join(first_issue_path).display().to_string()
+            }
+            (Some(saved_location), None) => saved_location.display().to_string(),
+            (None, Some(first_issue_path)) => first_issue_path.display().to_string(),
+            (None, None) => "-".to_string(),
+        }
+    };
+
+    Some(CriticalDetailsPanel {
+        title: "Critical",
+        text: format!(
+            "DATA UNAVAILABLE ({})\nFiles Check: {}\n\n{}",
+            issue_count,
+            torrent
+                .integrity_next_probe_in
+                .map(format_countdown)
+                .unwrap_or_else(|| "-".to_string()),
+            display_path
+        ),
+    })
+}
+
 pub fn draw_network_chart(
     f: &mut Frame,
     app_state: &AppState,
@@ -1485,136 +1872,455 @@ pub fn draw_network_chart(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    let (points_to_show, step_secs, source_points) = match app_state.graph_mode {
-        GraphDisplayMode::OneMinute
-        | GraphDisplayMode::FiveMinutes
-        | GraphDisplayMode::TenMinutes
-        | GraphDisplayMode::ThirtyMinutes
-        | GraphDisplayMode::OneHour => (
-            app_state
-                .graph_mode
-                .as_seconds()
-                .clamp(1, SECONDS_HISTORY_MAX),
-            1_u64,
-            &app_state.network_history_state.tiers.second_1s,
-        ),
-        GraphDisplayMode::ThreeHours
-        | GraphDisplayMode::TwelveHours
-        | GraphDisplayMode::TwentyFourHours => (
-            (app_state.graph_mode.as_seconds() / 60).clamp(1, MINUTES_HISTORY_MAX),
-            60_u64,
-            &app_state.network_history_state.tiers.minute_1m,
-        ),
-        GraphDisplayMode::SevenDays => (
-            7 * 24 * 4,
-            15 * 60_u64,
-            &app_state.network_history_state.tiers.minute_15m,
-        ),
-        GraphDisplayMode::ThirtyDays => (
-            30 * 24 * 4,
-            15 * 60_u64,
-            &app_state.network_history_state.tiers.minute_15m,
-        ),
-        GraphDisplayMode::OneYear => (
-            365 * 24,
-            60 * 60_u64,
-            &app_state.network_history_state.tiers.hour_1h,
-        ),
-    };
-
-    let (dl_history_slice, ul_history_slice, backoff_history_relevant_ms) =
-        build_time_aligned_window(source_points, step_secs, points_to_show, now_unix);
-
-    let stable_max_speed = dl_history_slice
-        .iter()
-        .chain(ul_history_slice.iter())
-        .max()
-        .copied()
-        .unwrap_or(10_000);
-    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
-
+    let (points_to_show, step_secs, tier) = graph_window_spec(app_state.graph_mode);
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
-    let smoothed_dl_data = smooth_data(&dl_history_slice, alpha);
-    let smoothed_ul_data = smooth_data(&ul_history_slice, alpha);
 
-    let dl_data: Vec<(f64, f64)> = smoothed_dl_data
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (i as f64, s as f64))
-        .collect();
-    let ul_data: Vec<(f64, f64)> = smoothed_ul_data
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (i as f64, s as f64))
-        .collect();
+    let mut dataset_specs: Vec<(String, Color, bool, Option<ratatui::widgets::GraphType>)> =
+        Vec::new();
+    let mut dataset_data: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut y_axis_upper: f64;
+    let y_axis_labels: Vec<Span>;
 
-    let backoff_marker_data: Vec<(f64, f64)> = backoff_history_relevant_ms
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &ms)| {
-            if ms > 0 {
-                let y_val = smoothed_dl_data.get(i).copied().unwrap_or(0) as f64;
-                Some((i as f64, y_val))
+    match app_state.chart_panel_view {
+        ChartPanelView::Network => {
+            let source_points = network_points_for_tier(app_state, tier);
+            let (dl_history_slice, ul_history_slice, backoff_history_relevant_ms) =
+                build_time_aligned_window(source_points, step_secs, points_to_show, now_unix);
+            let smoothed_dl_data = smooth_data(&dl_history_slice, alpha);
+            let smoothed_ul_data = smooth_data(&ul_history_slice, alpha);
+            let displayed_max_speed = smoothed_dl_data
+                .iter()
+                .chain(smoothed_ul_data.iter())
+                .max()
+                .copied()
+                .unwrap_or(0);
+            let nice_max_speed = speed_chart_upper_bound(displayed_max_speed);
+            y_axis_upper = nice_max_speed as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::styled(
+                    format_speed(nice_max_speed / 2),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    format_speed(nice_max_speed),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+
+            let dl_data: Vec<(f64, f64)> = smoothed_dl_data
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (i as f64, s as f64))
+                .collect();
+            let ul_data: Vec<(f64, f64)> = smoothed_ul_data
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (i as f64, s as f64))
+                .collect();
+            dataset_data.push(dl_data);
+            dataset_specs.push((
+                "Download".to_string(),
+                ctx.state_info(),
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+            dataset_data.push(ul_data);
+            dataset_specs.push((
+                "Upload".to_string(),
+                ctx.state_success(),
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+
+            let backoff_marker_data: Vec<(f64, f64)> = backoff_history_relevant_ms
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &ms)| {
+                    if ms > 0 {
+                        Some((
+                            i as f64,
+                            smoothed_dl_data.get(i).copied().unwrap_or(0) as f64,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            dataset_data.push(backoff_marker_data);
+            dataset_specs.push((
+                "File Limits".to_string(),
+                ctx.state_error(),
+                true,
+                Some(ratatui::widgets::GraphType::Scatter),
+            ));
+        }
+        ChartPanelView::Cpu => {
+            let points = activity_points_for_tier(&app_state.activity_history_state.cpu, tier);
+            let (cpu_x10, _) =
+                build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+            let smoothed = smooth_data(&cpu_x10, alpha);
+            let cpu_data: Vec<(f64, f64)> = smoothed
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64 / 10.0))
+                .collect();
+            dataset_data.push(cpu_data);
+            dataset_specs.push((
+                "CPU".to_string(),
+                ctx.state_error(),
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+            y_axis_upper = 100.0;
+            y_axis_labels = vec![
+                Span::raw("0%"),
+                Span::styled(
+                    "50%",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    "100%",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+        }
+        ChartPanelView::Ram => {
+            let points = activity_points_for_tier(&app_state.activity_history_state.ram, tier);
+            let (ram_x10, _) =
+                build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+            let smoothed = smooth_data(&ram_x10, alpha);
+            let ram_data: Vec<(f64, f64)> = smoothed
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64 / 10.0))
+                .collect();
+            dataset_data.push(ram_data);
+            dataset_specs.push((
+                "RAM".to_string(),
+                ctx.state_warning(),
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+            y_axis_upper = 100.0;
+            y_axis_labels = vec![
+                Span::raw("0%"),
+                Span::styled(
+                    "50%",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    "100%",
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+        }
+        ChartPanelView::Disk => {
+            let points = activity_points_for_tier(&app_state.activity_history_state.disk, tier);
+            let (read_bps, write_bps) =
+                build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+            let smoothed_read = smooth_data(&read_bps, alpha);
+            let smoothed_write = smooth_data(&write_bps, alpha);
+            let displayed_max_speed = smoothed_read
+                .iter()
+                .chain(smoothed_write.iter())
+                .max()
+                .copied()
+                .unwrap_or(0);
+            let nice_max_speed = speed_chart_upper_bound(displayed_max_speed);
+            y_axis_upper = nice_max_speed as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::styled(
+                    format_speed(nice_max_speed / 2),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    format_speed(nice_max_speed),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+
+            let read_data: Vec<(f64, f64)> = smoothed_read
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64))
+                .collect();
+            let write_data: Vec<(f64, f64)> = smoothed_write
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64))
+                .collect();
+            if disk_series_draw_read_last(&smoothed_read, &smoothed_write) {
+                dataset_data.push(write_data);
+                dataset_specs.push((
+                    "Write".to_string(),
+                    ctx.accent_sky(),
+                    true,
+                    Some(ratatui::widgets::GraphType::Line),
+                ));
+                dataset_data.push(read_data);
+                dataset_specs.push((
+                    "Read".to_string(),
+                    ctx.state_success(),
+                    true,
+                    Some(ratatui::widgets::GraphType::Line),
+                ));
             } else {
-                None
+                dataset_data.push(read_data);
+                dataset_specs.push((
+                    "Read".to_string(),
+                    ctx.state_success(),
+                    true,
+                    Some(ratatui::widgets::GraphType::Line),
+                ));
+                dataset_data.push(write_data);
+                dataset_specs.push((
+                    "Write".to_string(),
+                    ctx.accent_sky(),
+                    true,
+                    Some(ratatui::widgets::GraphType::Line),
+                ));
             }
-        })
-        .collect();
-
-    let backoff_dataset = ratatui::widgets::Dataset::default()
-        .name("File Limits")
-        .marker(ratatui::symbols::Marker::Braille)
-        .graph_type(ratatui::widgets::GraphType::Scatter)
-        .style(
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.state_error())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .data(&backoff_marker_data);
-
-    let datasets = vec![
-        ratatui::widgets::Dataset::default()
-            .name("Download")
-            .marker(ratatui::symbols::Marker::Braille)
-            .style(
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_info())
-                        .add_modifier(Modifier::BOLD),
+        }
+        ChartPanelView::Tuning => {
+            let points = activity_points_for_tier(&app_state.activity_history_state.tuning, tier);
+            let (current_series, best_series) =
+                build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+            let stable_max = current_series
+                .iter()
+                .chain(best_series.iter())
+                .max()
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            y_axis_upper = calculate_nice_upper_bound(stable_max) as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::styled(
+                    (y_axis_upper as u64 / 2).to_string(),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                 ),
-            )
-            .data(&dl_data),
-        ratatui::widgets::Dataset::default()
-            .name("Upload")
-            .marker(ratatui::symbols::Marker::Braille)
-            .style(
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_success())
-                        .add_modifier(Modifier::BOLD),
+                Span::styled(
+                    (y_axis_upper as u64).to_string(),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                 ),
-            )
-            .data(&ul_data),
-        backoff_dataset,
-    ];
+            ];
 
-    let y_speed_axis_labels = vec![
-        Span::raw("0"),
-        Span::styled(
-            format_speed(nice_max_speed / 2),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-        Span::styled(
-            format_speed(nice_max_speed),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-    ];
+            let current_data: Vec<(f64, f64)> = current_series
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64))
+                .collect();
+            let best_data: Vec<(f64, f64)> = best_series
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64, v as f64))
+                .collect();
+            dataset_data.push(current_data);
+            dataset_specs.push((
+                "Current".to_string(),
+                ctx.theme.semantic.text,
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+            dataset_data.push(best_data);
+            dataset_specs.push((
+                "Best".to_string(),
+                ctx.state_success(),
+                false,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+        }
+        ChartPanelView::TorrentOverlay => {
+            let selected_hash = app_state
+                .torrent_list_order
+                .get(app_state.ui.selected_torrent_index)
+                .cloned();
+            let mut max_overlay_speed = 1_u64;
+
+            if let Some(info_hash) = selected_hash {
+                let key = hex::encode(&info_hash);
+                let points = app_state
+                    .activity_history_state
+                    .torrents
+                    .get(&key)
+                    .map(|series| activity_points_for_tier(series, tier))
+                    .unwrap_or(&[]);
+                let (dl_hist, ul_hist) =
+                    build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+                let net_hist: Vec<u64> = dl_hist
+                    .iter()
+                    .zip(ul_hist.iter())
+                    .map(|(dl, ul)| dl.saturating_add(*ul))
+                    .collect();
+                let smoothed = smooth_data(&net_hist, alpha);
+                max_overlay_speed =
+                    max_overlay_speed.max(smoothed.iter().copied().max().unwrap_or(0));
+                dataset_data.push(
+                    smoothed
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| (i as f64, v as f64))
+                        .collect(),
+                );
+                dataset_specs.push((
+                    torrent_activity_label(app_state, &info_hash),
+                    ctx.state_info(),
+                    true,
+                    Some(ratatui::widgets::GraphType::Line),
+                ));
+            }
+
+            let nice_max_speed = speed_chart_upper_bound(max_overlay_speed);
+            y_axis_upper = nice_max_speed as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::styled(
+                    format_speed(nice_max_speed / 2),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    format_speed(nice_max_speed),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+        }
+        ChartPanelView::MultiTorrentOverlay => {
+            let mut ranked: Vec<(Vec<u8>, u64)> = app_state
+                .torrent_list_order
+                .iter()
+                .map(|info_hash| {
+                    (
+                        info_hash.clone(),
+                        torrent_period_traffic(
+                            app_state,
+                            info_hash,
+                            tier,
+                            step_secs,
+                            points_to_show,
+                            now_unix,
+                        ),
+                    )
+                })
+                .filter(|(_, total)| *total > 0)
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut chosen_hashes: Vec<Vec<u8>> =
+                ranked.into_iter().take(5).map(|(hash, _)| hash).collect();
+
+            let mut seen = HashSet::new();
+            chosen_hashes.retain(|hash| seen.insert(hash.clone()));
+            chosen_hashes.sort_by(|a, b| {
+                torrent_period_traffic(app_state, b, tier, step_secs, points_to_show, now_unix).cmp(
+                    &torrent_period_traffic(
+                        app_state,
+                        a,
+                        tier,
+                        step_secs,
+                        points_to_show,
+                        now_unix,
+                    ),
+                )
+            });
+
+            let palette = [
+                ctx.state_info(),
+                ctx.state_success(),
+                ctx.state_warning(),
+                ctx.accent_teal(),
+                ctx.accent_sapphire(),
+                ctx.accent_sky(),
+                ctx.accent_peach(),
+                ctx.accent_maroon(),
+                ctx.state_selected(),
+                ctx.theme.semantic.text,
+            ];
+
+            let mut max_overlay_speed = 1_u64;
+            for info_hash in chosen_hashes {
+                let key = hex::encode(&info_hash);
+                let points = app_state
+                    .activity_history_state
+                    .torrents
+                    .get(&key)
+                    .map(|series| activity_points_for_tier(series, tier))
+                    .unwrap_or(&[]);
+                let (dl_hist, ul_hist) =
+                    build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+                let base_idx = info_hash.iter().fold(0_u64, |acc, b| {
+                    acc.wrapping_mul(131).wrapping_add(*b as u64)
+                }) as usize;
+                let color = palette[base_idx % palette.len()];
+                let label = torrent_activity_label(app_state, &info_hash);
+
+                let net_hist: Vec<u64> = dl_hist
+                    .iter()
+                    .zip(ul_hist.iter())
+                    .map(|(dl, ul)| dl.saturating_add(*ul))
+                    .collect();
+                let smoothed = smooth_data(&net_hist, alpha);
+                max_overlay_speed =
+                    max_overlay_speed.max(smoothed.iter().copied().max().unwrap_or(0));
+                let data: Vec<(f64, f64)> = smoothed
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i as f64, v as f64))
+                    .collect();
+                dataset_data.push(data);
+                dataset_specs.push((label, color, true, Some(ratatui::widgets::GraphType::Line)));
+            }
+
+            let nice_max_speed = speed_chart_upper_bound(max_overlay_speed);
+            y_axis_upper = nice_max_speed as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::styled(
+                    format_speed(nice_max_speed / 2),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+                Span::styled(
+                    format_speed(nice_max_speed),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ];
+        }
+    }
+
+    if y_axis_upper < 1.0 {
+        y_axis_upper = 1.0;
+    }
+
+    let mut datasets: Vec<ratatui::widgets::Dataset> = Vec::with_capacity(dataset_specs.len());
+    for (idx, (name, color, emphasize, graph_type)) in dataset_specs.iter().enumerate() {
+        let mut style = Style::default().fg(*color);
+        if *emphasize {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let mut dataset = ratatui::widgets::Dataset::default()
+            .name(name.clone())
+            .marker(ratatui::symbols::Marker::Braille)
+            .style(ctx.apply(style))
+            .data(&dataset_data[idx]);
+        if let Some(graph_type) = graph_type {
+            dataset = dataset.graph_type(*graph_type);
+        }
+        datasets.push(dataset);
+    }
+
     let x_labels = generate_x_axis_labels(ctx, app_state.graph_mode);
 
+    let all_views = [
+        ChartPanelView::Network,
+        ChartPanelView::Cpu,
+        ChartPanelView::Ram,
+        ChartPanelView::Disk,
+        ChartPanelView::Tuning,
+        ChartPanelView::TorrentOverlay,
+        ChartPanelView::MultiTorrentOverlay,
+    ];
     let all_modes = [
         GraphDisplayMode::OneMinute,
         GraphDisplayMode::FiveMinutes,
@@ -1628,33 +2334,43 @@ pub fn draw_network_chart(
         GraphDisplayMode::ThirtyDays,
         GraphDisplayMode::OneYear,
     ];
+    let view_labels: Vec<&str> = all_views.iter().map(|view| view.to_string()).collect();
+    let mode_labels: Vec<&str> = all_modes.iter().map(|mode| mode.to_string()).collect();
+    let full_title_width = "Activity ".len()
+        + selector_content_width(&view_labels)
+        + " | ".len()
+        + selector_content_width(&mode_labels);
+    let available_title_width = chart_chunk.width.saturating_sub(2) as usize;
+    let use_compact_title = full_title_width > available_title_width;
+    let active_view_idx = all_views
+        .iter()
+        .position(|view| *view == app_state.chart_panel_view)
+        .unwrap_or(0);
+    let active_mode_idx = all_modes
+        .iter()
+        .position(|mode| *mode == app_state.graph_mode)
+        .unwrap_or(0);
+
     let mut title_spans: Vec<Span> = vec![Span::styled(
-        "Network Activity ",
+        "Activity ",
         ctx.apply(Style::default().fg(ctx.accent_peach())),
     )];
-    for (i, &mode) in all_modes.iter().enumerate() {
-        let is_active = mode == app_state.graph_mode;
-        let mode_str = mode.to_string();
-
-        let style = if is_active {
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.state_warning())
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ctx.apply(Style::default().fg(ctx.theme.semantic.surface0))
-        };
-
-        title_spans.push(Span::styled(mode_str, style));
-
-        if i < all_modes.len().saturating_sub(1) {
-            title_spans.push(Span::styled(
-                " ",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-            ));
-        }
-    }
+    title_spans.extend(build_selector_spans(
+        ctx,
+        &view_labels,
+        active_view_idx,
+        use_compact_title,
+    ));
+    title_spans.push(Span::styled(
+        " | ",
+        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+    ));
+    title_spans.extend(build_selector_spans(
+        ctx,
+        &mode_labels,
+        active_mode_idx,
+        use_compact_title,
+    ));
     let chart_title = Line::from(title_spans);
 
     let chart = ratatui::widgets::Chart::new(datasets)
@@ -1673,10 +2389,11 @@ pub fn draw_network_chart(
         .y_axis(
             ratatui::widgets::Axis::default()
                 .style(ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)))
-                .bounds([0.0, nice_max_speed as f64])
-                .labels(y_speed_axis_labels),
+                .bounds([0.0, y_axis_upper])
+                .labels(y_axis_labels),
         )
-        .legend_position(Some(ratatui::widgets::LegendPosition::TopRight));
+        .hidden_legend_constraints(chart_hidden_legend_constraints(app_state.chart_panel_view))
+        .legend_position(chart_legend_position(app_state.chart_panel_view));
 
     f.render_widget(chart, chart_chunk);
 }
@@ -2459,24 +3176,53 @@ pub fn draw_block_stream_and_disk_orb(
         return;
     }
 
+    match block_stream_and_disk_layout_mode(app_state.screen_area, area) {
+        BlockStreamDiskLayoutMode::SideBySide => {
+            let split =
+                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                    .split(area);
+            draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
+            draw_disk_health_panel(f, app_state, split[1], ctx);
+        }
+        BlockStreamDiskLayoutMode::Stacked => {
+            let split = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .split(area);
+            draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
+            draw_disk_health_panel(f, app_state, split[1], ctx);
+        }
+        BlockStreamDiskLayoutMode::DiskOnly => {
+            draw_disk_health_panel(f, app_state, area, ctx);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockStreamDiskLayoutMode {
+    SideBySide,
+    Stacked,
+    DiskOnly,
+}
+
+fn block_stream_and_disk_layout_mode(screen_area: Rect, area: Rect) -> BlockStreamDiskLayoutMode {
+    const FORCE_STACKED_WIDTH: u16 = 34;
+    const HIDE_BLOCKS_SCREEN_WIDTH: u16 = 64;
+
     // Decide split shape using the local pane geometry first; global screen mode can be too coarse
     // and causes unreadable side-by-side micro-panels at transition widths.
-    let force_stacked = area.width < 34 || area.height > area.width.saturating_mul(2);
-    let is_vertical_mode = app_state.screen_area.width < 100
-        || (app_state.screen_area.height as f32 > app_state.screen_area.width as f32 * 0.6);
+    let force_stacked =
+        area.width < FORCE_STACKED_WIDTH || area.height > area.width.saturating_mul(2);
+    let is_vertical_mode =
+        screen_area.width < 100 || (screen_area.height as f32 > screen_area.width as f32 * 0.6);
 
-    if !force_stacked && is_vertical_mode {
-        let split = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(area);
-        draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-        draw_disk_health_panel(f, app_state, split[1], ctx);
-        return;
+    if is_vertical_mode && force_stacked && screen_area.width < HIDE_BLOCKS_SCREEN_WIDTH {
+        return BlockStreamDiskLayoutMode::DiskOnly;
     }
 
-    let split =
-        Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).split(area);
-    draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-    draw_disk_health_panel(f, app_state, split[1], ctx);
+    if !force_stacked && is_vertical_mode {
+        BlockStreamDiskLayoutMode::SideBySide
+    } else {
+        BlockStreamDiskLayoutMode::Stacked
+    }
 }
 
 fn draw_vertical_block_stream_panel(
@@ -3592,45 +4338,70 @@ fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     true
 }
 
-async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
+enum PastedContent<'a> {
+    Magnet(&'a str),
+    TorrentFile(&'a Path),
+    Unsupported,
+}
+
+fn classify_pasted_text(pasted_text: &str) -> PastedContent<'_> {
     let pasted_text = pasted_text.trim();
-
     if pasted_text.starts_with("magnet:") {
-        let download_path = app.client_configs.default_download_folder.clone();
+        return PastedContent::Magnet(pasted_text);
+    }
 
-        app.add_magnet_torrent(
-            "Fetching name...".to_string(),
-            pasted_text.to_string(),
-            download_path.clone(),
-            false,
-            TorrentControlState::Running,
-            HashMap::new(),
-            None,
-        )
-        .await;
+    let path = Path::new(pasted_text);
+    if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
+        return PastedContent::TorrentFile(path);
+    }
 
-        if download_path.is_none() {
-            app.app_state.pending_torrent_link = pasted_text.to_string();
-            let initial_path = app.get_initial_destination_path();
-            let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
-                path: initial_path,
-                browser_mode: FileBrowserMode::DownloadLocSelection {
-                    torrent_files: vec![],
-                    container_name: String::new(),
-                    use_container: false,
-                    is_editing_name: false,
-                    focused_pane: BrowserPane::FileSystem,
-                    preview_tree: Vec::new(),
-                    preview_state: TreeViewState::default(),
-                    cursor_pos: 0,
-                    original_name_backup: "Magnet Download".to_string(),
-                },
-                highlight_path: None,
-            });
+    PastedContent::Unsupported
+}
+
+pub fn accepts_pasted_text(pasted_text: &str) -> bool {
+    !matches!(
+        classify_pasted_text(pasted_text),
+        PastedContent::Unsupported
+    )
+}
+
+async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
+    match classify_pasted_text(pasted_text) {
+        PastedContent::Magnet(magnet_link) => {
+            let download_path = app.client_configs.default_download_folder.clone();
+
+            app.add_magnet_torrent(
+                "Fetching name...".to_string(),
+                magnet_link.to_string(),
+                download_path.clone(),
+                false,
+                TorrentControlState::Running,
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+            if download_path.is_none() {
+                app.app_state.pending_torrent_link = magnet_link.to_string();
+                let initial_path = app.get_initial_destination_path();
+                let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
+                    path: initial_path,
+                    browser_mode: FileBrowserMode::DownloadLocSelection {
+                        torrent_files: vec![],
+                        container_name: String::new(),
+                        use_container: false,
+                        is_editing_name: false,
+                        focused_pane: BrowserPane::FileSystem,
+                        preview_tree: Vec::new(),
+                        preview_state: TreeViewState::default(),
+                        cursor_pos: 0,
+                        original_name_backup: "Magnet Download".to_string(),
+                    },
+                    highlight_path: None,
+                });
+            }
         }
-    } else {
-        let path = Path::new(pasted_text);
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
+        PastedContent::TorrentFile(path) => {
             if let Some(download_path) = app.client_configs.default_download_folder.clone() {
                 app.add_torrent_from_file(
                     path.to_path_buf(),
@@ -3646,47 +4417,44 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     .app_command_tx
                     .try_send(AppCommand::AddTorrentFromFile(path.to_path_buf()));
             }
-        } else {
+        }
+        PastedContent::Unsupported => {
+            let pasted_text = pasted_text.trim();
             tracing_event!(
                 Level::WARN,
-                "Clipboard content not recognized as magnet link or torrent file: {}",
+                "Pasted content not recognized as magnet link or torrent file: {}",
                 pasted_text
             );
-            app.app_state.system_error = Some(
-                "Clipboard content not recognized as magnet link or torrent file.".to_string(),
-            );
+            app.app_state.system_error =
+                Some("Pasted content not recognized as magnet link or torrent file.".to_string());
         }
     }
 }
-
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     match event {
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            let _ = handle_key_press(key.code, app).await;
+            let _ = handle_key_press(key, app).await;
         }
-        #[cfg(not(windows))]
         CrosstermEvent::Paste(pasted_text) => {
             let _ = handle_paste_text(pasted_text.trim().to_string(), app).await;
         }
         _ => {}
     };
 }
-
-async fn handle_key_press(key_code: KeyCode, app: &mut App) -> bool {
-    if handle_search_key(key_code, app) {
+async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
+    if handle_search_key(key.code, app) {
         app.app_state.ui.needs_redraw = true;
         return true;
     }
 
-    if handle_reducer_key(key_code, app).await {
+    if handle_reducer_key(key, app).await {
         return true;
     }
 
     false
 }
-
-async fn handle_reducer_key(key_code: KeyCode, app: &mut App) -> bool {
-    let Some(action) = map_key_to_ui_action(key_code) else {
+async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
+    let Some(action) = map_key_to_ui_action(key) else {
         return false;
     };
 
@@ -3697,7 +4465,6 @@ async fn handle_reducer_key(key_code: KeyCode, app: &mut App) -> bool {
     execute_ui_effects(app, result.effects).await;
     true
 }
-
 async fn handle_paste_text(text: String, app: &mut App) -> bool {
     let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
     if result.redraw {
@@ -3805,22 +4572,6 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;
         }
-        #[cfg(windows)]
-        UiEffect::ReadClipboardAndPaste => match ClipboardContext::new() {
-            Ok(mut ctx) => match ctx.get_contents() {
-                Ok(text) => {
-                    handle_pasted_text(app, text.trim()).await;
-                }
-                Err(e) => {
-                    tracing_event!(Level::ERROR, "Clipboard read error: {}", e);
-                    app.app_state.system_error = Some(format!("Clipboard read error: {}", e));
-                }
-            },
-            Err(e) => {
-                tracing_event!(Level::ERROR, "Clipboard context error: {}", e);
-                app.app_state.system_error = Some(format!("Clipboard initialization error: {}", e));
-            }
-        },
     }
 }
 
@@ -3832,7 +4583,12 @@ mod tests {
         TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
+    use crate::errors::StorageError;
     use crate::theme::{Theme, ThemeContext, ThemeName};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tempfile::tempdir;
 
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
         let mut metrics = TorrentMetrics::default();
@@ -3964,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_graph_actions_cycle_mode() {
+    fn reducer_graph_actions_stop_at_boundaries() {
         let mut app_state = AppState::default();
         let initial = app_state.graph_mode;
 
@@ -3973,8 +4729,249 @@ mod tests {
 
         reduce_ui_action(&mut app_state, UiAction::GraphPrev);
         assert_eq!(app_state.graph_mode, initial);
+
+        app_state.graph_mode = GraphDisplayMode::OneYear;
+        reduce_ui_action(&mut app_state, UiAction::GraphNext);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneYear);
+
+        app_state.graph_mode = GraphDisplayMode::OneMinute;
+        reduce_ui_action(&mut app_state, UiAction::GraphPrev);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneMinute);
     }
 
+    #[test]
+    fn reducer_chart_view_actions_stop_at_boundaries() {
+        let mut app_state = AppState::default();
+        let initial = app_state.chart_panel_view;
+
+        reduce_ui_action(&mut app_state, UiAction::ChartViewNext);
+        assert_eq!(app_state.chart_panel_view, initial.next());
+
+        reduce_ui_action(&mut app_state, UiAction::ChartViewPrev);
+        assert_eq!(app_state.chart_panel_view, initial);
+
+        app_state.chart_panel_view = ChartPanelView::MultiTorrentOverlay;
+        reduce_ui_action(&mut app_state, UiAction::ChartViewNext);
+        assert_eq!(
+            app_state.chart_panel_view,
+            ChartPanelView::MultiTorrentOverlay
+        );
+
+        app_state.chart_panel_view = ChartPanelView::Network;
+        reduce_ui_action(&mut app_state, UiAction::ChartViewPrev);
+        assert_eq!(app_state.chart_panel_view, ChartPanelView::Network);
+    }
+
+    #[test]
+    fn reducer_chart_view_navigation_includes_disk_mode() {
+        assert_eq!(ChartPanelView::Ram.next(), ChartPanelView::Disk);
+        assert_eq!(ChartPanelView::Disk.prev(), ChartPanelView::Ram);
+        assert_eq!(ChartPanelView::Disk.next(), ChartPanelView::Tuning);
+        assert_eq!(
+            ChartPanelView::Tuning.next(),
+            ChartPanelView::TorrentOverlay
+        );
+        assert_eq!(
+            ChartPanelView::TorrentOverlay.next(),
+            ChartPanelView::MultiTorrentOverlay
+        );
+        assert_eq!(
+            ChartPanelView::MultiTorrentOverlay.prev(),
+            ChartPanelView::TorrentOverlay
+        );
+        assert_eq!(
+            ChartPanelView::MultiTorrentOverlay.next(),
+            ChartPanelView::MultiTorrentOverlay
+        );
+        assert_eq!(ChartPanelView::Network.prev(), ChartPanelView::Network);
+    }
+
+    #[test]
+    fn disk_series_draw_order_favors_more_recent_read_activity() {
+        assert!(disk_series_draw_read_last(&[0, 12, 8, 0], &[0, 0, 0, 0]));
+        assert!(!disk_series_draw_read_last(&[0, 0, 0, 0], &[0, 4, 3, 0]));
+    }
+
+    #[test]
+    fn torrent_period_traffic_sums_download_and_upload_over_window() {
+        let mut app_state = AppState::default();
+        let info_hash = vec![9; 20];
+        let key = hex::encode(&info_hash);
+        app_state.activity_history_state.torrents.insert(
+            key,
+            ActivityHistorySeries {
+                tiers: crate::persistence::activity_history::ActivityHistoryTiers {
+                    second_1s: vec![
+                        ActivityHistoryPoint {
+                            ts_unix: 8,
+                            primary: 100,
+                            secondary: 50,
+                        },
+                        ActivityHistoryPoint {
+                            ts_unix: 9,
+                            primary: 25,
+                            secondary: 5,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            torrent_period_traffic(&app_state, &info_hash, HistoryTier::Second1s, 1, 4, 9),
+            180
+        );
+    }
+
+    #[test]
+    fn details_eta_or_probe_text_uses_eta_for_incomplete_torrent() {
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_pieces_total = 10;
+        torrent.latest_state.number_of_pieces_completed = 4;
+        torrent.latest_state.eta = Duration::from_secs(95);
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(30));
+
+        assert_eq!(
+            details_eta_or_probe_text(&torrent),
+            ("ETA:      ", "1m 35s".to_string())
+        );
+    }
+
+    #[test]
+    fn details_eta_or_probe_text_uses_probe_for_completed_torrent() {
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_pieces_total = 10;
+        torrent.latest_state.number_of_pieces_completed = 10;
+        torrent.latest_state.eta = Duration::ZERO;
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(125));
+
+        assert_eq!(
+            details_eta_or_probe_text(&torrent),
+            ("Probe:    ", "2m 5s".to_string())
+        );
+    }
+
+    #[test]
+    fn torrent_overlay_legend_uses_full_chart_constraints() {
+        assert_eq!(
+            chart_hidden_legend_constraints(ChartPanelView::TorrentOverlay),
+            (Constraint::Percentage(100), Constraint::Percentage(100))
+        );
+        assert_eq!(
+            chart_hidden_legend_constraints(ChartPanelView::MultiTorrentOverlay),
+            (Constraint::Percentage(100), Constraint::Percentage(100))
+        );
+        assert_eq!(
+            chart_hidden_legend_constraints(ChartPanelView::Network),
+            (Constraint::Ratio(1, 4), Constraint::Ratio(1, 4))
+        );
+    }
+
+    #[test]
+    fn torrent_overlay_legend_uses_top_left_position() {
+        assert_eq!(
+            chart_legend_position(ChartPanelView::TorrentOverlay),
+            Some(ratatui::widgets::LegendPosition::TopLeft)
+        );
+        assert_eq!(
+            chart_legend_position(ChartPanelView::MultiTorrentOverlay),
+            Some(ratatui::widgets::LegendPosition::TopLeft)
+        );
+        assert_eq!(
+            chart_legend_position(ChartPanelView::Network),
+            Some(ratatui::widgets::LegendPosition::TopRight)
+        );
+    }
+
+    #[test]
+    fn speed_chart_upper_bound_adds_headroom_while_staying_near_peak() {
+        assert_eq!(speed_chart_upper_bound(8_500_000), 10_000_000);
+        assert_eq!(speed_chart_upper_bound(12_000_000), 14_000_000);
+        assert_eq!(speed_chart_upper_bound(0), 10_000);
+    }
+
+    #[test]
+    fn selector_window_returns_full_list_when_not_compact() {
+        let labels = ["NET", "CPU", "RAM", "DISK"];
+        assert_eq!(selector_window(&labels, 1, false), labels);
+    }
+
+    #[test]
+    fn selector_window_centers_active_item_when_compact() {
+        let labels = ["1m", "5m", "10m", "30m", "1h"];
+        assert_eq!(selector_window(&labels, 2, true), vec!["5m", "10m", "30m"]);
+    }
+
+    #[test]
+    fn selector_window_clamps_at_edges_in_compact_mode() {
+        let labels = ["NET", "CPU", "RAM", "DISK", "TUNE", "TOR", "MULTI"];
+        assert_eq!(selector_window(&labels, 0, true), vec!["NET", "CPU", "RAM"]);
+        assert_eq!(
+            selector_window(&labels, labels.len() - 1, true),
+            vec!["TUNE", "TOR", "MULTI"]
+        );
+    }
+
+    #[test]
+    fn selector_active_position_clamps_to_visible_edge_slots() {
+        let labels = ["1m", "5m", "10m", "30m", "1h"];
+        assert_eq!(selector_active_position(labels.len(), 0, true), 0);
+        assert_eq!(selector_active_position(labels.len(), 2, true), 1);
+        assert_eq!(
+            selector_active_position(labels.len(), labels.len() - 1, true),
+            2
+        );
+    }
+    #[test]
+    fn keymap_includes_chart_view_controls() {
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(UiAction::ChartViewNext)
+        );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE)),
+            Some(UiAction::ChartViewPrev)
+        );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn keymap_ignores_control_modified_shortcuts() {
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn accepts_magnet_links_as_paste_candidates() {
+        assert!(accepts_pasted_text(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        ));
+    }
+
+    #[test]
+    fn accepts_existing_torrent_files_as_paste_candidates() {
+        let dir = tempdir().expect("temp dir");
+        let torrent_path = dir.path().join("sample_fixture.torrent");
+        fs::write(&torrent_path, b"sample torrent data").expect("write torrent fixture");
+
+        assert!(accepts_pasted_text(torrent_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn rejects_invalid_paste_candidates() {
+        assert!(!accepts_pasted_text("jj"));
+    }
     #[test]
     fn build_time_aligned_window_snaps_unaligned_now_to_step_boundary() {
         let points = vec![
@@ -4177,6 +5174,87 @@ mod tests {
     }
 
     #[test]
+    fn critical_details_panel_returns_simple_text_for_unavailable_data() {
+        let mut torrent = create_mock_display_state(0);
+        torrent.latest_state.data_available = false;
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(5));
+        torrent.latest_state.download_path = Some("/downloads".into());
+        torrent.latest_state.container_name = Some("sample".to_string());
+        torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
+            crate::torrent_manager::FileProbeEntry {
+                relative_path: "missing.bin".into(),
+                absolute_path: "/tmp/missing.bin".into(),
+                error: StorageError::from(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No such file or directory",
+                )),
+                expected_size: 10,
+                observed_size: None,
+            },
+        ]));
+
+        let panel = selected_torrent_critical_details(&torrent, false)
+            .expect("critical panel should be present for unavailable data");
+        let expected_path = PathBuf::from("/downloads")
+            .join("sample")
+            .join("missing.bin")
+            .display()
+            .to_string();
+        assert_eq!(panel.title, "Critical");
+        assert!(panel.text.contains("DATA UNAVAILABLE (1)"));
+        assert!(panel.text.contains("Files Check: 5s"));
+        assert!(panel.text.contains(&expected_path));
+    }
+
+    #[test]
+    fn critical_details_panel_masks_path_when_anonymized() {
+        let mut torrent = create_mock_display_state(0);
+        torrent.latest_state.data_available = false;
+        torrent.integrity_next_probe_in = Some(Duration::from_secs(5));
+        torrent.latest_state.download_path = Some("/downloads".into());
+        torrent.latest_state.container_name = Some("sample".to_string());
+        torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
+            crate::torrent_manager::FileProbeEntry {
+                relative_path: "missing.bin".into(),
+                absolute_path: "/tmp/missing.bin".into(),
+                error: StorageError::from(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No such file or directory",
+                )),
+                expected_size: 10,
+                observed_size: None,
+            },
+        ]));
+
+        let panel = selected_torrent_critical_details(&torrent, true)
+            .expect("critical panel should be present for unavailable data");
+        let unexpected_path = PathBuf::from("/downloads")
+            .join("sample")
+            .join("missing.bin")
+            .display()
+            .to_string();
+        assert_eq!(panel.title, "Critical");
+        assert!(panel.text.contains("DATA UNAVAILABLE (1)"));
+        assert!(panel.text.contains("Files Check: 5s"));
+        assert!(panel.text.contains("/path/to/torrent/file"));
+        assert!(!panel.text.contains(&unexpected_path));
+    }
+
+    #[test]
+    fn torrent_list_row_color_uses_error_when_data_is_unavailable() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let mut torrent = create_mock_display_state(0);
+
+        assert_eq!(
+            torrent_list_row_color(&torrent, &ctx),
+            ctx.theme.semantic.text
+        );
+
+        torrent.latest_state.data_available = false;
+        assert_eq!(torrent_list_row_color(&torrent, &ctx), ctx.state_error());
+    }
+
+    #[test]
     fn reducer_open_help_emits_help_effect() {
         let mut app_state = create_test_app_state();
         let out = reduce_ui_action(&mut app_state, UiAction::OpenHelp);
@@ -4217,6 +5295,27 @@ mod tests {
         let data = [0_u64, 10, 0];
         let smoothed = peer_stream_smoothed_activity(&data, 1);
         assert!((smoothed - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn block_stream_and_disk_layout_uses_side_by_side_when_vertical_and_roomy() {
+        let mode =
+            block_stream_and_disk_layout_mode(Rect::new(0, 0, 90, 70), Rect::new(0, 0, 40, 18));
+        assert_eq!(mode, BlockStreamDiskLayoutMode::SideBySide);
+    }
+
+    #[test]
+    fn block_stream_and_disk_layout_hides_blocks_when_vertical_stack_gets_too_narrow() {
+        let mode =
+            block_stream_and_disk_layout_mode(Rect::new(0, 0, 63, 90), Rect::new(0, 0, 33, 18));
+        assert_eq!(mode, BlockStreamDiskLayoutMode::DiskOnly);
+    }
+
+    #[test]
+    fn block_stream_and_disk_layout_keeps_stacked_mode_above_hide_breakpoint() {
+        let mode =
+            block_stream_and_disk_layout_mode(Rect::new(0, 0, 64, 90), Rect::new(0, 0, 33, 18));
+        assert_eq!(mode, BlockStreamDiskLayoutMode::Stacked);
     }
 
     #[test]

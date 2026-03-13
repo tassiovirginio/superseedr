@@ -82,6 +82,15 @@ impl TokenBucket {
     }
 
     #[cfg(test)]
+    pub fn rewind_last_refill_time(&self, duration: Duration) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.last_refill_time = guard
+            .last_refill_time
+            .checked_sub(duration)
+            .unwrap_or_else(Instant::now);
+    }
+
+    #[cfg(test)]
     fn get_fill_rate(&self) -> f64 {
         self.inner.lock().unwrap().fill_rate
     }
@@ -161,7 +170,7 @@ pub async fn consume_tokens(bucket: &TokenBucket, amount_tokens: f64) {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::time::{sleep, Instant};
+    use tokio::time::Instant;
 
     const TOLERANCE: f64 = 1e-3;
     const TIMING_TOLERANCE: f64 = 0.15;
@@ -203,7 +212,7 @@ mod tests {
         bucket.set_tokens(0.0);
         assert!(bucket.get_tokens().abs() < TOLERANCE);
 
-        sleep(Duration::from_secs(2)).await;
+        bucket.rewind_last_refill_time(Duration::from_secs(2));
 
         {
             let mut g = bucket.inner.lock().unwrap();

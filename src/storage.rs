@@ -194,7 +194,7 @@ pub async fn read_data_from_disk(
         }
     }
 
-    Err(StorageError::Io(std::io::Error::new(
+    Err(StorageError::from(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "Failed to read all data, offset likely out of bounds",
     )))
@@ -263,7 +263,7 @@ pub async fn write_data_to_disk(
         global_offset
     );
 
-    Err(StorageError::Io(std::io::Error::new(
+    Err(StorageError::from(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "Failed to write all data, offset likely out of bounds",
     )))
@@ -317,7 +317,6 @@ pub async fn build_fs_tree(
 mod tests {
     use super::*;
     use crate::app::FilePriority;
-    use crate::errors::StorageError;
     use crate::torrent_file::InfoFile;
 
     use std::collections::HashMap;
@@ -564,8 +563,14 @@ mod tests {
 
         let res = read_data_from_disk(&mfi, 95, 10).await;
         assert!(res.is_err());
-        if let Err(StorageError::Io(err)) = res {
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        if let Err(err) = res {
+            assert!(matches!(
+                err,
+                StorageError::Io {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                }
+            ));
         } else {
             panic!("Expected Io Error");
         }
@@ -583,8 +588,14 @@ mod tests {
         let data = vec![1; 10];
         let res = write_data_to_disk(&mfi, 95, &data).await;
         assert!(res.is_err());
-        if let Err(StorageError::Io(err)) = res {
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        if let Err(err) = res {
+            assert!(matches!(
+                err,
+                StorageError::Io {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                }
+            ));
         } else {
             panic!("Expected Io Error");
         }

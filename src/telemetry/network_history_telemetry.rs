@@ -7,6 +7,7 @@ use crate::persistence::network_history::{
     NetworkHistoryRollupState, NetworkHistoryTiers, HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP,
     SECOND_1S_CAP,
 };
+use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -143,75 +144,17 @@ fn densify_tier_points(
     max_points: usize,
     now_unix: u64,
 ) -> Vec<NetworkHistoryPoint> {
-    if points.is_empty() || step_secs == 0 || max_points == 0 {
-        return Vec::new();
-    }
-
-    let dense_end_ts = densified_end_ts(points[points.len() - 1].ts_unix, step_secs, now_unix);
-    let max_window_span = step_secs.saturating_mul(max_points.saturating_sub(1) as u64);
-    let dense_start_ts = points[0]
-        .ts_unix
-        .max(dense_end_ts.saturating_sub(max_window_span));
-
-    let mut start_idx = 0;
-    while start_idx < points.len() && points[start_idx].ts_unix < dense_start_ts {
-        start_idx += 1;
-    }
-
-    let mut dense = Vec::with_capacity(max_points);
-    let mut next_ts = dense_start_ts;
-
-    for point in &points[start_idx..] {
-        while next_ts < point.ts_unix && next_ts <= dense_end_ts {
-            dense.push(NetworkHistoryPoint {
-                ts_unix: next_ts,
-                ..Default::default()
-            });
-            let advanced_ts = next_ts.saturating_add(step_secs);
-            if advanced_ts == next_ts {
-                return dense;
-            }
-            next_ts = advanced_ts;
-        }
-
-        if next_ts > dense_end_ts {
-            break;
-        }
-
-        dense.push(point.clone());
-        if point.ts_unix >= dense_end_ts {
-            return dense;
-        }
-
-        let advanced_ts = point.ts_unix.saturating_add(step_secs);
-        if advanced_ts == point.ts_unix {
-            return dense;
-        }
-        next_ts = advanced_ts;
-    }
-
-    while next_ts <= dense_end_ts {
-        dense.push(NetworkHistoryPoint {
-            ts_unix: next_ts,
+    densify_points_for_restore(
+        points,
+        step_secs,
+        max_points,
+        now_unix,
+        |point| point.ts_unix,
+        |ts_unix| NetworkHistoryPoint {
+            ts_unix,
             ..Default::default()
-        });
-        let advanced_ts = next_ts.saturating_add(step_secs);
-        if advanced_ts == next_ts {
-            break;
-        }
-        next_ts = advanced_ts;
-    }
-
-    dense
-}
-
-fn densified_end_ts(last_point_ts: u64, step_secs: u64, now_unix: u64) -> u64 {
-    if last_point_ts >= now_unix {
-        return last_point_ts;
-    }
-
-    let trailing_steps = (now_unix - last_point_ts) / step_secs;
-    last_point_ts.saturating_add(trailing_steps.saturating_mul(step_secs))
+        },
+    )
 }
 
 fn densify_state_for_restore(

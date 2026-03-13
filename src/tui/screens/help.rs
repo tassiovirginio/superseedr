@@ -26,20 +26,9 @@ pub struct HelpReduceResult {
     pub effects: Vec<HelpEffect>,
 }
 
-#[cfg(windows)]
 fn map_key_to_help_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<HelpAction> {
     if key_kind == KeyEventKind::Press
         && (key_code == KeyCode::Esc || key_code == KeyCode::Char('m'))
-    {
-        return Some(HelpAction::Close);
-    }
-    None
-}
-
-#[cfg(not(windows))]
-fn map_key_to_help_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<HelpAction> {
-    if (key_code == KeyCode::Esc && key_kind == KeyEventKind::Press)
-        || (key_code == KeyCode::Char('m') && key_kind == KeyEventKind::Release)
     {
         return Some(HelpAction::Close);
     }
@@ -356,10 +345,12 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
-                        "Paste | v",
+                        "Paste",
                         ctx.apply(Style::default().fg(ctx.accent_sapphire())),
                     )),
-                    Cell::from("Paste a magnet link or local file path to add"),
+                    Cell::from(
+                        "Use your terminal paste shortcut to add a magnet link or file path",
+                    ),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
@@ -379,7 +370,14 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                         "t / T",
                         ctx.apply(Style::default().fg(ctx.accent_teal())),
                     )),
-                    Cell::from("Switch network graph time scale forward/backward"),
+                    Cell::from("Switch graph time scale forward/backward"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "g / G",
+                        ctx.apply(Style::default().fg(ctx.accent_teal())),
+                    )),
+                    Cell::from("Switch chart panel view forward/backward"),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
@@ -733,6 +731,21 @@ mod tests {
 
         handle_event(
             CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn help_m_press_returns_to_normal() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             &mut app_state,
         );
 

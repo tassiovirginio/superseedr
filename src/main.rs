@@ -6,6 +6,7 @@ mod command;
 mod config;
 mod errors;
 mod integrations;
+mod integrity_scheduler;
 mod networking;
 mod persistence;
 mod resource_manager;
@@ -22,7 +23,6 @@ mod tuning;
 use app::App;
 use rand::Rng;
 
-use fs2::FileExt;
 use std::fs;
 use std::fs::File;
 
@@ -42,15 +42,14 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-// Conditionally import the flags ONLY on non-Windows platforms
 #[cfg(not(windows))]
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
 use clap::Parser;
@@ -61,9 +60,6 @@ const DEFAULT_LOG_FILTER: LevelFilter = LevelFilter::INFO;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //#[cfg(feature = "console")]
-    //console_subscriber::init();
-
     let base_data_dir = config::get_app_paths()
         .map(|(_, data_dir)| data_dir)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -143,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(lock_path) = get_lock_path() {
         if let Ok(file) = File::create(&lock_path) {
-            if file.try_lock_exclusive().is_ok() {
+            if file.try_lock().is_ok() {
                 _lock_file_handle = Some(file);
             } else {
                 proceed_to_app = false;
@@ -252,15 +248,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_raw_mode()?;
         let mut stdout = stdout();
         execute!(stdout, EnterAlternateScreen,)?;
+        let _ = execute!(stdout, EnableBracketedPaste);
 
-        // This command ONLY runs on non-Windows platforms (like Linux)
         #[cfg(not(windows))]
         {
-            execute!(
+            let _ = execute!(
                 stdout,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
-                EnableBracketedPaste
-            )?;
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            );
         }
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -288,11 +283,11 @@ fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
     let _ = disable_raw_mode();
     // Common cleanup for all platforms
     let _ = execute!(stdout(), LeaveAlternateScreen,);
+    let _ = execute!(stdout(), DisableBracketedPaste);
 
-    // Corresponding cleanup ONLY for non-Windows platforms
     #[cfg(not(windows))]
     {
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste);
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
 
     Ok(())

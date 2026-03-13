@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v1.0.3
+### 🚀 New Features
+- **Persistent Activity History Charts**: Added on-disk activity history for per-torrent and system activity charts, so chart views can restore meaningful trend data after restart.
+- **Expanded Activity Chart Views**: Added richer chart panels for CPU, RAM, disk activity, tuning, per-torrent overlays, and multi-torrent comparisons, with longer-range history views for deeper monitoring.
+- **Torrent Data Availability Probing**: Added active data-availability checks that can detect missing or inaccessible torrent data and surface the issue directly in the interface.
+
+### ✨ Improvements
+- **Integrity Recovery Scheduling**: Added a dedicated integrity probe scheduler so completed and active torrents are rechecked more predictably without overloading normal download activity.
+- **Chart Readability and Navigation**: Refined chart rendering with clearer line-based traffic views, better speed scaling, and smoother switching between overlay modes and graph panels.
+- **Connection Resilience**: Hardened peer handling with inbound handshake timeouts and protection against abusive message floods, helping sessions recover more cleanly under hostile or stalled network conditions.
+- **Probe UI Clarity**: Improved the torrent details and probe display so data-availability issues and follow-up checks are easier to understand at a glance.
+
+### 🐛 Bug Fixes
+- **Per-Torrent Activity History Preservation**: Torrent activity charts now keep their history intact while you search or filter the list, so hidden active torrents do not lose their recorded trend data.
+- **Saved-Location Integrity Recovery**: File-availability faults now trigger immediate re-checks only for the affected saved location, preventing unrelated torrents in the same download root from being unnecessarily reprobed.
+
 ## Release v1.0.2
 ### 🚀 New Features
 - **Persistent Network History**: Added on-disk network history so charts can restore download, upload, and backoff data after restart.

@@ -155,6 +155,9 @@ impl UiTelemetry {
             display_state.latest_state.torrent_name = message.torrent_name;
         }
         display_state.latest_state.container_name = message.container_name;
+        display_state.latest_state.file_count = message.file_count;
+        display_state.latest_state.data_available = message.data_available;
+        display_state.latest_state.is_complete = message.is_complete;
         display_state.latest_state.total_size = message.total_size;
         display_state.latest_state.bytes_written = message.bytes_written;
 
@@ -307,18 +310,8 @@ impl UiTelemetry {
             app_state.disk_write_history.remove(0);
         }
 
-        app_state.avg_disk_read_bps = if app_state.disk_read_history.is_empty() {
-            0
-        } else {
-            app_state.disk_read_history.iter().sum::<u64>()
-                / app_state.disk_read_history.len() as u64
-        };
-        app_state.avg_disk_write_bps = if app_state.disk_write_history.is_empty() {
-            0
-        } else {
-            app_state.disk_write_history.iter().sum::<u64>()
-                / app_state.disk_write_history.len() as u64
-        };
+        app_state.avg_disk_read_bps = global_disk_read_bps;
+        app_state.avg_disk_write_bps = global_disk_write_bps;
 
         let mut total_dl = 0;
         let mut total_ul = 0;
@@ -581,6 +574,7 @@ mod tests {
         let mut message = TorrentMetrics {
             info_hash: vec![7; 20],
             torrent_name: "test".to_string(),
+            file_count: Some(3),
             number_of_pieces_total: 10,
             number_of_pieces_completed: 3,
             download_speed_bps: 512,
@@ -601,6 +595,7 @@ mod tests {
         assert_eq!(app_state.session_total_uploaded, 16);
 
         let state = app_state.torrents.get(&vec![7; 20]).unwrap();
+        assert_eq!(state.latest_state.file_count, Some(3));
         assert_eq!(state.latest_state.download_speed_bps, 512);
         assert_eq!(state.latest_state.upload_speed_bps, 128);
         assert_eq!(state.download_history.len(), 1);
@@ -696,6 +691,28 @@ mod tests {
         UiTelemetry::on_metrics(&mut app_state, tick_b);
 
         assert_eq!(app_state.session_total_downloaded, 128);
+    }
+
+    #[test]
+    fn disk_speed_uses_current_tick_and_returns_to_zero_when_idle() {
+        let mut app_state = AppState::default();
+        let torrent = TorrentDisplayState {
+            bytes_read_this_tick: 1_024,
+            bytes_written_this_tick: 2_048,
+            ..TorrentDisplayState::default()
+        };
+        app_state.torrents.insert(vec![3; 20], torrent);
+
+        let mut sys = System::new();
+        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+
+        assert_eq!(app_state.avg_disk_read_bps, 8_192);
+        assert_eq!(app_state.avg_disk_write_bps, 16_384);
+
+        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+
+        assert_eq!(app_state.avg_disk_read_bps, 0);
+        assert_eq!(app_state.avg_disk_write_bps, 0);
     }
 
     #[test]

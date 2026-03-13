@@ -16,9 +16,9 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 | **Experience** | **Networking** | **Engineering** |
 | :--- | :--- | :--- |
-| 🎨 **60 FPS TUI**<br>Fluid, animated interface with heatmaps. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
+| 🎨 **60 FPS TUI + Themes**<br>Fluid, animated interface with heatmaps and 40 live-switchable built-in themes. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
 | 📊 **Deep Analytics**<br>Real-time bandwidth graphs & peer metrics. | 📰 **RSS Feeds**<br>In-app feed tracking, filtering, and ingest. | 🧠 **Self-Tuning**<br>Adaptive limits control for max speed and I/O Stability. |
-| 🧲 **Magnet Links**<br>Native OS-level handler support. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 🎨 **Themes**<br>Large built-in theme library with live switching. |
+| 🧲 **Magnet Links**<br>Native OS-level handler support. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 📡 **Integrity Prober**<br>Continuous lightweight background integrity checks with fast recovery reprobes. |
 
 ### Terminal Torrenting With Superseedr
 
@@ -82,7 +82,7 @@ superseedr
 - 🗺️[Roadmap](ROADMAP.md): Discover upcoming features and future plans for Superseedr.
 - 🧑‍🤝‍🧑[Code of Conduct](CODE_OF_CONDUCT.md): Understand the community standards and expectations.
 
-## Running with Docker
+## 🐳 Running with Docker
 
 Superseedr offers a fully secured Docker setup using Gluetun. All BitTorrent traffic is routed through a VPN tunnel with dynamic port forwarding and zero manual network configuration.
 
@@ -182,7 +182,7 @@ docker compose -f docker-compose.standalone.yml up -d && docker compose attach s
 
 </details>
 
-## Integrations & Automation
+## 🔗 Integrations & Automation
 
 Superseedr includes several integration points designed for automation, headless operation, and easy pairing with VPN containers like Gluetun.
 For dockerized interoperability tests, see `docs/integration-harness.md`.
@@ -269,6 +269,12 @@ The application logic abandons traditional mutex-heavy threading in favor of a *
 Instead of static `ulimit` values, Superseedr runs a **Stochastic Hill Climbing** optimizer in the background.
 * **The Loop:** Every 90 seconds, it randomly reallocates internal permits between competing resources—**Peer Sockets**, **Disk Read Slots**, and **Disk Write Slots**—to find the local maximum for performance.
 * **Universal Optimization:** This algorithm dynamically discovers the optimal configuration for *any* combination of hardware (SSD vs HDD) and network environment (Home Fiber vs Datacenter), automatically scaling concurrency to match capacity.
+
+### 📡 Integrity Prober
+Superseedr automatically and continuously checks completed torrents in the background without falling back to blunt full-library rescans.
+* **Designed for Scale:** Integrity work is split into small bounded batches, keeping checks cheap even across very large collections.
+* **Fast Fault Detection:** Foreground disk-read failures immediately trigger targeted recovery reprobes, surfacing missing or damaged data quickly.
+* **No-Config Recovery:** Healthy torrents are monitored automatically, while unavailable torrents are prioritized for fast recovery detection without extra setup.
 
 ### 🧮 Statistical Engine
 Superseedr calculates granular metrics in real-time to drive optimization and observability:

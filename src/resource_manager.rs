@@ -264,7 +264,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{advance, sleep, timeout};
 
     /// Helper function to create a map of limits for the manager.
     fn create_limits(
@@ -315,7 +315,7 @@ mod tests {
         let queue_size = 20_000;
         let worker_count = 64;
         let work_time = Duration::from_millis(10);
-        let run_time = Duration::from_millis(1_200);
+        let run_steps = 120;
 
         let limits = create_trial_limits(resource, limit, queue_size);
         let (client, manager_handle) = setup_manager(limits);
@@ -358,9 +358,14 @@ mod tests {
             }));
         }
 
-        sleep(run_time).await;
+        for _ in 0..run_steps {
+            tokio::task::yield_now().await;
+            advance(work_time).await;
+        }
         stop.store(true, Ordering::Relaxed);
-        sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        advance(work_time).await;
+        tokio::task::yield_now().await;
 
         for worker in workers {
             worker.abort();
@@ -675,7 +680,7 @@ mod tests {
         assert!(result.unwrap().is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_disk_permit_throughput_roughly_halves_when_limit_halves() {
         let baseline_limit = 16;
         let half_limit = baseline_limit / 2;
@@ -713,7 +718,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_peer_limit_throughput_roughly_halves_when_limit_halves() {
         let baseline_limit = 16;
         let half_limit = baseline_limit / 2;
