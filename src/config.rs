@@ -601,24 +601,48 @@ fn shared_config_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn resolve_host_id() -> String {
-    if let Ok(host_id) = env::var(SHARED_HOST_ID_ENV) {
-        let sanitized = sanitize_host_id(&host_id);
-        if !sanitized.is_empty() {
-            return sanitized;
+fn sanitized_host_id_candidate(raw: &str) -> Option<String> {
+    let sanitized = sanitize_host_id(raw);
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn resolve_host_id_from_sources(
+    explicit_host_id: Option<String>,
+    env_hostnames: Vec<String>,
+    system_hostname: Option<String>,
+) -> String {
+    if let Some(host_id) = explicit_host_id
+        .as_deref()
+        .and_then(sanitized_host_id_candidate)
+    {
+        return host_id;
+    }
+
+    for hostname in env_hostnames {
+        if let Some(host_id) = sanitized_host_id_candidate(&hostname) {
+            return host_id;
         }
     }
 
-    for key in ["HOSTNAME", "COMPUTERNAME"] {
-        if let Ok(hostname) = env::var(key) {
-            let sanitized = sanitize_host_id(&hostname);
-            if !sanitized.is_empty() {
-                return sanitized;
-            }
-        }
+    if let Some(host_id) = system_hostname
+        .as_deref()
+        .and_then(sanitized_host_id_candidate)
+    {
+        return host_id;
     }
 
     "default-host".to_string()
+}
+
+fn resolve_host_id() -> String {
+    let explicit_host_id = env::var(SHARED_HOST_ID_ENV).ok();
+    let env_hostnames = ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .filter_map(|key| env::var(key).ok())
+        .collect();
+    let system_hostname = sysinfo::System::host_name();
+
+    resolve_host_id_from_sources(explicit_host_id, env_hostnames, system_hostname)
 }
 
 fn resolve_shared_config_paths() -> io::Result<Option<SharedConfigPaths>> {
@@ -1372,6 +1396,28 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_host_id_uses_system_hostname_fallback() {
+        let resolved = resolve_host_id_from_sources(
+            None,
+            Vec::new(),
+            Some("MacBook Pro.local".to_string()),
+        );
+
+        assert_eq!(resolved, "macbook-pro.local");
+    }
+
+    #[test]
+    fn test_resolve_host_id_prefers_explicit_override() {
+        let resolved = resolve_host_id_from_sources(
+            Some("Custom Laptop".to_string()),
+            vec!["IgnoredHost".to_string()],
+            Some("IgnoredSystem".to_string()),
+        );
+
+        assert_eq!(resolved, "custom-laptop");
+    }
+
+    #[test]
     fn test_shared_torrent_source_round_trip() {
         let shared_root = Path::new("/shared-root");
         let absolute = "/shared-root/torrents/0123456789abcdef0123456789abcdef01234567.torrent";
@@ -1611,6 +1657,8 @@ mod tests {
         assert!(host_contents.contains("client_id = \"host-override\""));
     }
 }
+
+
 
 
 
