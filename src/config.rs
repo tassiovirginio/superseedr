@@ -1221,6 +1221,14 @@ pub fn create_watch_directories() -> io::Result<()> {
     Ok(())
 }
 
+pub fn ensure_watch_directories(settings: &Settings) -> io::Result<()> {
+    create_watch_directories()?;
+    for watch_path in configured_watch_paths(settings) {
+        fs::create_dir_all(&watch_path)?;
+    }
+    Ok(())
+}
+
 pub fn load_settings() -> io::Result<Settings> {
     resolve_config_backend()?.load_settings()
 }
@@ -1915,5 +1923,3 @@ mod tests {
         );
     }
 }
-
-

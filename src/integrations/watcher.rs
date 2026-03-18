@@ -5,6 +5,7 @@ use crate::app::AppCommand;
 use crate::config::{
     configured_watch_paths, is_shared_config_path, shared_config_watch_paths, Settings,
 };
+use crate::integrations::control::read_control_request;
 use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,21 @@ pub fn path_to_command(path: &Path) -> Option<AppCommand> {
         "torrent" => Some(AppCommand::AddTorrentFromFile(path.to_path_buf())),
         "path" => Some(AppCommand::AddTorrentFromPathFile(path.to_path_buf())),
         "magnet" => Some(AppCommand::AddMagnetFromFile(path.to_path_buf())),
+        "control" => match read_control_request(path) {
+            Ok(request) => Some(AppCommand::ControlRequest {
+                path: path.to_path_buf(),
+                request,
+            }),
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to parse control request {:?}: {}",
+                    path,
+                    error
+                );
+                None
+            }
+        },
         "cmd" if path.file_name().is_some_and(|name| name == "shutdown.cmd") => {
             Some(AppCommand::ClientShutdown(path.to_path_buf()))
         }
@@ -152,6 +168,7 @@ pub fn path_to_command(path: &Path) -> Option<AppCommand> {
 mod tests {
     use super::*;
     use crate::app::AppCommand;
+    use crate::integrations::control::{write_control_request, ControlRequest};
     use notify::EventKind;
     use std::fs::File;
     use std::time::Duration;
@@ -187,6 +204,22 @@ mod tests {
             let cmd = path_to_command(path);
             assert!(matches!(cmd, Some(AppCommand::AddTorrentFromPathFile(_))));
         });
+    }
+
+    #[test]
+    fn test_path_to_command_control_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = write_control_request(&ControlRequest::StatusNow, dir.path())
+            .expect("write control request");
+
+        let cmd = path_to_command(&path);
+        assert!(matches!(
+            cmd,
+            Some(AppCommand::ControlRequest {
+                request: ControlRequest::StatusNow,
+                ..
+            })
+        ));
     }
 
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {
@@ -252,7 +285,10 @@ mod tests {
         .await
         .expect("timed out waiting for watch event");
 
-        assert!(matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)));
+        assert!(matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_)
+        ));
 
         if let Some(value) = original {
             std::env::set_var("SUPERSEEDR_WATCH_PATH_1", value);
@@ -296,6 +332,3 @@ mod tests {
         let _ = fs::remove_dir(dir);
     }
 }
-
-
-

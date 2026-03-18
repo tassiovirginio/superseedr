@@ -25,11 +25,27 @@ use rand::Rng;
 
 use std::fs;
 use std::fs::File;
+use std::io;
+use std::io::Write;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use crate::config::load_settings;
 use crate::config::Settings;
+use crate::config::{load_settings, resolve_command_watch_path};
+use crate::integrations::cli::{
+    command_to_control_request, status_file_modified_at, wait_for_status_json_after,
+    write_control_command, write_input_command, write_stop_command, Cli, Commands,
+};
+use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
+use crate::integrations::status::offline_output_json;
+use crate::persistence::event_journal::{
+    append_event_journal_entry, event_journal_json, load_event_journal_state,
+    save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
+    EventType,
+};
+use crate::torrent_file::parser::from_bytes;
+use magnet_url::Magnet;
 
 use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::rolling::Rotation;
@@ -93,62 +109,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("STARTING SUPERSEEDR");
 
-    if let Err(e) = config::create_watch_directories() {
+    let cli = Cli::parse();
+    let loaded_settings = load_settings()?;
+
+    if let Err(e) = config::ensure_watch_directories(&loaded_settings) {
         tracing::error!("Failed to create watch directories: {}", e);
     }
 
-    let cli = integrations::cli::Cli::parse();
-    let loaded_settings = load_settings()?;
-    let mut command_processed = false;
+    let has_cli_request = cli.input.is_some() || cli.command.is_some();
+    let mut _lock_file_handle = try_acquire_app_lock()?;
+    let app_is_running = _lock_file_handle.is_none();
 
-    if let Some(direct_input) = cli.input {
-        if let Some(watch_path) = config::resolve_command_watch_path(&loaded_settings) {
-            let _ = fs::create_dir_all(&watch_path);
-            tracing::info!("Processing direct input: {}", direct_input);
-            integrations::cli::process_input(&direct_input, &watch_path);
-            command_processed = true;
-        } else {
-            tracing::error!("Could not get watch path to process direct input.");
+    if has_cli_request {
+        if let Err(error) = process_cli_request(&cli, &loaded_settings, app_is_running) {
+            eprintln!("[Error] Application failed: {}", error);
+            std::process::exit(1);
         }
-    } else if let Some(command) = cli.command {
-        if let Some(watch_path) = config::resolve_command_watch_path(&loaded_settings) {
-            let _ = fs::create_dir_all(&watch_path);
-            command_processed = true;
-            match command {
-                integrations::cli::Commands::StopClient => {
-                    tracing::info!("Processing StopClient command.");
-                    let file_path = watch_path.join("shutdown.cmd");
-                    if let Err(e) = fs::write(&file_path, "STOP") {
-                        tracing::error!("Failed to write stop command file: {}", e);
-                    }
-                }
-                integrations::cli::Commands::Add { input } => {
-                    tracing::info!("Processing Add subcommand input: {}", input);
-                    integrations::cli::process_input(&input, &watch_path);
-                }
-            }
-        } else {
-            tracing::error!("Could not get watch path to process subcommand.");
-        }
-    }
-    if command_processed {
         tracing::info!("Command processed, exiting temporary instance.");
         return Ok(());
     }
 
-    let mut proceed_to_app = true;
-    let mut _lock_file_handle: Option<File> = None;
-
-    if let Some(lock_path) = get_lock_path() {
-        if let Ok(file) = File::create(&lock_path) {
-            if file.try_lock().is_ok() {
-                _lock_file_handle = Some(file);
-            } else {
-                proceed_to_app = false;
-            }
-        }
-    }
-    if proceed_to_app {
+    if _lock_file_handle.is_some() {
         let mut client_configs = loaded_settings;
 
         #[cfg(all(feature = "dht", feature = "pex"))]
@@ -284,6 +265,389 @@ fn get_lock_path() -> Option<PathBuf> {
     Some(base_data_dir.join("superseedr.lock"))
 }
 
+fn try_acquire_app_lock() -> io::Result<Option<File>> {
+    let Some(lock_path) = get_lock_path() else {
+        return Ok(None);
+    };
+    let file = File::create(lock_path)?;
+    if file.try_lock().is_ok() {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> io::Result<()> {
+    if let Some(direct_input) = &cli.input {
+        let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not resolve the command watch path",
+            )
+        })?;
+        tracing::info!("Processing direct input: {}", direct_input);
+        let command_path = write_input_command(direct_input, &watch_path)?;
+        println!("Queued add command at {}", command_path.display());
+        return Ok(());
+    }
+
+    let Some(command) = &cli.command else {
+        return Ok(());
+    };
+
+    match command {
+        Commands::Add { input } => {
+            let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Could not resolve the command watch path",
+                )
+            })?;
+            tracing::info!("Processing Add subcommand input: {}", input);
+            let command_path = write_input_command(input, &watch_path)?;
+            println!("Queued add command at {}", command_path.display());
+            Ok(())
+        }
+        Commands::Journal => {
+            println!("{}", event_journal_json()?);
+            Ok(())
+        }
+        Commands::StopClient => {
+            if !app_is_running {
+                println!("superseedr is not running.");
+                return Ok(());
+            }
+            let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Could not resolve the command watch path",
+                )
+            })?;
+            tracing::info!("Processing StopClient command.");
+            let _ = write_stop_command(&watch_path)?;
+            println!("Queued stop request.");
+            Ok(())
+        }
+        _ => {
+            let request = command_to_control_request(command)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Unsupported command")
+                })?;
+
+            if app_is_running {
+                process_online_control_request(settings, &request)
+            } else {
+                process_offline_control_request(settings, &request)
+            }
+        }
+    }
+}
+
+fn process_online_control_request(settings: &Settings, request: &ControlRequest) -> io::Result<()> {
+    let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve the command watch path",
+        )
+    })?;
+
+    match request {
+        ControlRequest::StatusNow => {
+            let previous_modified_at = status_file_modified_at()?;
+            let _ = write_control_command(request, &watch_path)?;
+            let json = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+            println!("{}", json);
+            Ok(())
+        }
+        ControlRequest::StatusFollowStart { interval_secs } => {
+            let mut last_modified_at = status_file_modified_at()?;
+            let _ = write_control_command(request, &watch_path)?;
+            loop {
+                let json = wait_for_status_json_after(
+                    last_modified_at,
+                    Duration::from_secs(interval_secs.saturating_mul(3).max(15)),
+                )?;
+                println!("{}", json);
+                io::stdout().flush()?;
+                last_modified_at = status_file_modified_at()?;
+            }
+        }
+        ControlRequest::StatusFollowStop => {
+            let _ = write_control_command(request, &watch_path)?;
+            println!("Queued status streaming stop request.");
+            Ok(())
+        }
+        _ => {
+            let _ = write_control_command(request, &watch_path)?;
+            println!("{}", online_control_success_message(request));
+            Ok(())
+        }
+    }
+}
+
+fn process_offline_control_request(
+    settings: &Settings,
+    request: &ControlRequest,
+) -> io::Result<()> {
+    match request {
+        ControlRequest::StatusNow => {
+            println!("{}", offline_output_json(settings)?);
+            return Ok(());
+        }
+        ControlRequest::StatusFollowStart { .. } | ControlRequest::StatusFollowStop => {
+            return Err(io::Error::other(
+                "Streaming status commands require a running superseedr instance",
+            ));
+        }
+        _ => {}
+    }
+
+    let mut next_settings = settings.clone();
+    let mut result = apply_offline_control_request(&mut next_settings, request);
+    if result.is_ok() {
+        if let Err(error) = config::save_settings(&next_settings) {
+            result = Err(format!("Failed to save updated settings: {}", error));
+        }
+    }
+    record_offline_control_journal_entry(request, &result);
+    let message = result.map_err(io::Error::other)?;
+    println!("{}", message);
+    Ok(())
+}
+
+fn online_control_success_message(request: &ControlRequest) -> String {
+    match request {
+        ControlRequest::Pause { info_hash_hex } => {
+            format!("Queued pause request for torrent '{}'", info_hash_hex)
+        }
+        ControlRequest::Resume { info_hash_hex } => {
+            format!("Queued resume request for torrent '{}'", info_hash_hex)
+        }
+        ControlRequest::Delete { info_hash_hex } => {
+            format!(
+                "Queued delete request for torrent '{}' (files deleted: no)",
+                info_hash_hex
+            )
+        }
+        ControlRequest::SetFilePriority {
+            info_hash_hex,
+            target,
+            priority,
+        } => format!(
+            "Queued file priority request for torrent '{}' ({}) -> {:?}",
+            info_hash_hex,
+            describe_priority_target(target),
+            priority
+        ),
+        ControlRequest::StatusNow
+        | ControlRequest::StatusFollowStart { .. }
+        | ControlRequest::StatusFollowStop => "Queued control request.".to_string(),
+    }
+}
+
+fn describe_priority_target(target: &ControlPriorityTarget) -> String {
+    match target {
+        ControlPriorityTarget::FileIndex(index) => format!("index {}", index),
+        ControlPriorityTarget::FilePath(path) => format!("path {}", path),
+    }
+}
+
+fn apply_offline_control_request(
+    settings: &mut Settings,
+    request: &ControlRequest,
+) -> Result<String, String> {
+    match request {
+        ControlRequest::Pause { info_hash_hex } => {
+            let info_hash = app::decode_info_hash(info_hash_hex)?;
+            let Some(index) = settings.torrents.iter().position(|torrent| {
+                torrent_info_hash_from_settings(torrent).as_deref() == Some(info_hash.as_slice())
+            }) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            settings.torrents[index].torrent_control_state = app::TorrentControlState::Paused;
+            Ok(format!("Paused torrent '{}'", info_hash_hex))
+        }
+        ControlRequest::Resume { info_hash_hex } => {
+            let info_hash = app::decode_info_hash(info_hash_hex)?;
+            let Some(index) = settings.torrents.iter().position(|torrent| {
+                torrent_info_hash_from_settings(torrent).as_deref() == Some(info_hash.as_slice())
+            }) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            settings.torrents[index].torrent_control_state = app::TorrentControlState::Running;
+            Ok(format!("Resumed torrent '{}'", info_hash_hex))
+        }
+        ControlRequest::Delete { info_hash_hex } => {
+            let info_hash = app::decode_info_hash(info_hash_hex)?;
+            let initial_len = settings.torrents.len();
+            settings.torrents.retain(|torrent| {
+                torrent_info_hash_from_settings(torrent).as_deref() != Some(info_hash.as_slice())
+            });
+            if settings.torrents.len() == initial_len {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            }
+            Ok(format!(
+                "Removed torrent '{}' (files deleted: no)",
+                info_hash_hex
+            ))
+        }
+        ControlRequest::SetFilePriority {
+            info_hash_hex,
+            target,
+            priority,
+        } => {
+            let info_hash = app::decode_info_hash(info_hash_hex)?;
+            let Some(index) = settings.torrents.iter().position(|torrent| {
+                torrent_info_hash_from_settings(torrent).as_deref() == Some(info_hash.as_slice())
+            }) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            let file_index =
+                resolve_offline_priority_file_index(&settings.torrents[index], target)?;
+            if matches!(priority, app::FilePriority::Normal) {
+                settings.torrents[index].file_priorities.remove(&file_index);
+            } else {
+                settings.torrents[index]
+                    .file_priorities
+                    .insert(file_index, *priority);
+            }
+            Ok(format!(
+                "Set file priority for torrent '{}' at index {} to {:?}",
+                info_hash_hex, file_index, priority
+            ))
+        }
+        ControlRequest::StatusNow
+        | ControlRequest::StatusFollowStart { .. }
+        | ControlRequest::StatusFollowStop => {
+            Err("Status commands require a running superseedr instance".to_string())
+        }
+    }
+}
+
+fn record_offline_control_journal_entry(request: &ControlRequest, result: &Result<String, String>) {
+    let mut journal = load_event_journal_state();
+    let event_type = if result.is_ok() {
+        EventType::ControlApplied
+    } else {
+        EventType::ControlFailed
+    };
+    let message = match result {
+        Ok(message) | Err(message) => Some(message.clone()),
+    };
+    append_event_journal_entry(
+        &mut journal,
+        EventJournalEntry {
+            host_id: config::shared_host_id(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Control,
+            event_type,
+            message,
+            details: offline_control_event_details(request),
+            ..Default::default()
+        },
+    );
+    if let Err(error) = save_event_journal_state(&journal) {
+        tracing::error!("Failed to save offline control journal entry: {}", error);
+    }
+}
+
+fn offline_control_event_details(request: &ControlRequest) -> EventDetails {
+    let (file_index, file_path) = match request {
+        ControlRequest::SetFilePriority { target, .. } => match target {
+            ControlPriorityTarget::FileIndex(index) => (Some(*index), None),
+            ControlPriorityTarget::FilePath(path) => (None, Some(path.clone())),
+        },
+        _ => (None, None),
+    };
+
+    EventDetails::Control {
+        origin: ControlOrigin::CliOffline,
+        action: request.action_name().to_string(),
+        target_info_hash_hex: request.target_info_hash_hex().map(str::to_string),
+        file_index,
+        file_path,
+        priority: request
+            .priority_value()
+            .map(|priority| format!("{:?}", priority)),
+    }
+}
+
+fn torrent_info_hash_from_settings(torrent_settings: &config::TorrentSettings) -> Option<Vec<u8>> {
+    if torrent_settings.torrent_or_magnet.starts_with("magnet:") {
+        Magnet::new(&torrent_settings.torrent_or_magnet)
+            .ok()
+            .and_then(|magnet| magnet.hash().map(|hash| hash.to_string()))
+            .and_then(|hash| app::decode_info_hash(&hash).ok())
+    } else {
+        PathBuf::from(&torrent_settings.torrent_or_magnet)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| hex::decode(stem).ok())
+    }
+}
+
+fn resolve_offline_priority_file_index(
+    torrent_settings: &config::TorrentSettings,
+    target: &ControlPriorityTarget,
+) -> Result<usize, String> {
+    let file_list = load_torrent_file_list_for_settings(torrent_settings)?;
+    match target {
+        ControlPriorityTarget::FileIndex(index) => {
+            if *index < file_list.len() {
+                Ok(*index)
+            } else {
+                Err(format!(
+                    "File index {} is out of range for torrent '{}' ({} files)",
+                    index,
+                    torrent_settings.name,
+                    file_list.len()
+                ))
+            }
+        }
+        ControlPriorityTarget::FilePath(path) => {
+            let normalized_target = path.replace('\\', "/");
+            file_list
+                .into_iter()
+                .enumerate()
+                .find_map(|(index, (parts, _))| {
+                    (parts.join("/") == normalized_target).then_some(index)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "No file matching '{}' was found in torrent '{}'",
+                        path, torrent_settings.name
+                    )
+                })
+        }
+    }
+}
+
+fn load_torrent_file_list_for_settings(
+    torrent_settings: &config::TorrentSettings,
+) -> Result<Vec<(Vec<String>, u64)>, String> {
+    if torrent_settings.torrent_or_magnet.starts_with("magnet:") {
+        return Err(
+            "This torrent does not have a persisted .torrent source for file path lookup"
+                .to_string(),
+        );
+    }
+
+    let bytes = fs::read(&torrent_settings.torrent_or_magnet).map_err(|error| {
+        format!(
+            "Failed to read torrent metadata from '{}': {}",
+            torrent_settings.torrent_or_magnet, error
+        )
+    })?;
+    let torrent = from_bytes(&bytes).map_err(|error| {
+        format!(
+            "Failed to parse torrent metadata from '{}': {:?}",
+            torrent_settings.torrent_or_magnet, error
+        )
+    })?;
+    Ok(torrent.file_list())
+}
+
 fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
     let _ = disable_raw_mode();
     // Common cleanup for all platforms
@@ -313,4 +677,154 @@ fn generate_client_id_string() -> String {
         .collect();
 
     format!("{}{}", CLIENT_PREFIX, random_chars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn sample_settings() -> Settings {
+        Settings {
+            torrents: vec![config::TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Alpha".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn write_sample_torrent_file() -> (tempfile::TempDir, String) {
+        let dir = tempdir().expect("create tempdir");
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "sample-pack".to_string(),
+                piece_length: 16_384,
+                pieces: vec![0; 20],
+                files: vec![
+                    crate::torrent_file::InfoFile {
+                        length: 10,
+                        path: vec!["folder".to_string(), "alpha.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 20,
+                        path: vec!["folder".to_string(), "beta.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            announce: Some("http://tracker.test".to_string()),
+            ..Default::default()
+        };
+        let bytes = serde_bencode::to_bytes(&torrent).expect("serialize torrent");
+        let path = dir
+            .path()
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.torrent");
+        fs::write(&path, bytes).expect("write torrent fixture");
+        (dir, path.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn offline_pause_updates_torrent_control_state() {
+        let mut settings = sample_settings();
+        let request = ControlRequest::Pause {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            settings.torrents[0].torrent_control_state,
+            app::TorrentControlState::Paused
+        );
+    }
+
+    #[test]
+    fn offline_delete_removes_matching_torrent() {
+        let mut settings = sample_settings();
+        let request = ControlRequest::Delete {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert!(settings.torrents.is_empty());
+    }
+
+    #[test]
+    fn offline_resume_updates_torrent_control_state() {
+        let mut settings = sample_settings();
+        settings.torrents[0].torrent_control_state = app::TorrentControlState::Paused;
+        let request = ControlRequest::Resume {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            settings.torrents[0].torrent_control_state,
+            app::TorrentControlState::Running
+        );
+    }
+
+    #[test]
+    fn offline_priority_updates_file_priority_by_index() {
+        let (_dir, torrent_path) = write_sample_torrent_file();
+        let mut settings = Settings {
+            torrents: vec![config::TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::SetFilePriority {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            target: ControlPriorityTarget::FileIndex(1),
+            priority: app::FilePriority::High,
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            settings.torrents[0].file_priorities.get(&1),
+            Some(&app::FilePriority::High)
+        );
+    }
+
+    #[test]
+    fn offline_priority_updates_file_priority_by_relative_path() {
+        let (_dir, torrent_path) = write_sample_torrent_file();
+        let mut settings = Settings {
+            torrents: vec![config::TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::SetFilePriority {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            target: ControlPriorityTarget::FilePath("folder/beta.bin".to_string()),
+            priority: app::FilePriority::Skip,
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            settings.torrents[0].file_priorities.get(&1),
+            Some(&app::FilePriority::Skip)
+        );
+    }
 }

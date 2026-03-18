@@ -302,7 +302,10 @@ async fn run_sync(
                 };
 
                 let _ = app_command_tx
-                    .send(AppCommand::RssDownloadSelected { entry, command_path })
+                    .send(AppCommand::RssDownloadSelected {
+                        entry,
+                        command_path,
+                    })
                     .await;
             }
         }

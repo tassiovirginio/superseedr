@@ -21,10 +21,7 @@ enum JournalAction {
     MoveDown,
 }
 
-fn map_key_to_journal_action(
-    key_code: KeyCode,
-    key_kind: KeyEventKind,
-) -> Option<JournalAction> {
+fn map_key_to_journal_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<JournalAction> {
     if !matches!(key_kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
@@ -105,14 +102,23 @@ fn event_type_label(entry: &EventJournalEntry) -> &'static str {
         EventType::TorrentCompleted => "Complete",
         EventType::DataUnavailable => "Missing",
         EventType::DataRecovered => "Found",
+        EventType::ControlQueued => "Queued",
+        EventType::ControlApplied => "Applied",
+        EventType::ControlFailed => "Error",
     }
 }
 
 fn source_label(entry: &EventJournalEntry) -> String {
-    entry.source_watch_folder
+    entry
+        .source_watch_folder
         .as_ref()
         .map(|path| compact_path_label(path, 2))
-        .or_else(|| entry.source_path.as_ref().map(|path| compact_path_label(path, 2)))
+        .or_else(|| {
+            entry
+                .source_path
+                .as_ref()
+                .map(|path| compact_path_label(path, 2))
+        })
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -207,10 +213,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     f.render_widget(Paragraph::new(Line::from(filter_spans)), rows[0]);
 
     let entries = filtered_entries(app_state);
-    let status_line = format!(
-        "{} entries",
-        entries.len()
-    );
+    let status_line = format!("{} entries", entries.len());
     f.render_widget(
         Paragraph::new(status_line)
             .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
@@ -223,7 +226,12 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             Row::new(vec![
                 Cell::from(pretty_timestamp(&entry.ts_iso)),
                 Cell::from(event_type_label(entry)),
-                Cell::from(entry.torrent_name.clone().unwrap_or_else(|| "-".to_string())),
+                Cell::from(
+                    entry
+                        .torrent_name
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
                 Cell::from(source_label(entry)),
             ])
         })
@@ -262,7 +270,9 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 
     let mut table_state = TableState::default();
     if !entries.is_empty() {
-        table_state.select(Some(app_state.ui.journal.selected_index.min(entries.len() - 1)));
+        table_state.select(Some(
+            app_state.ui.journal.selected_index.min(entries.len() - 1),
+        ));
     }
     f.render_stateful_widget(table, rows[2], &mut table_state);
 

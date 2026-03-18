@@ -18,6 +18,7 @@ pub enum EventCategory {
     Ingest,
     TorrentLifecycle,
     DataHealth,
+    Control,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,6 +33,9 @@ pub enum EventType {
     TorrentCompleted,
     DataUnavailable,
     DataRecovered,
+    ControlQueued,
+    ControlApplied,
+    ControlFailed,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,6 +56,14 @@ pub enum IngestKind {
     PathFile,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlOrigin {
+    #[default]
+    CliOnline,
+    CliOffline,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventDetails {
@@ -64,6 +76,14 @@ pub enum EventDetails {
     DataHealth {
         issue_count: usize,
         issue_files: Vec<String>,
+    },
+    Control {
+        origin: ControlOrigin,
+        action: String,
+        target_info_hash_hex: Option<String>,
+        file_index: Option<usize>,
+        file_path: Option<String>,
+        priority: Option<String>,
     },
 }
 
@@ -121,11 +141,22 @@ pub fn save_event_journal_state(state: &EventJournalState) -> io::Result<()> {
     save_event_journal_state_to_path(state, &path)
 }
 
+pub fn event_journal_json() -> io::Result<String> {
+    serde_json::to_string_pretty(&load_event_journal_state()).map_err(io::Error::other)
+}
+
 pub fn enforce_event_journal_retention(state: &mut EventJournalState) {
     if state.entries.len() > EVENT_JOURNAL_CAP {
         let overflow = state.entries.len() - EVENT_JOURNAL_CAP;
         state.entries.drain(0..overflow);
     }
+}
+
+pub fn append_event_journal_entry(state: &mut EventJournalState, mut entry: EventJournalEntry) {
+    entry.id = state.next_id;
+    state.next_id = state.next_id.saturating_add(1);
+    state.entries.push(entry);
+    enforce_event_journal_retention(state);
 }
 
 fn load_event_journal_state_from_path(path: &Path) -> EventJournalState {
@@ -249,5 +280,45 @@ mod tests {
 
         assert_eq!(state.entries.len(), EVENT_JOURNAL_CAP);
         assert_eq!(state.entries.first().map(|entry| entry.id), Some(1));
+    }
+
+    #[test]
+    fn append_entry_assigns_next_id_and_prunes() {
+        let mut state = EventJournalState {
+            next_id: 7,
+            entries: Vec::new(),
+        };
+
+        append_event_journal_entry(
+            &mut state,
+            EventJournalEntry {
+                ts_iso: "2026-03-17T12:00:00Z".to_string(),
+                category: EventCategory::Control,
+                event_type: EventType::ControlApplied,
+                details: EventDetails::Control {
+                    origin: ControlOrigin::CliOffline,
+                    action: "pause".to_string(),
+                    target_info_hash_hex: Some(
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    ),
+                    file_index: None,
+                    file_path: None,
+                    priority: None,
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].id, 7);
+        assert_eq!(state.next_id, 8);
+    }
+
+    #[test]
+    fn event_journal_json_serializes_current_state() {
+        let json = serde_json::to_string_pretty(&EventJournalState::default())
+            .expect("serialize journal state");
+        assert!(json.contains("\"next_id\""));
+        assert!(json.contains("\"entries\""));
     }
 }
