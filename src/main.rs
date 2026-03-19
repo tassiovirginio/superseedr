@@ -34,11 +34,12 @@ use std::time::Duration;
 use crate::config::Settings;
 use crate::config::{load_settings, resolve_command_watch_path};
 use crate::integrations::cli::{
-    command_to_control_request, status_file_modified_at, wait_for_status_json_after,
+    command_to_control_requests, expand_add_inputs, status_control_request,
+    status_file_modified_at, status_should_stream, wait_for_status_json_after,
     write_control_command, write_input_command, write_stop_command, Cli, Commands,
 };
 use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
-use crate::integrations::status::offline_output_json;
+use crate::integrations::status::{offline_output_json, status_file_path};
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
@@ -296,21 +297,32 @@ fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> 
     };
 
     match command {
-        Commands::Add { input } => {
+        Commands::Add { inputs } => {
             let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "Could not resolve the command watch path",
                 )
             })?;
-            tracing::info!("Processing Add subcommand input: {}", input);
-            let command_path = write_input_command(input, &watch_path)?;
-            println!("Queued add command at {}", command_path.display());
+            for input in expand_add_inputs(inputs) {
+                tracing::info!("Processing Add subcommand input: {}", input);
+                let command_path = write_input_command(&input, &watch_path)?;
+                println!("Queued add command at {}", command_path.display());
+            }
             Ok(())
         }
         Commands::Journal => {
             println!("{}", event_journal_json()?);
             Ok(())
+        }
+        Commands::Status { .. } => {
+            let request = status_control_request(command)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            if app_is_running {
+                process_online_status_request(settings, &request, status_should_stream(command))
+            } else {
+                process_offline_control_request(settings, &request)
+            }
         }
         Commands::StopClient => {
             if !app_is_running {
@@ -329,18 +341,73 @@ fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> 
             Ok(())
         }
         _ => {
-            let request = command_to_control_request(command)
+            let requests = command_to_control_requests(command)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "Unsupported command")
                 })?;
 
-            if app_is_running {
-                process_online_control_request(settings, &request)
-            } else {
-                process_offline_control_request(settings, &request)
+            for request in requests {
+                if app_is_running {
+                    process_online_control_request(settings, &request)?;
+                } else {
+                    process_offline_control_request(settings, &request)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn process_online_status_request(
+    settings: &Settings,
+    request: &ControlRequest,
+    stream: bool,
+) -> io::Result<()> {
+    let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve the command watch path",
+        )
+    })?;
+
+    match request {
+        ControlRequest::StatusNow => {
+            let previous_modified_at = status_file_modified_at()?;
+            let _ = write_control_command(request, &watch_path)?;
+            let json = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+            println!("{}", json);
+            Ok(())
+        }
+        ControlRequest::StatusFollowStart { interval_secs } if stream => {
+            let mut last_modified_at = status_file_modified_at()?;
+            let _ = write_control_command(request, &watch_path)?;
+            loop {
+                let json = wait_for_status_json_after(
+                    last_modified_at,
+                    Duration::from_secs(interval_secs.saturating_mul(3).max(15)),
+                )?;
+                println!("{}", json);
+                io::stdout().flush()?;
+                last_modified_at = status_file_modified_at()?;
             }
         }
+        ControlRequest::StatusFollowStart { interval_secs } => {
+            let _ = write_control_command(request, &watch_path)?;
+            let status_path = status_file_path()?;
+            println!(
+                "Set status output interval to {} seconds.\nStatus file: {}",
+                interval_secs,
+                status_path.display()
+            );
+            Ok(())
+        }
+        ControlRequest::StatusFollowStop => {
+            let _ = write_control_command(request, &watch_path)?;
+            println!("Queued status streaming stop request.");
+            Ok(())
+        }
+        _ => unreachable!("status request handler received non-status control request"),
     }
 }
 

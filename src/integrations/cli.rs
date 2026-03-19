@@ -24,7 +24,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Add {
-        input: String,
+        #[arg(value_name = "INPUT", num_args = 1..)]
+        inputs: Vec<String>,
     },
     StopClient,
     Journal,
@@ -33,18 +34,20 @@ pub enum Commands {
         follow: bool,
         #[arg(long)]
         stop: bool,
+        #[arg(long, value_name = "SECONDS")]
+        interval: Option<u64>,
     },
     Pause {
         #[arg(value_name = "INFO_HASH_HEX")]
-        info_hash: Option<String>,
+        info_hashes: Vec<String>,
     },
     Resume {
         #[arg(value_name = "INFO_HASH_HEX")]
-        info_hash: Option<String>,
+        info_hashes: Vec<String>,
     },
     Delete {
         #[arg(value_name = "INFO_HASH_HEX")]
-        info_hash: Option<String>,
+        info_hashes: Vec<String>,
     },
     Priority {
         #[arg(value_name = "INFO_HASH_HEX")]
@@ -166,29 +169,29 @@ pub fn write_stop_command(watch_path: &Path) -> io::Result<PathBuf> {
     Ok(file_path)
 }
 
-pub fn command_to_control_request(command: &Commands) -> Result<Option<ControlRequest>, String> {
+pub fn command_to_control_requests(
+    command: &Commands,
+) -> Result<Option<Vec<ControlRequest>>, String> {
     match command {
-        Commands::Status { follow, stop } => {
-            if *follow && *stop {
-                return Err("Choose either --follow or --stop, not both".to_string());
-            }
-            Ok(Some(if *stop {
-                ControlRequest::StatusFollowStop
-            } else if *follow {
-                ControlRequest::StatusFollowStart { interval_secs: 5 }
-            } else {
-                ControlRequest::StatusNow
-            }))
-        }
-        Commands::Pause { info_hash } => Ok(Some(ControlRequest::Pause {
-            info_hash_hex: require_info_hash_hex(info_hash.as_deref(), "pause")?.to_string(),
-        })),
-        Commands::Resume { info_hash } => Ok(Some(ControlRequest::Resume {
-            info_hash_hex: require_info_hash_hex(info_hash.as_deref(), "resume")?.to_string(),
-        })),
-        Commands::Delete { info_hash } => Ok(Some(ControlRequest::Delete {
-            info_hash_hex: require_info_hash_hex(info_hash.as_deref(), "delete")?.to_string(),
-        })),
+        Commands::Status { .. } => Ok(Some(vec![status_control_request(command)?])),
+        Commands::Pause { info_hashes } => Ok(Some(
+            require_info_hash_hexes(info_hashes, "pause")?
+                .into_iter()
+                .map(|info_hash_hex| ControlRequest::Pause { info_hash_hex })
+                .collect(),
+        )),
+        Commands::Resume { info_hashes } => Ok(Some(
+            require_info_hash_hexes(info_hashes, "resume")?
+                .into_iter()
+                .map(|info_hash_hex| ControlRequest::Resume { info_hash_hex })
+                .collect(),
+        )),
+        Commands::Delete { info_hashes } => Ok(Some(
+            require_info_hash_hexes(info_hashes, "delete")?
+                .into_iter()
+                .map(|info_hash_hex| ControlRequest::Delete { info_hash_hex })
+                .collect(),
+        )),
         Commands::Priority {
             info_hash,
             file_index,
@@ -204,13 +207,58 @@ pub fn command_to_control_request(command: &Commands) -> Result<Option<ControlRe
                 return Err("Priority requires either --file-index or --file-path".to_string());
             };
 
-            Ok(Some(ControlRequest::SetFilePriority {
+            Ok(Some(vec![ControlRequest::SetFilePriority {
                 info_hash_hex: info_hash_hex.to_string(),
                 target,
                 priority: (*priority).into(),
-            }))
+            }]))
         }
         Commands::Add { .. } | Commands::StopClient | Commands::Journal => Ok(None),
+    }
+}
+
+pub fn status_control_request(command: &Commands) -> Result<ControlRequest, String> {
+    let Commands::Status {
+        follow,
+        stop,
+        interval,
+    } = command
+    else {
+        return Err("Expected status command".to_string());
+    };
+
+    if *follow && *stop {
+        return Err("Choose either --follow or --stop, not both".to_string());
+    }
+    if *stop && interval.is_some() {
+        return Err("Do not use --interval together with --stop".to_string());
+    }
+
+    Ok(if *stop {
+        ControlRequest::StatusFollowStop
+    } else if *follow || interval.is_some() {
+        ControlRequest::StatusFollowStart {
+            interval_secs: interval.unwrap_or(5),
+        }
+    } else {
+        ControlRequest::StatusNow
+    })
+}
+
+pub fn status_should_stream(command: &Commands) -> bool {
+    matches!(command, Commands::Status { follow: true, .. })
+}
+
+pub fn command_to_control_request(command: &Commands) -> Result<Option<ControlRequest>, String> {
+    match command_to_control_requests(command)? {
+        Some(mut requests) => {
+            let request = requests
+                .drain(..)
+                .next()
+                .ok_or_else(|| "No control requests were produced".to_string())?;
+            Ok(Some(request))
+        }
+        None => Ok(None),
     }
 }
 
@@ -224,6 +272,53 @@ fn require_info_hash_hex<'a>(
             command_name, command_name
         )
     })
+}
+
+fn require_info_hash_hexes(values: &[String], command_name: &str) -> Result<Vec<String>, String> {
+    let hashes = values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if hashes.is_empty() {
+        return Err(format!(
+            "Missing INFO_HASH_HEX for `superseedr {}`. Get it from `superseedr status` and use the `info_hash_hex` field. Example: `superseedr {} 7f3a9c2d4e1b8a6f0d5c3b2a1908e7d6c5b4a321`",
+            command_name, command_name
+        ));
+    }
+
+    Ok(hashes)
+}
+
+pub fn expand_add_inputs(inputs: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for input in inputs {
+        if input.starts_with("magnet:") || Path::new(input).exists() {
+            expanded.push(input.clone());
+            continue;
+        }
+
+        let mut split_values = input
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        if split_values.is_empty() {
+            continue;
+        }
+
+        if split_values.len() == 1 {
+            expanded.push(split_values.remove(0));
+        } else {
+            expanded.extend(split_values);
+        }
+    }
+    expanded
 }
 
 pub fn write_control_command(request: &ControlRequest, watch_path: &Path) -> io::Result<PathBuf> {
@@ -365,14 +460,28 @@ mod tests {
         let follow = Commands::Status {
             follow: true,
             stop: false,
+            interval: None,
         };
-        let request = command_to_control_request(&follow)
-            .expect("map status command")
-            .expect("control request");
+        let request = status_control_request(&follow).expect("map status command");
         assert_eq!(
             request,
             ControlRequest::StatusFollowStart { interval_secs: 5 }
         );
+    }
+
+    #[test]
+    fn status_interval_maps_to_runtime_request_without_follow() {
+        let command = Commands::Status {
+            follow: false,
+            stop: false,
+            interval: Some(30),
+        };
+        let request = status_control_request(&command).expect("map status interval");
+        assert_eq!(
+            request,
+            ControlRequest::StatusFollowStart { interval_secs: 30 }
+        );
+        assert!(!status_should_stream(&command));
     }
 
     #[test]
@@ -396,8 +505,10 @@ mod tests {
 
     #[test]
     fn delete_without_info_hash_returns_helpful_error() {
-        let error = command_to_control_request(&Commands::Delete { info_hash: None })
-            .expect_err("missing hash should fail");
+        let error = command_to_control_request(&Commands::Delete {
+            info_hashes: Vec::new(),
+        })
+        .expect_err("missing hash should fail");
         assert!(error.contains("Missing INFO_HASH_HEX"));
         assert!(error.contains("superseedr status"));
         assert!(error.contains("info_hash_hex"));
@@ -414,5 +525,27 @@ mod tests {
         .expect_err("missing hash should fail");
         assert!(error.contains("Missing INFO_HASH_HEX"));
         assert!(error.contains("superseedr priority"));
+    }
+
+    #[test]
+    fn delete_command_supports_multiple_hashes() {
+        let requests = command_to_control_requests(&Commands::Delete {
+            info_hashes: vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ],
+        })
+        .expect("map delete commands")
+        .expect("requests");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn add_command_expands_comma_separated_non_magnet_inputs() {
+        let expanded = expand_add_inputs(&["alpha.torrent,beta.torrent".to_string()]);
+        assert_eq!(
+            expanded,
+            vec!["alpha.torrent".to_string(), "beta.torrent".to_string()]
+        );
     }
 }
