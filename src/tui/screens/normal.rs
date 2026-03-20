@@ -5501,9 +5501,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_open_rss_screen_sets_rss_mode_and_unified_screen() {
-        let mut app = App::new(crate::config::Settings::default())
-            .await
-            .expect("build app");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings).await.expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
         execute_ui_effect(&mut app, UiEffect::OpenRssScreen).await;
@@ -5518,9 +5520,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_open_journal_screen_sets_journal_mode() {
-        let mut app = App::new(crate::config::Settings::default())
-            .await
-            .expect("build app");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings).await.expect("build app");
         app.app_state.ui.journal.selected_index = 9;
 
         execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
