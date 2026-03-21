@@ -290,7 +290,9 @@ mod tests {
             client_port: 0,
             ..Settings::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         app.app_state.mode = AppMode::Normal;
         app
     }

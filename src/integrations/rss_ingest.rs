@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::{get_watch_path, Settings};
+use crate::config::{resolve_command_watch_path, Settings};
 use sha1::{Digest, Sha1};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,15 +41,10 @@ async fn atomic_write(temp_path: &Path, final_path: &Path, payload: &[u8]) -> io
 }
 
 fn rss_watch_dir(settings: &Settings) -> io::Result<PathBuf> {
-    if let Some(path) = settings.watch_folder.clone() {
-        return Ok(path);
-    }
-
-    let (watch_path, _) = get_watch_path().ok_or_else(|| {
+    resolve_command_watch_path(settings).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "watch path unavailable for RSS auto-ingest",
         )
-    })?;
-    Ok(watch_path)
+    })
 }

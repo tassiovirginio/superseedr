@@ -8,13 +8,11 @@ use tracing::{event as tracing_event, Level};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::app::FilePriority;
@@ -254,14 +252,6 @@ pub struct TorrentMetadataConfig {
     pub torrents: Vec<TorrentMetadataEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharedConfigScope {
-    GlobalSettings,
-    TorrentCatalog,
-    TorrentMetadata,
-    HostSettings,
-}
-
 mod string_usize_map {
     use crate::app::FilePriority;
     use serde::{self, Deserialize, Deserializer, Serializer};
@@ -296,15 +286,7 @@ mod string_usize_map {
 
 const SHARED_CONFIG_DIR_ENV: &str = "SUPERSEEDR_SHARED_CONFIG_DIR";
 const SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_HOST_ID";
-const EXTRA_WATCH_PATH_PREFIX: &str = "SUPERSEEDR_WATCH_PATH_";
 const SHARED_TORRENT_SOURCE_PREFIX: &str = "shared:";
-
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(untagged)]
-enum SharedPath {
-    Absolute(PathBuf),
-    Portable { root: String, relative: PathBuf },
-}
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
@@ -312,7 +294,7 @@ struct CatalogTorrentSettings {
     pub torrent_or_magnet: String,
     pub name: String,
     pub validation_status: bool,
-    pub download_path: Option<SharedPath>,
+    pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
     pub torrent_control_state: TorrentControlState,
     #[serde(with = "string_usize_map")]
@@ -331,7 +313,7 @@ struct SharedSettingsConfig {
     pub peer_sort_column: PeerSortColumn,
     pub peer_sort_direction: SortDirection,
     pub ui_theme: ThemeName,
-    pub default_download_folder: Option<SharedPath>,
+    pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
     pub global_download_limit_bps: u64,
@@ -397,7 +379,6 @@ struct HostConfig {
     pub client_id: Option<String>,
     pub client_port: u16,
     pub watch_folder: Option<PathBuf>,
-    pub path_roots: HashMap<String, PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -407,7 +388,6 @@ impl Default for HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder,
-            path_roots: HashMap::new(),
         }
     }
 }
@@ -464,34 +444,34 @@ fn shared_config_state() -> &'static Mutex<Option<SharedConfigState>> {
 
 impl LayeredConfig {
     fn from_flat_settings(settings: &Settings) -> Self {
-        let path_roots = HashMap::new();
         Self {
-            settings: SharedSettingsConfig::from_settings(settings, &path_roots),
-            catalog: CatalogConfig::from_settings(settings, &path_roots, None),
+            settings: SharedSettingsConfig::from_settings(settings, None)
+                .expect("flat settings should always be encodable"),
+            catalog: CatalogConfig::from_settings(settings, None)
+                .expect("flat catalog should always be encodable"),
             host: HostConfig::from_flat_settings(settings),
         }
     }
 
     fn from_shared_settings(
         settings: &Settings,
-        existing_roots: &HashMap<String, PathBuf>,
         shared_root: &Path,
         preserved_shared_client_id: Option<&str>,
-    ) -> Self {
-        let mut settings_config = SharedSettingsConfig::from_settings(settings, existing_roots);
+    ) -> io::Result<Self> {
+        let mut settings_config = SharedSettingsConfig::from_settings(settings, Some(shared_root))?;
         let shared_client_id = preserved_shared_client_id.unwrap_or(&settings_config.client_id);
-        let host = HostConfig::from_settings(settings, existing_roots, shared_client_id);
+        let host = HostConfig::from_settings(settings, shared_client_id);
         if let Some(shared_client_id) =
             preserved_shared_client_id.filter(|_| host.client_id.is_some())
         {
             settings_config.client_id = shared_client_id.to_string();
         }
 
-        Self {
+        Ok(Self {
             settings: settings_config,
-            catalog: CatalogConfig::from_settings(settings, existing_roots, Some(shared_root)),
+            catalog: CatalogConfig::from_settings(settings, Some(shared_root))?,
             host,
-        }
+        })
     }
 
     fn resolve_flat_settings(&self) -> io::Result<Settings> {
@@ -504,10 +484,8 @@ impl LayeredConfig {
 
     fn resolve_settings(&self, shared_root: Option<&Path>) -> io::Result<Settings> {
         let mut settings = Settings::default();
-        self.settings
-            .apply_to_settings(&mut settings, &self.host.path_roots)?;
-        self.catalog
-            .apply_to_settings(&mut settings, &self.host.path_roots, shared_root)?;
+        self.settings.apply_to_settings(&mut settings, shared_root)?;
+        self.catalog.apply_to_settings(&mut settings, shared_root)?;
         self.host.apply_to_settings(&mut settings);
         Ok(settings)
     }
@@ -516,10 +494,9 @@ impl LayeredConfig {
 impl CatalogTorrentSettings {
     fn from_settings(
         settings: &TorrentSettings,
-        path_roots: &HashMap<String, PathBuf>,
         shared_root: Option<&Path>,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        Ok(Self {
             torrent_or_magnet: encode_catalog_torrent_source(
                 &settings.torrent_or_magnet,
                 shared_root,
@@ -529,16 +506,16 @@ impl CatalogTorrentSettings {
             download_path: settings
                 .download_path
                 .as_deref()
-                .map(|path| encode_shared_path(path, path_roots)),
+                .map(|path| encode_shared_data_path(path, shared_root, &format!("torrent '{}'", settings.name)))
+                .transpose()?,
             container_name: settings.container_name.clone(),
             torrent_control_state: settings.torrent_control_state.clone(),
             file_priorities: settings.file_priorities.clone(),
-        }
+        })
     }
 
     fn to_settings(
         &self,
-        path_roots: &HashMap<String, PathBuf>,
         shared_root: Option<&Path>,
     ) -> io::Result<TorrentSettings> {
         Ok(TorrentSettings {
@@ -548,9 +525,7 @@ impl CatalogTorrentSettings {
             download_path: self
                 .download_path
                 .as_ref()
-                .map(|path| {
-                    resolve_shared_path(path, path_roots, &format!("torrent '{}'", self.name))
-                })
+                .map(|path| resolve_shared_data_path(path, shared_root, &format!("torrent '{}'", self.name)))
                 .transpose()?,
             container_name: self.container_name.clone(),
             torrent_control_state: self.torrent_control_state.clone(),
@@ -643,8 +618,8 @@ fn apply_metadata_to_settings(settings: &mut Settings, metadata: &TorrentMetadat
 }
 
 impl SharedSettingsConfig {
-    fn from_settings(settings: &Settings, path_roots: &HashMap<String, PathBuf>) -> Self {
-        Self {
+    fn from_settings(settings: &Settings, shared_root: Option<&Path>) -> io::Result<Self> {
+        Ok(Self {
             client_id: settings.client_id.clone(),
             lifetime_downloaded: settings.lifetime_downloaded,
             lifetime_uploaded: settings.lifetime_uploaded,
@@ -657,7 +632,8 @@ impl SharedSettingsConfig {
             default_download_folder: settings
                 .default_download_folder
                 .as_deref()
-                .map(|path| encode_shared_path(path, path_roots)),
+                .map(|path| encode_shared_data_path(path, shared_root, "default_download_folder"))
+                .transpose()?,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes.clone(),
             global_download_limit_bps: settings.global_download_limit_bps,
@@ -671,14 +647,10 @@ impl SharedSettingsConfig {
             client_leeching_fallback_interval_secs: settings.client_leeching_fallback_interval_secs,
             output_status_interval: settings.output_status_interval,
             rss: settings.rss.clone(),
-        }
+        })
     }
 
-    fn apply_to_settings(
-        &self,
-        settings: &mut Settings,
-        path_roots: &HashMap<String, PathBuf>,
-    ) -> io::Result<()> {
+    fn apply_to_settings(&self, settings: &mut Settings, shared_root: Option<&Path>) -> io::Result<()> {
         settings.client_id = self.client_id.clone();
         settings.lifetime_downloaded = self.lifetime_downloaded;
         settings.lifetime_uploaded = self.lifetime_uploaded;
@@ -691,7 +663,7 @@ impl SharedSettingsConfig {
         settings.default_download_folder = self
             .default_download_folder
             .as_ref()
-            .map(|path| resolve_shared_path(path, path_roots, "default_download_folder"))
+            .map(|path| resolve_shared_data_path(path, shared_root, "default_download_folder"))
             .transpose()?;
         settings.max_connected_peers = self.max_connected_peers;
         settings.bootstrap_nodes = self.bootstrap_nodes.clone();
@@ -712,32 +684,21 @@ impl SharedSettingsConfig {
 }
 
 impl CatalogConfig {
-    fn from_settings(
-        settings: &Settings,
-        path_roots: &HashMap<String, PathBuf>,
-        shared_root: Option<&Path>,
-    ) -> Self {
-        Self {
+    fn from_settings(settings: &Settings, shared_root: Option<&Path>) -> io::Result<Self> {
+        Ok(Self {
             torrents: settings
                 .torrents
                 .iter()
-                .map(|torrent| {
-                    CatalogTorrentSettings::from_settings(torrent, path_roots, shared_root)
-                })
-                .collect(),
-        }
+                .map(|torrent| CatalogTorrentSettings::from_settings(torrent, shared_root))
+                .collect::<io::Result<Vec<_>>>()?,
+        })
     }
 
-    fn apply_to_settings(
-        &self,
-        settings: &mut Settings,
-        path_roots: &HashMap<String, PathBuf>,
-        shared_root: Option<&Path>,
-    ) -> io::Result<()> {
+    fn apply_to_settings(&self, settings: &mut Settings, shared_root: Option<&Path>) -> io::Result<()> {
         settings.torrents = self
             .torrents
             .iter()
-            .map(|torrent| torrent.to_settings(path_roots, shared_root))
+            .map(|torrent| torrent.to_settings(shared_root))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(())
     }
@@ -749,20 +710,14 @@ impl HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
-            path_roots: HashMap::new(),
         }
     }
 
-    fn from_settings(
-        settings: &Settings,
-        existing_roots: &HashMap<String, PathBuf>,
-        shared_client_id: &str,
-    ) -> Self {
+    fn from_settings(settings: &Settings, shared_client_id: &str) -> Self {
         Self {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
-            path_roots: existing_roots.clone(),
         }
     }
 
@@ -875,110 +830,6 @@ fn resolve_config_backend() -> io::Result<ConfigBackend> {
         },
     }))
 }
-
-fn encode_shared_path(path: &Path, path_roots: &HashMap<String, PathBuf>) -> SharedPath {
-    let mut matches: Vec<_> = path_roots
-        .iter()
-        .filter_map(|(root, base_path)| {
-            path.strip_prefix(base_path).ok().map(|relative| {
-                (
-                    root.clone(),
-                    relative.to_path_buf(),
-                    base_path.components().count(),
-                )
-            })
-        })
-        .collect();
-
-    matches.sort_by_key(|(_, _, component_count)| Reverse(*component_count));
-    if let Some((root, relative, _)) = matches.into_iter().next() {
-        SharedPath::Portable { root, relative }
-    } else {
-        SharedPath::Absolute(path.to_path_buf())
-    }
-}
-
-fn resolve_shared_path(
-    path: &SharedPath,
-    path_roots: &HashMap<String, PathBuf>,
-    context: &str,
-) -> io::Result<PathBuf> {
-    match path {
-        SharedPath::Absolute(path) => Ok(path.clone()),
-        SharedPath::Portable { root, relative } => {
-            let base_path = path_roots.get(root).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Missing host path root '{}' while resolving {}",
-                        root, context
-                    ),
-                )
-            })?;
-            Ok(base_path.join(relative))
-        }
-    }
-}
-
-fn shared_path_root(path: &SharedPath) -> Option<&str> {
-    match path {
-        SharedPath::Absolute(_) => None,
-        SharedPath::Portable { root, .. } => Some(root.as_str()),
-    }
-}
-
-fn collect_required_path_roots(
-    settings_config: &SharedSettingsConfig,
-    catalog: &CatalogConfig,
-) -> BTreeSet<String> {
-    let mut roots = BTreeSet::new();
-
-    if let Some(root) = settings_config
-        .default_download_folder
-        .as_ref()
-        .and_then(shared_path_root)
-    {
-        roots.insert(root.to_string());
-    }
-
-    for torrent in &catalog.torrents {
-        if let Some(root) = torrent.download_path.as_ref().and_then(shared_path_root) {
-            roots.insert(root.to_string());
-        }
-    }
-
-    roots
-}
-
-fn inferred_shared_data_root(paths: &SharedConfigPaths) -> PathBuf {
-    paths
-        .root_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| paths.root_dir.clone())
-}
-
-fn bootstrap_shared_host_config(
-    paths: &SharedConfigPaths,
-    settings_config: &SharedSettingsConfig,
-    catalog: &CatalogConfig,
-) -> io::Result<HostConfig> {
-    let mut host = HostConfig::default();
-    let inferred_root = inferred_shared_data_root(paths);
-
-    for root in collect_required_path_roots(settings_config, catalog) {
-        host.path_roots.insert(root, inferred_root.clone());
-    }
-
-    write_toml_atomically(&paths.host_path, &host)?;
-    tracing_event!(
-        Level::INFO,
-        "Bootstrapped shared host config at {:?}",
-        paths.host_path
-    );
-
-    Ok(host)
-}
 fn portable_relative_path_string(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())
@@ -994,6 +845,90 @@ fn shared_relative_path_to_pathbuf(relative: &str) -> PathBuf {
         }
     }
     path
+}
+
+fn normalize_shared_relative_path(path: &Path, context: &str) -> io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} must be a relative path inside the shared root, got {:?}",
+                        context, path
+                    ),
+                ));
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} must not be empty", context),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn encode_shared_data_path(
+    path: &Path,
+    shared_root: Option<&Path>,
+    context: &str,
+) -> io::Result<PathBuf> {
+    let Some(shared_root) = shared_root else {
+        return Ok(path.to_path_buf());
+    };
+
+    if !path.is_absolute() {
+        return normalize_shared_relative_path(path, context);
+    }
+
+    let relative = path.strip_prefix(shared_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} must live under the shared root {:?}, got {:?}",
+                context, shared_root, path
+            ),
+        )
+    })?;
+
+    normalize_shared_relative_path(relative, context)
+}
+
+fn resolve_shared_data_path(
+    path: &Path,
+    shared_root: Option<&Path>,
+    context: &str,
+) -> io::Result<PathBuf> {
+    let Some(shared_root) = shared_root else {
+        return Ok(path.to_path_buf());
+    };
+
+    Ok(shared_root.join(normalize_shared_relative_path(path, context)?))
+}
+
+fn validate_shared_runtime_settings(settings: &Settings, shared_root: &Path) -> io::Result<()> {
+    if let Some(path) = settings.default_download_folder.as_deref() {
+        encode_shared_data_path(path, Some(shared_root), "default_download_folder")?;
+    }
+
+    for torrent in &settings.torrents {
+        if let Some(path) = torrent.download_path.as_deref() {
+            encode_shared_data_path(
+                path,
+                Some(shared_root),
+                &format!("torrent '{}'", torrent.name),
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn encode_catalog_torrent_source(source: &str, shared_root: Option<&Path>) -> String {
@@ -1093,6 +1028,11 @@ fn clear_shared_config_state() {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn clear_shared_config_state_for_tests() {
+    clear_shared_config_state();
+}
+
 fn first_run_settings() -> Settings {
     let mut settings = Settings::default();
     if let Some(user_dirs) = directories::UserDirs::new() {
@@ -1166,7 +1106,13 @@ impl SharedConfigBackend {
         let host = if self.paths.host_path.exists() {
             read_toml_or_default(&self.paths.host_path)?
         } else {
-            bootstrap_shared_host_config(&self.paths, &settings_config, &catalog)?
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Missing shared host config at {:?}. Shared mode requires an explicit host file.",
+                    self.paths.host_path
+                ),
+            ));
         };
 
         let layered = LayeredConfig {
@@ -1177,6 +1123,7 @@ impl SharedConfigBackend {
         let mut resolved_settings = layered.resolve_shared_settings(&self.paths.root_dir)?;
         apply_metadata_to_settings(&mut resolved_settings, &metadata);
         let resolved_settings = apply_env_overrides(&resolved_settings)?;
+        validate_shared_runtime_settings(&resolved_settings, &self.paths.root_dir)?;
         let settings_fingerprint = fingerprint_for_path(&self.paths.settings_path)?;
         let catalog_fingerprint = fingerprint_for_path(&self.paths.catalog_path)?;
         let metadata_fingerprint = fingerprint_for_path(&self.paths.metadata_path)?;
@@ -1199,6 +1146,8 @@ impl SharedConfigBackend {
     }
 
     fn save_settings(&self, settings: &Settings) -> io::Result<()> {
+        validate_shared_runtime_settings(settings, &self.paths.root_dir)?;
+
         let mut guard = shared_config_state()
             .lock()
             .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
@@ -1229,7 +1178,6 @@ impl SharedConfigBackend {
 
         let next_layered = LayeredConfig::from_shared_settings(
             settings,
-            &state.layered.host.path_roots,
             &state.paths.root_dir,
             state
                 .layered
@@ -1237,7 +1185,7 @@ impl SharedConfigBackend {
                 .client_id
                 .as_ref()
                 .map(|_| state.layered.settings.client_id.as_str()),
-        );
+        )?;
 
         if next_layered.settings != state.layered.settings || state.settings_fingerprint.is_none() {
             state.settings_fingerprint =
@@ -1377,51 +1325,40 @@ pub fn shared_torrents_path() -> Option<PathBuf> {
     shared_config_root().map(|root| root.join("torrents"))
 }
 
+pub fn shared_data_path() -> Option<PathBuf> {
+    shared_config_root().map(|root| root.join("data"))
+}
+
 pub fn shared_torrent_file_path(info_hash: &[u8]) -> Option<PathBuf> {
     shared_torrents_path().map(|path| path.join(format!("{}.torrent", hex::encode(info_hash))))
 }
 
-pub fn shared_config_watch_paths() -> Vec<PathBuf> {
-    let Some(paths) = resolve_shared_config_paths().ok().flatten() else {
-        return Vec::new();
-    };
-
-    let mut watch_paths = vec![paths.root_dir.clone()];
-    if let Some(host_dir) = paths.host_path.parent() {
-        if host_dir != paths.root_dir {
-            watch_paths.push(host_dir.to_path_buf());
-        }
-    }
-    watch_paths
+pub fn shared_inbox_path() -> Option<PathBuf> {
+    shared_config_root().map(|root| root.join("inbox"))
 }
 
-pub fn shared_config_scope_for_path(path: &Path) -> Option<SharedConfigScope> {
-    let paths = resolve_shared_config_paths().ok().flatten()?;
+pub fn shared_processed_path() -> Option<PathBuf> {
+    shared_config_root().map(|root| root.join("processed"))
+}
 
-    if path == paths.settings_path {
-        return Some(SharedConfigScope::GlobalSettings);
-    }
+pub fn shared_status_path() -> Option<PathBuf> {
+    shared_config_root().map(|root| root.join("status").join("app_state.json"))
+}
 
-    if path == paths.catalog_path {
-        return Some(SharedConfigScope::TorrentCatalog);
-    }
+pub fn shared_lock_path() -> Option<PathBuf> {
+    shared_config_root().map(|root| root.join("superseedr.lock"))
+}
 
-    if path == paths.metadata_path {
-        return Some(SharedConfigScope::TorrentMetadata);
-    }
-
-    if path == paths.host_path {
-        return Some(SharedConfigScope::HostSettings);
-    }
-
-    None
+pub fn resolve_host_watch_path(settings: &Settings) -> Option<PathBuf> {
+    settings.watch_folder.clone()
 }
 
 pub fn resolve_command_watch_path(settings: &Settings) -> Option<PathBuf> {
-    settings
-        .watch_folder
-        .clone()
-        .or_else(|| get_watch_path().map(|(watch_path, _)| watch_path))
+    if is_shared_config_mode() {
+        return shared_inbox_path();
+    }
+
+    resolve_host_watch_path(settings).or_else(|| get_watch_path().map(|(watch_path, _)| watch_path))
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1430,51 +1367,18 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn resolve_additional_watch_paths_from_sources<I, K, V>(vars: I) -> Vec<PathBuf>
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: Into<OsString>,
-    V: Into<OsString>,
-{
-    let mut indexed_paths = vars
-        .into_iter()
-        .filter_map(|(key, value)| {
-            let key = key.into();
-            let value = value.into();
-            let key = key.to_string_lossy();
-            let suffix = key.strip_prefix(EXTRA_WATCH_PATH_PREFIX)?;
-
-            if suffix.is_empty() || value.is_empty() {
-                return None;
-            }
-
-            let index = suffix.parse::<usize>().ok();
-            Some((index, suffix.to_string(), PathBuf::from(value)))
-        })
-        .collect::<Vec<_>>();
-
-    indexed_paths.sort_by(|left, right| {
-        left.0
-            .unwrap_or(usize::MAX)
-            .cmp(&right.0.unwrap_or(usize::MAX))
-            .then_with(|| left.1.cmp(&right.1))
-    });
-
-    let mut paths = Vec::new();
-    for (_, _, path) in indexed_paths {
-        push_unique_path(&mut paths, path);
-    }
-    paths
-}
-
 pub fn additional_watch_paths() -> Vec<PathBuf> {
-    resolve_additional_watch_paths_from_sources(env::vars_os())
+    Vec::new()
 }
 
 pub fn configured_watch_paths(settings: &Settings) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     if let Some(path) = resolve_command_watch_path(settings) {
+        push_unique_path(&mut paths, path);
+    }
+
+    if let Some(path) = resolve_host_watch_path(settings) {
         push_unique_path(&mut paths, path);
     }
 
@@ -1506,6 +1410,18 @@ pub fn create_watch_directories() -> io::Result<()> {
 
 pub fn ensure_watch_directories(settings: &Settings) -> io::Result<()> {
     create_watch_directories()?;
+    if let Some(path) = shared_inbox_path() {
+        fs::create_dir_all(path)?;
+    }
+    if let Some(path) = shared_processed_path() {
+        fs::create_dir_all(path)?;
+    }
+    if let Some(path) = shared_data_path() {
+        fs::create_dir_all(path)?;
+    }
+    if let Some(path) = shared_status_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        fs::create_dir_all(path)?;
+    }
     for watch_path in configured_watch_paths(settings) {
         fs::create_dir_all(&watch_path)?;
     }
@@ -1808,36 +1724,35 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_path_round_trip_through_roots() {
-        let mut roots = HashMap::new();
-        roots.insert("media".to_string(), PathBuf::from("/mnt/nas"));
+    fn test_shared_data_path_round_trip_under_root() {
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path();
+        let absolute = shared_root.join("data").join("alpha");
 
-        let shared = encode_shared_path(Path::new("/mnt/nas/downloads/alpha"), &roots);
-        assert_eq!(
-            shared,
-            SharedPath::Portable {
-                root: "media".to_string(),
-                relative: PathBuf::from("downloads/alpha"),
-            }
-        );
+        let encoded =
+            encode_shared_data_path(&absolute, Some(shared_root), "default_download_folder")
+                .expect("encode shared path");
+        let resolved =
+            resolve_shared_data_path(&encoded, Some(shared_root), "default_download_folder")
+                .expect("resolve shared path");
 
-        let resolved = resolve_shared_path(&shared, &roots, "test path").expect("resolve path");
-        assert_eq!(resolved, PathBuf::from("/mnt/nas/downloads/alpha"));
+        assert_eq!(encoded, PathBuf::from("data").join("alpha"));
+        assert_eq!(resolved, absolute);
     }
 
     #[test]
-    fn test_resolve_shared_path_reports_missing_root() {
-        let err = resolve_shared_path(
-            &SharedPath::Portable {
-                root: "media".to_string(),
-                relative: PathBuf::from("downloads/alpha"),
-            },
-            &HashMap::new(),
+    fn test_shared_data_path_rejects_path_outside_root() {
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path();
+        let outside_root = dir.path().parent().unwrap_or_else(|| dir.path()).join("outside-root");
+        let err = encode_shared_data_path(
+            &outside_root.join("data").join("alpha"),
+            Some(shared_root),
             "default_download_folder",
         )
-        .expect_err("missing root should fail");
+        .expect_err("path outside shared root should fail");
 
-        assert!(err.to_string().contains("Missing host path root 'media'"));
+        assert!(err.to_string().contains("must live under the shared root"));
     }
 
     #[test]
@@ -1903,30 +1818,29 @@ mod tests {
 
     #[test]
     fn test_layered_config_round_trips_shared_settings() {
-        let shared_root = Path::new("/shared-root");
-        let mut roots = HashMap::new();
-        roots.insert("media".to_string(), PathBuf::from("/mnt/media"));
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path();
 
         let settings = Settings {
             client_id: "host-node".to_string(),
             client_port: 7711,
             watch_folder: Some(PathBuf::from("/watch")),
-            default_download_folder: Some(PathBuf::from("/mnt/media/downloads")),
+            default_download_folder: Some(shared_root.join("data").join("downloads")),
             torrents: vec![TorrentSettings {
-                torrent_or_magnet: "/shared-root/torrents/abc123.torrent".to_string(),
+                torrent_or_magnet: shared_root
+                    .join("torrents")
+                    .join("abc123.torrent")
+                    .to_string_lossy()
+                    .to_string(),
                 name: "Shared Archive".to_string(),
-                download_path: Some(PathBuf::from("/mnt/media/downloads/shared")),
+                download_path: Some(shared_root.join("data").join("downloads").join("shared")),
                 ..TorrentSettings::default()
             }],
             ..Settings::default()
         };
 
-        let layered = LayeredConfig::from_shared_settings(
-            &settings,
-            &roots,
-            shared_root,
-            Some("shared-node"),
-        );
+        let layered = LayeredConfig::from_shared_settings(&settings, shared_root, Some("shared-node"))
+            .expect("build layered shared settings");
         let resolved = layered
             .resolve_shared_settings(shared_root)
             .expect("resolve shared settings");
@@ -1950,32 +1864,33 @@ mod tests {
         assert_eq!(layered.settings.client_id, "shared-node");
         assert_eq!(layered.host.client_id.as_deref(), Some("host-node"));
         assert_eq!(
+            layered.settings.default_download_folder,
+            Some(PathBuf::from("data").join("downloads"))
+        );
+        assert_eq!(
             layered.catalog.torrents[0].torrent_or_magnet,
             "shared:torrents/abc123.torrent"
+        );
+        assert_eq!(
+            layered.catalog.torrents[0].download_path,
+            Some(PathBuf::from("data").join("downloads").join("shared"))
         );
     }
 
     #[test]
     fn test_catalog_and_host_merge_into_runtime_settings() {
-        let mut roots = HashMap::new();
-        roots.insert("media".to_string(), PathBuf::from("/mnt/nas"));
+        let shared_root = Path::new("/shared-root");
 
         let shared_settings = SharedSettingsConfig {
             client_id: "shared-id".to_string(),
-            default_download_folder: Some(SharedPath::Portable {
-                root: "media".to_string(),
-                relative: PathBuf::from("downloads"),
-            }),
+            default_download_folder: Some(PathBuf::from("data").join("downloads")),
             global_download_limit_bps: 1234,
             ..SharedSettingsConfig::default()
         };
         let catalog = CatalogConfig {
             torrents: vec![CatalogTorrentSettings {
                 name: "Shared Collection".to_string(),
-                download_path: Some(SharedPath::Portable {
-                    root: "media".to_string(),
-                    relative: PathBuf::from("downloads/shared"),
-                }),
+                download_path: Some(PathBuf::from("data").join("downloads").join("shared")),
                 ..CatalogTorrentSettings::default()
             }],
         };
@@ -1983,19 +1898,14 @@ mod tests {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
             watch_folder: Some(PathBuf::from("/watch")),
-            path_roots: roots.clone(),
         };
 
         let mut settings = Settings::default();
         shared_settings
-            .apply_to_settings(&mut settings, &host.path_roots)
+            .apply_to_settings(&mut settings, Some(shared_root))
             .expect("apply shared settings");
         catalog
-            .apply_to_settings(
-                &mut settings,
-                &host.path_roots,
-                Some(Path::new("/shared-root")),
-            )
+            .apply_to_settings(&mut settings, Some(shared_root))
             .expect("apply catalog");
         host.apply_to_settings(&mut settings);
 
@@ -2004,12 +1914,12 @@ mod tests {
         assert_eq!(settings.watch_folder, Some(PathBuf::from("/watch")));
         assert_eq!(
             settings.default_download_folder,
-            Some(PathBuf::from("/mnt/nas/downloads"))
+            Some(shared_root.join("data").join("downloads"))
         );
         assert_eq!(settings.global_download_limit_bps, 1234);
         assert_eq!(
             settings.torrents[0].download_path,
-            Some(PathBuf::from("/mnt/nas/downloads/shared"))
+            Some(shared_root.join("data").join("downloads").join("shared"))
         );
     }
 
@@ -2026,7 +1936,7 @@ mod tests {
 
         let mut settings = Settings::default();
         shared_settings
-            .apply_to_settings(&mut settings, &HashMap::new())
+            .apply_to_settings(&mut settings, Some(Path::new("/shared-root")))
             .expect("apply shared settings");
         host.apply_to_settings(&mut settings);
 
@@ -2108,16 +2018,19 @@ mod tests {
             .join("torrents")
             .join("0123456789abcdef0123456789abcdef01234567.torrent");
 
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed host file");
+
         let mut loaded = backend.load_settings().expect("load shared settings");
         loaded.client_id = "shared-node".to_string();
         loaded.client_port = 9090;
         loaded.watch_folder = Some(PathBuf::from("/watch"));
         loaded.global_upload_limit_bps = 4321;
-        loaded.default_download_folder = Some(PathBuf::from("/shared/downloads"));
+        loaded.default_download_folder = Some(dir.path().join("data").join("downloads"));
         loaded.torrents.push(TorrentSettings {
             torrent_or_magnet: shared_torrent_path.to_string_lossy().to_string(),
             name: "Library Item".to_string(),
-            download_path: Some(PathBuf::from("/shared/downloads/library-item")),
+            download_path: Some(dir.path().join("data").join("downloads").join("library-item")),
             ..TorrentSettings::default()
         });
 
@@ -2126,34 +2039,48 @@ mod tests {
             .expect("save shared settings");
         let reloaded = backend.load_settings().expect("reload shared settings");
 
-        let settings_contents =
-            fs::read_to_string(&backend.paths.settings_path).expect("read settings file");
-        let host_contents = fs::read_to_string(&backend.paths.host_path).expect("read host file");
-        let catalog_contents =
-            fs::read_to_string(&backend.paths.catalog_path).expect("read catalog file");
+        let shared_settings: SharedSettingsConfig =
+            read_toml_or_default(&backend.paths.settings_path).expect("read settings file");
+        let host_config: HostConfig =
+            read_toml_or_default(&backend.paths.host_path).expect("read host file");
+        let catalog_config: CatalogConfig =
+            read_toml_or_default(&backend.paths.catalog_path).expect("read catalog file");
         let metadata_contents =
             fs::read_to_string(&backend.paths.metadata_path).expect("read metadata file");
 
-        assert!(host_contents.contains("client_port = 9090"));
-        assert!(!host_contents.contains("client_id"));
-        assert!(host_contents.contains("watch_folder = \"/watch\""));
-        assert!(settings_contents.contains("client_id = \"shared-node\""));
-        assert!(settings_contents.contains("global_upload_limit_bps = 4321"));
-        assert!(settings_contents.contains("default_download_folder = \"/shared/downloads\""));
-        assert!(catalog_contents.contains("[[torrents]]"));
-        assert!(catalog_contents.contains("name = \"Library Item\""));
-        assert!(catalog_contents.contains("torrent_or_magnet = \"shared:torrents/0123456789abcdef0123456789abcdef01234567.torrent\""));
+        assert_eq!(host_config.client_port, 9090);
+        assert_eq!(host_config.client_id, None);
+        assert_eq!(host_config.watch_folder, Some(PathBuf::from("/watch")));
+        assert_eq!(shared_settings.client_id, "shared-node");
+        assert_eq!(shared_settings.global_upload_limit_bps, 4321);
+        assert_eq!(
+            shared_settings.default_download_folder,
+            Some(PathBuf::from("data").join("downloads"))
+        );
+        assert_eq!(catalog_config.torrents.len(), 1);
+        assert_eq!(catalog_config.torrents[0].name, "Library Item");
+        assert_eq!(
+            catalog_config.torrents[0].torrent_or_magnet,
+            "shared:torrents/0123456789abcdef0123456789abcdef01234567.torrent"
+        );
+        assert_eq!(
+            catalog_config.torrents[0].download_path,
+            Some(PathBuf::from("data").join("downloads").join("library-item"))
+        );
         assert!(metadata_contents.contains("[[torrents]]"));
         assert!(metadata_contents.contains("torrent_name = \"Library Item\""));
-        assert!(!catalog_contents.contains("global_upload_limit_bps"));
         assert_eq!(
             reloaded.torrents[0].torrent_or_magnet,
             shared_torrent_path.to_string_lossy().to_string()
         );
+        assert_eq!(
+            reloaded.default_download_folder,
+            Some(dir.path().join("data").join("downloads"))
+        );
     }
 
     #[test]
-    fn test_shared_backend_bootstraps_missing_host_file_with_inferred_roots() {
+    fn test_shared_backend_requires_explicit_host_file() {
         clear_shared_config_state();
         let dir = tempdir().expect("create tempdir");
         let shared_root = dir.path().join("superseedr-config");
@@ -2169,27 +2096,11 @@ mod tests {
         };
 
         fs::create_dir_all(&backend.paths.root_dir).expect("create shared root");
-        write_toml_atomically(
-            &backend.paths.settings_path,
-            &SharedSettingsConfig {
-                default_download_folder: Some(SharedPath::Portable {
-                    root: "media".to_string(),
-                    relative: PathBuf::new(),
-                }),
-                ..SharedSettingsConfig::default()
-            },
-        )
-        .expect("seed shared settings");
+        let error = backend
+            .load_settings()
+            .expect_err("missing host file should fail");
 
-        let loaded = backend.load_settings().expect("load shared settings");
-        let host_contents = fs::read_to_string(&backend.paths.host_path).expect("read host file");
-
-        assert_eq!(
-            loaded.default_download_folder,
-            Some(dir.path().to_path_buf())
-        );
-        assert!(host_contents.contains("[path_roots]"));
-        assert!(host_contents.contains("media = "));
+        assert!(error.to_string().contains("Missing shared host config"));
     }
 
     #[test]
@@ -2284,66 +2195,37 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_watch_paths_always_include_primary_command_inbox() {
+    fn test_configured_watch_paths_use_shared_inbox_in_shared_mode() {
         let _guard = watch_env_guard().lock().unwrap();
-        let original = env::var_os("SUPERSEEDR_WATCH_PATH_1");
-        env::set_var("SUPERSEEDR_WATCH_PATH_1", "/bridge-watch");
+        let original_shared_dir = env::var_os(SHARED_CONFIG_DIR_ENV);
+        let original_host_id = env::var_os(SHARED_HOST_ID_ENV);
+        let dir = tempdir().expect("create tempdir");
 
-        let explicit_watch = PathBuf::from("/shared-watch");
+        env::set_var(SHARED_CONFIG_DIR_ENV, dir.path());
+        env::set_var(SHARED_HOST_ID_ENV, "node-a");
+        clear_shared_config_state();
+
+        let explicit_watch = PathBuf::from("/host-watch");
         let settings = Settings {
             watch_folder: Some(explicit_watch.clone()),
             ..Settings::default()
         };
         let configured = configured_watch_paths(&settings);
 
+        assert!(configured.contains(&dir.path().join("inbox")));
         assert!(configured.contains(&explicit_watch));
-        assert!(configured.contains(&PathBuf::from("/bridge-watch")));
+        assert_eq!(resolve_command_watch_path(&settings), Some(dir.path().join("inbox")));
 
-        if let Some(value) = original.clone() {
-            env::set_var("SUPERSEEDR_WATCH_PATH_1", value);
+        if let Some(value) = original_shared_dir {
+            env::set_var(SHARED_CONFIG_DIR_ENV, value);
         } else {
-            env::remove_var("SUPERSEEDR_WATCH_PATH_1");
+            env::remove_var(SHARED_CONFIG_DIR_ENV);
         }
-
-        let fallback_paths = configured_watch_paths(&Settings::default());
-        if let Some(local_watch) = get_watch_path().map(|(watch_path, _)| watch_path) {
-            assert!(fallback_paths.contains(&local_watch));
-        }
-
-        env::set_var("SUPERSEEDR_WATCH_PATH_1", "/bridge-watch");
-        let fallback_with_bridge = configured_watch_paths(&Settings::default());
-        if let Some(local_watch) = get_watch_path().map(|(watch_path, _)| watch_path) {
-            assert!(fallback_with_bridge.contains(&local_watch));
-        }
-        assert!(fallback_with_bridge.contains(&PathBuf::from("/bridge-watch")));
-
-        if let Some(value) = original {
-            env::set_var("SUPERSEEDR_WATCH_PATH_1", value);
+        if let Some(value) = original_host_id {
+            env::set_var(SHARED_HOST_ID_ENV, value);
         } else {
-            env::remove_var("SUPERSEEDR_WATCH_PATH_1");
+            env::remove_var(SHARED_HOST_ID_ENV);
         }
-    }
-
-    #[test]
-    fn test_resolve_additional_watch_paths_from_sources_orders_and_deduplicates() {
-        let paths = resolve_additional_watch_paths_from_sources([
-            ("SUPERSEEDR_WATCH_PATH_2", "/watch-b"),
-            ("SUPERSEEDR_WATCH_PATH_10", "/watch-z"),
-            ("IGNORED", "/nope"),
-            ("SUPERSEEDR_WATCH_PATH_1", "/watch-a"),
-            ("SUPERSEEDR_WATCH_PATH_3", "/watch-b"),
-            ("SUPERSEEDR_WATCH_PATH_ALPHA", "/watch-alpha"),
-            ("SUPERSEEDR_WATCH_PATH_4", ""),
-        ]);
-
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/watch-a"),
-                PathBuf::from("/watch-b"),
-                PathBuf::from("/watch-z"),
-                PathBuf::from("/watch-alpha"),
-            ]
-        );
+        clear_shared_config_state();
     }
 }

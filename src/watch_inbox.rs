@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::get_watch_path;
+use crate::config::{get_watch_path, shared_inbox_path, shared_processed_path};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn is_cross_device_link_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(18) | Some(17))
@@ -38,9 +39,51 @@ pub fn move_file_with_fallback(source: &Path, destination: &Path) -> io::Result<
 }
 
 pub fn processed_watch_destination(path: &Path) -> Option<PathBuf> {
+    if let Some(shared_inbox) = shared_inbox_path() {
+        if path.parent() == Some(shared_inbox.as_path()) {
+            let processed = shared_processed_path()?;
+            let file_name = path.file_name()?;
+            return Some(processed.join(file_name));
+        }
+    }
+
     let (_, processed_path) = get_watch_path()?;
     let file_name = path.file_name()?;
     Some(processed_path.join(file_name))
+}
+
+fn unique_relay_destination(source: &Path, destination_dir: &Path) -> io::Result<PathBuf> {
+    let file_name = source.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Relay source file has no file name")
+    })?;
+    let candidate = destination_dir.join(file_name);
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("relay");
+    let extension = source.extension().and_then(|value| value.to_str());
+    let renamed = match extension {
+        Some(ext) => format!("{stem}-{now_ms}.{ext}"),
+        None => format!("{stem}-{now_ms}"),
+    };
+    Ok(destination_dir.join(renamed))
+}
+
+pub fn relay_watch_file_to_shared_inbox(path: &Path) -> io::Result<PathBuf> {
+    let inbox = shared_inbox_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Shared inbox path unavailable"))?;
+    fs::create_dir_all(&inbox)?;
+    let destination = unique_relay_destination(path, &inbox)?;
+    move_file_with_fallback(path, &destination)?;
+    Ok(destination)
 }
 
 pub fn archive_watch_file(path: &Path, fallback_extension: &str) -> io::Result<PathBuf> {
@@ -58,8 +101,17 @@ pub fn archive_watch_file(path: &Path, fallback_extension: &str) -> io::Result<P
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_watch_file, is_cross_device_link_error, move_file_with_fallback_impl};
+    use super::{
+        archive_watch_file, is_cross_device_link_error, move_file_with_fallback_impl,
+        relay_watch_file_to_shared_inbox,
+    };
+    use crate::config::clear_shared_config_state_for_tests;
     use std::fs;
+
+    fn shared_env_guard() -> &'static std::sync::Mutex<()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     #[test]
     fn cross_device_link_detection_accepts_windows_and_unix_codes() {
@@ -101,5 +153,28 @@ mod tests {
             archived.extension().and_then(|ext| ext.to_str()),
             Some("done")
         );
+    }
+
+    #[test]
+    fn relay_watch_file_to_shared_inbox_moves_file() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("sample.control");
+        let shared_root = dir.path().join("shared-root");
+        let original_shared_dir = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        fs::write(&source, "content").expect("write source");
+        std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", &shared_root);
+        clear_shared_config_state_for_tests();
+
+        let relayed = relay_watch_file_to_shared_inbox(&source).expect("relay watch file");
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&relayed).expect("read relayed file"), "content");
+
+        if let Some(value) = original_shared_dir {
+            std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        clear_shared_config_state_for_tests();
     }
 }

@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::AppCommand;
-use crate::config::{
-    configured_watch_paths, shared_config_scope_for_path, shared_config_watch_paths, Settings,
-};
 use crate::integrations::control::read_control_request;
 use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
@@ -13,7 +10,8 @@ use tokio::sync::mpsc;
 use tracing::{event as tracing_event, Level};
 
 pub fn create_watcher(
-    settings: &Settings,
+    watch_paths: &[PathBuf],
+    watch_port_file: bool,
     tx: mpsc::Sender<Result<Event, NotifyError>>,
 ) -> Result<RecommendedWatcher, Box<dyn std::error::Error>> {
     let mut watcher = RecommendedWatcher::new(
@@ -25,7 +23,7 @@ pub fn create_watcher(
         Config::default(),
     )?;
 
-    for path in configured_watch_paths(settings) {
+    for path in watch_paths {
         if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
             tracing_event!(
                 Level::ERROR,
@@ -38,48 +36,33 @@ pub fn create_watcher(
         }
     }
 
-    for shared_path in shared_config_watch_paths() {
-        if let Err(e) = watcher.watch(&shared_path, RecursiveMode::NonRecursive) {
-            tracing_event!(
-                Level::WARN,
-                "Failed to watch shared config path {:?}: {}",
-                shared_path,
-                e
-            );
-        } else {
-            tracing_event!(
-                Level::INFO,
-                "Watching shared config path: {:?}",
-                shared_path
-            );
-        }
-    }
-
-    let port_file_path = PathBuf::from("/port-data/forwarded_port");
-    if let Some(port_dir) = port_file_path.parent() {
-        if let Err(e) = watcher.watch(port_dir, RecursiveMode::NonRecursive) {
-            tracing_event!(
-                Level::WARN,
-                "Failed to watch port file directory {:?}: {}",
-                port_dir,
-                e
-            );
-        } else {
-            tracing_event!(
-                Level::INFO,
-                "Watching for port file changes in {:?}",
-                port_dir
-            );
+    if watch_port_file {
+        let port_file_path = PathBuf::from("/port-data/forwarded_port");
+        if let Some(port_dir) = port_file_path.parent() {
+            if let Err(e) = watcher.watch(port_dir, RecursiveMode::NonRecursive) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to watch port file directory {:?}: {}",
+                    port_dir,
+                    e
+                );
+            } else {
+                tracing_event!(
+                    Level::INFO,
+                    "Watching for port file changes in {:?}",
+                    port_dir
+                );
+            }
         }
     }
 
     Ok(watcher)
 }
 
-pub fn scan_watch_folder_paths(settings: &Settings) -> Vec<PathBuf> {
+pub fn scan_watch_folder_paths(watch_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    for watch_path in configured_watch_paths(settings) {
+    for watch_path in watch_paths {
         if let Ok(entries) = fs::read_dir(&watch_path) {
             for entry in entries.flatten() {
                 paths.push(entry.path());
@@ -96,18 +79,7 @@ pub fn scan_watch_folder_paths(settings: &Settings) -> Vec<PathBuf> {
     paths
 }
 
-pub fn scan_watch_folders(settings: &Settings) -> Vec<AppCommand> {
-    scan_watch_folder_paths(settings)
-        .into_iter()
-        .filter_map(|path| path_to_command(&path))
-        .collect()
-}
-
 pub fn path_to_command(path: &Path) -> Option<AppCommand> {
-    if let Some(scope) = shared_config_scope_for_path(path) {
-        return Some(AppCommand::ReloadSharedConfig(scope));
-    }
-
     if !path.is_file() {
         return None;
     }
@@ -168,7 +140,6 @@ pub fn path_to_command(path: &Path) -> Option<AppCommand> {
 mod tests {
     use super::*;
     use crate::app::AppCommand;
-    use crate::config::SharedConfigScope;
     use crate::integrations::control::{write_control_request, ControlRequest};
     use notify::EventKind;
     use std::fs::File;
@@ -223,51 +194,25 @@ mod tests {
         ));
     }
 
-    fn watch_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    fn shared_config_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[test]
-    fn scan_watch_folders_reads_env_watch_paths() {
-        let _guard = watch_env_guard().lock().unwrap();
-        let original = std::env::var_os("SUPERSEEDR_WATCH_PATH_1");
-
+    fn scan_watch_folder_paths_reads_provided_paths() {
         let dir = std::env::temp_dir().join(format!("watcher_env_test_{}", rand::random::<u32>()));
         fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("queued-job.magnet");
         File::create(&file_path).unwrap();
-        std::env::set_var("SUPERSEEDR_WATCH_PATH_1", &dir);
 
-        let commands = scan_watch_folders(&crate::config::Settings::default());
-        assert!(commands
-            .iter()
-            .any(|cmd| matches!(cmd, AppCommand::AddMagnetFromFile(path) if path == &file_path)));
-
-        if let Some(value) = original {
-            std::env::set_var("SUPERSEEDR_WATCH_PATH_1", value);
-        } else {
-            std::env::remove_var("SUPERSEEDR_WATCH_PATH_1");
-        }
+        let paths = scan_watch_folder_paths(&[dir.clone()]);
+        assert!(paths.contains(&file_path));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn create_watcher_emits_live_events_for_env_watch_paths() {
-        let _guard = watch_env_guard().lock().unwrap();
-        let original = std::env::var_os("SUPERSEEDR_WATCH_PATH_1");
-
+    async fn create_watcher_emits_live_events_for_provided_watch_paths() {
         let dir = std::env::temp_dir().join(format!("watcher_live_test_{}", rand::random::<u32>()));
         fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("SUPERSEEDR_WATCH_PATH_1", &dir);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let _watcher = create_watcher(&crate::config::Settings::default(), tx).unwrap();
+        let _watcher = create_watcher(std::slice::from_ref(&dir), false, tx).unwrap();
 
         let file_path = dir.join("bridge.magnet");
         std::fs::write(
@@ -296,11 +241,6 @@ mod tests {
             EventKind::Create(_) | EventKind::Modify(_)
         ));
 
-        if let Some(value) = original {
-            std::env::set_var("SUPERSEEDR_WATCH_PATH_1", value);
-        } else {
-            std::env::remove_var("SUPERSEEDR_WATCH_PATH_1");
-        }
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -317,69 +257,6 @@ mod tests {
             let cmd = path_to_command(path);
             assert!(matches!(cmd, Some(AppCommand::ClientShutdown(_))));
         });
-    }
-
-    #[test]
-    fn test_path_to_command_shared_config_scopes() {
-        let _guard = shared_config_env_guard().lock().unwrap();
-        let original_root = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
-        let original_host_id = std::env::var_os("SUPERSEEDR_HOST_ID");
-
-        let dir =
-            tempfile::tempdir().expect("create tempdir for shared config path_to_command test");
-        let root = dir.path();
-        let host_dir = root.join("hosts");
-        fs::create_dir_all(&host_dir).expect("create host dir");
-
-        let settings = root.join("settings.toml");
-        let catalog = root.join("catalog.toml");
-        let metadata = root.join("torrent_metadata.toml");
-        let host = host_dir.join("watch-node.toml");
-
-        File::create(&settings).expect("create settings");
-        File::create(&catalog).expect("create catalog");
-        File::create(&metadata).expect("create metadata");
-        File::create(&host).expect("create host");
-
-        std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", root);
-        std::env::set_var("SUPERSEEDR_HOST_ID", "watch-node");
-
-        assert!(matches!(
-            path_to_command(&settings),
-            Some(AppCommand::ReloadSharedConfig(
-                SharedConfigScope::GlobalSettings
-            ))
-        ));
-        assert!(matches!(
-            path_to_command(&catalog),
-            Some(AppCommand::ReloadSharedConfig(
-                SharedConfigScope::TorrentCatalog
-            ))
-        ));
-        assert!(matches!(
-            path_to_command(&metadata),
-            Some(AppCommand::ReloadSharedConfig(
-                SharedConfigScope::TorrentMetadata
-            ))
-        ));
-        assert!(matches!(
-            path_to_command(&host),
-            Some(AppCommand::ReloadSharedConfig(
-                SharedConfigScope::HostSettings
-            ))
-        ));
-
-        if let Some(value) = original_root {
-            std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
-        } else {
-            std::env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
-        }
-
-        if let Some(value) = original_host_id {
-            std::env::set_var("SUPERSEEDR_HOST_ID", value);
-        } else {
-            std::env::remove_var("SUPERSEEDR_HOST_ID");
-        }
     }
 
     #[test]

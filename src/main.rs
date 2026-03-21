@@ -4,7 +4,6 @@
 mod app;
 mod command;
 mod config;
-mod config_reconcile;
 mod control_service;
 mod errors;
 mod integrations;
@@ -24,7 +23,7 @@ mod tui;
 mod tuning;
 mod watch_inbox;
 
-use app::App;
+use app::{App, AppRuntimeMode};
 use rand::Rng;
 
 use std::fs;
@@ -36,7 +35,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::Settings;
-use crate::config::{load_settings, resolve_command_watch_path};
+use crate::config::{is_shared_config_mode, load_settings, resolve_command_watch_path, shared_lock_path};
 use crate::control_service::{
     apply_offline_control_request, control_event_details, online_control_success_message,
 };
@@ -121,12 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("Failed to create watch directories: {}", e);
     }
 
+    let shared_mode = is_shared_config_mode();
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
     let mut _lock_file_handle = try_acquire_app_lock()?;
-    let app_is_running = _lock_file_handle.is_none();
+    let leader_is_running = _lock_file_handle.is_none();
 
     if has_cli_request {
-        if let Err(error) = process_cli_request(&cli, &loaded_settings, app_is_running) {
+        if let Err(error) = process_cli_request(&cli, &loaded_settings, shared_mode, leader_is_running) {
             eprintln!("[Error] Application failed: {}", error);
             std::process::exit(1);
         }
@@ -134,9 +134,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if _lock_file_handle.is_some() {
-        let mut client_configs = loaded_settings;
+    let runtime_mode = if shared_mode {
+        if _lock_file_handle.is_some() {
+            AppRuntimeMode::SharedLeader
+        } else {
+            AppRuntimeMode::SharedFollower
+        }
+    } else if _lock_file_handle.is_some() {
+        AppRuntimeMode::Normal
+    } else {
+        println!("superseedr is already running.");
+        return Ok(());
+    };
 
+    let mut client_configs = loaded_settings;
+
+    if !runtime_mode.is_shared_follower() {
         #[cfg(all(feature = "dht", feature = "pex"))]
         {
             if client_configs.private_client {
@@ -225,45 +238,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("Failed to save settings after generating client ID: {}", e);
             }
         }
-
-        tracing::info!("Initializing application state...");
-        let mut app = App::new(client_configs).await?;
-        tracing::info!("Application state initialized. Starting TUI.");
-
-        let original_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |panic_info| {
-            let _ = cleanup_terminal();
-            original_hook(panic_info);
-        }));
-
-        enable_raw_mode()?;
-        let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen,)?;
-        let _ = execute!(stdout, EnableBracketedPaste);
-
-        #[cfg(not(windows))]
-        {
-            let _ = execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-            );
-        }
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        if let Err(e) = app.run(&mut terminal).await {
-            eprintln!("[Error] Application failed: {}", e);
-        }
-
-        cleanup_terminal()?;
-    } else {
-        println!("superseedr is already running.");
     }
+
+    tracing::info!("Initializing application state...");
+    let mut app = App::new(client_configs, runtime_mode).await?;
+    tracing::info!("Application state initialized. Starting TUI.");
+
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = cleanup_terminal();
+        original_hook(panic_info);
+    }));
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen,)?;
+    let _ = execute!(stdout, EnableBracketedPaste);
+
+    #[cfg(not(windows))]
+    {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    if let Err(e) = app.run(&mut terminal).await {
+        eprintln!("[Error] Application failed: {}", e);
+    }
+
+    cleanup_terminal()?;
 
     Ok(())
 }
 
 fn get_lock_path() -> Option<PathBuf> {
+    if is_shared_config_mode() {
+        return shared_lock_path();
+    }
+
     let base_data_dir = config::get_app_paths()
         .map(|(_, data_dir)| data_dir)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -282,7 +297,12 @@ fn try_acquire_app_lock() -> io::Result<Option<File>> {
     }
 }
 
-fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> io::Result<()> {
+fn process_cli_request(
+    cli: &Cli,
+    settings: &Settings,
+    shared_mode: bool,
+    leader_is_running: bool,
+) -> io::Result<()> {
     if let Some(direct_input) = &cli.input {
         let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
             io::Error::new(
@@ -322,14 +342,21 @@ fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> 
         Commands::Status { .. } => {
             let request = status_control_request(command)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-            if app_is_running {
+            if shared_mode {
+                process_shared_status_request(
+                    settings,
+                    &request,
+                    status_should_stream(command),
+                    leader_is_running,
+                )
+            } else if leader_is_running {
                 process_online_status_request(settings, &request, status_should_stream(command))
             } else {
                 process_offline_control_request(settings, &request)
             }
         }
         Commands::StopClient => {
-            if !app_is_running {
+            if !leader_is_running {
                 println!("superseedr is not running.");
                 return Ok(());
             }
@@ -352,7 +379,9 @@ fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> 
                 })?;
 
             for request in requests {
-                if app_is_running {
+                if shared_mode {
+                    process_shared_control_request(settings, &request, leader_is_running)?;
+                } else if leader_is_running {
                     process_online_control_request(settings, &request)?;
                 } else {
                     process_offline_control_request(settings, &request)?;
@@ -360,6 +389,66 @@ fn process_cli_request(cli: &Cli, settings: &Settings, app_is_running: bool) -> 
             }
             Ok(())
         }
+    }
+}
+
+fn process_shared_status_request(
+    settings: &Settings,
+    request: &ControlRequest,
+    stream: bool,
+    leader_is_running: bool,
+) -> io::Result<()> {
+    let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve the command watch path",
+        )
+    })?;
+
+    match request {
+        ControlRequest::StatusNow => {
+            if leader_is_running {
+                let previous_modified_at = status_file_modified_at()?;
+                let _ = write_control_command(request, &watch_path)?;
+                let json =
+                    wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+                println!("{}", json);
+                Ok(())
+            } else {
+                print_shared_status_snapshot(true)
+            }
+        }
+        ControlRequest::StatusFollowStart { interval_secs } if stream => {
+            if !leader_is_running {
+                return Err(io::Error::other(
+                    "Status follow requires an active shared-mode leader",
+                ));
+            }
+
+            let previous_modified_at = status_file_modified_at()?;
+            let _ = write_control_command(&ControlRequest::StatusNow, &watch_path)?;
+            let json = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+            println!("{}", json);
+            io::stdout().flush()?;
+
+            loop {
+                std::thread::sleep(Duration::from_secs((*interval_secs).max(1)));
+                let json = fs::read_to_string(status_file_path()?)?;
+                println!("{}", json);
+                io::stdout().flush()?;
+            }
+        }
+        ControlRequest::StatusFollowStart { .. } => {
+            println!(
+                "Shared mode does not support remote status interval changes. Use `superseedr status --follow` to poll the shared status file."
+            );
+            Ok(())
+        }
+        ControlRequest::StatusFollowStop => {
+            println!("Shared mode does not use remote status streaming state.");
+            Ok(())
+        }
+        _ => unreachable!("status request handler received non-status control request"),
     }
 }
 
@@ -457,6 +546,30 @@ fn process_online_control_request(settings: &Settings, request: &ControlRequest)
     }
 }
 
+fn process_shared_control_request(
+    settings: &Settings,
+    request: &ControlRequest,
+    leader_is_running: bool,
+) -> io::Result<()> {
+    let watch_path = resolve_command_watch_path(settings).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve the command watch path",
+        )
+    })?;
+
+    let _ = write_control_command(request, &watch_path)?;
+    if leader_is_running {
+        println!("{}", online_control_success_message(request));
+    } else {
+        println!(
+            "Queued {} request pending leader availability.",
+            request.action_name()
+        );
+    }
+    Ok(())
+}
+
 fn process_offline_control_request(
     settings: &Settings,
     request: &ControlRequest,
@@ -484,6 +597,28 @@ fn process_offline_control_request(
     record_offline_control_journal_entry(request, &result);
     let message = result.map_err(io::Error::other)?;
     println!("{}", message);
+    Ok(())
+}
+
+fn print_shared_status_snapshot(stale: bool) -> io::Result<()> {
+    let status_path = status_file_path()?;
+    let json = fs::read_to_string(&status_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "No shared status snapshot is available at {}: {}",
+                status_path.display(),
+                error
+            ),
+        )
+    })?;
+    if stale {
+        eprintln!(
+            "No leader is currently running. Showing the latest shared status snapshot from {}.",
+            status_path.display()
+        );
+    }
+    println!("{}", json);
     Ok(())
 }
 

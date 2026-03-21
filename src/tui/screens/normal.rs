@@ -5505,7 +5505,9 @@ mod tests {
             client_port: 0,
             ..crate::config::Settings::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
         execute_ui_effect(&mut app, UiEffect::OpenRssScreen).await;
@@ -5524,7 +5526,9 @@ mod tests {
             client_port: 0,
             ..crate::config::Settings::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         app.app_state.ui.journal.selected_index = 9;
 
         execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;

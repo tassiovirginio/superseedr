@@ -147,6 +147,10 @@ pub fn dump(output_data: AppOutputState, shutdown_tx: tokio::sync::broadcast::Se
 }
 
 pub fn status_file_path() -> io::Result<PathBuf> {
+    if let Some(shared_path) = crate::config::shared_status_path() {
+        return Ok(shared_path);
+    }
+
     let base_path = crate::config::get_app_paths()
         .map(|(_, data_dir)| data_dir)
         .ok_or_else(|| {
