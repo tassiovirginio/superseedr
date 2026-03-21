@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{App, AppMode, TorrentControlState};
-use crate::torrent_manager::ManagerCommand;
+use crate::app::{App, AppCommand, AppMode, TorrentControlState};
+use crate::integrations::control::ControlRequest;
 use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode};
@@ -196,22 +196,21 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
                         info_hash,
                         with_files,
                     } => {
-                        let command = if with_files {
-                            ManagerCommand::DeleteFile
-                        } else {
-                            ManagerCommand::Shutdown
-                        };
-                        if let Some(manager_tx) = app.torrent_manager_command_txs.get(&info_hash) {
-                            let manager_tx_clone = manager_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = manager_tx_clone.send(command).await;
-                            });
-                        }
+                        let _ = app.app_command_tx.try_send(AppCommand::SubmitControlRequest(
+                            ControlRequest::Delete {
+                                info_hash_hex: hex::encode(info_hash),
+                                delete_files: with_files,
+                            },
+                        ));
                     }
                     DeleteConfirmEffect::MarkDeleting { info_hash } => {
-                        if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
+                        if !app.is_current_shared_follower() {
+                            if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
                             torrent.latest_state.torrent_control_state =
                                 TorrentControlState::Deleting;
+                            torrent.latest_state.delete_files =
+                                app.app_state.ui.delete_confirm.with_files;
+                            }
                         }
                     }
                     DeleteConfirmEffect::ToNormal => {

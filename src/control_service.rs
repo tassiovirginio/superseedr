@@ -3,10 +3,13 @@
 
 use crate::app::FilePriority;
 use crate::config::{load_torrent_metadata, Settings, TorrentMetadataEntry, TorrentSettings};
-use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
+use crate::integrations::control::{
+    ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
+};
 use crate::persistence::event_journal::{ControlOrigin, EventDetails};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
+use std::collections::HashMap;
 use std::fs;
 
 pub fn find_torrent_settings_index_by_info_hash(
@@ -33,11 +36,15 @@ pub fn online_control_success_message(request: &ControlRequest) -> String {
         ControlRequest::Resume { info_hash_hex } => {
             format!("Queued resume request for torrent '{}'", info_hash_hex)
         }
-        ControlRequest::Delete { info_hash_hex } => {
-            format!(
-                "Queued delete request for torrent '{}' (files deleted: no)",
-                info_hash_hex
-            )
+        ControlRequest::Delete {
+            info_hash_hex,
+            delete_files,
+        } => {
+            if *delete_files {
+                format!("Queued purge request for torrent '{}'", info_hash_hex)
+            } else {
+                format!("Queued remove request for torrent '{}'", info_hash_hex)
+            }
         }
         ControlRequest::SetFilePriority {
             info_hash_hex,
@@ -49,6 +56,17 @@ pub fn online_control_success_message(request: &ControlRequest) -> String {
             describe_priority_target(target),
             priority
         ),
+        ControlRequest::AddTorrentFile { source_path, .. } => format!(
+            "Queued add request for torrent file '{}'",
+            source_path.display()
+        ),
+        ControlRequest::AddMagnet { magnet_link, .. } => {
+            let label = magnet_link
+                .split('&')
+                .next()
+                .unwrap_or(magnet_link.as_str());
+            format!("Queued add request for magnet '{}'", label)
+        }
         ControlRequest::StatusNow
         | ControlRequest::StatusFollowStart { .. }
         | ControlRequest::StatusFollowStop => "Queued control request.".to_string(),
@@ -144,6 +162,16 @@ fn file_list_from_metadata_entry(entry: &TorrentMetadataEntry) -> Vec<(Vec<Strin
         .collect()
 }
 
+pub fn file_priorities_to_map(
+    values: &[ControlFilePriorityOverride],
+) -> HashMap<usize, FilePriority> {
+    values
+        .iter()
+        .filter(|value| !matches!(value.priority, FilePriority::Normal))
+        .map(|value| (value.file_index, value.priority))
+        .collect()
+}
+
 pub fn resolve_priority_file_index(
     torrent_settings: &TorrentSettings,
     target: &ControlPriorityTarget,
@@ -203,7 +231,10 @@ pub fn apply_offline_control_request(
                 crate::app::TorrentControlState::Running;
             Ok(format!("Resumed torrent '{}'", info_hash_hex))
         }
-        ControlRequest::Delete { info_hash_hex } => {
+        ControlRequest::Delete {
+            info_hash_hex,
+            delete_files,
+        } => {
             let info_hash = decode_info_hash(info_hash_hex)?;
             let initial_len = settings.torrents.len();
             settings.torrents.retain(|torrent| {
@@ -213,10 +244,14 @@ pub fn apply_offline_control_request(
             if settings.torrents.len() == initial_len {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
             }
-            Ok(format!(
-                "Removed torrent '{}' (files deleted: no)",
-                info_hash_hex
-            ))
+            Ok(if *delete_files {
+                format!(
+                    "Removed torrent '{}' from desired state (payload purge not performed offline)",
+                    info_hash_hex
+                )
+            } else {
+                format!("Removed torrent '{}' (files kept)", info_hash_hex)
+            })
         }
         ControlRequest::SetFilePriority {
             info_hash_hex,
@@ -239,6 +274,46 @@ pub fn apply_offline_control_request(
                 "Set file priority for torrent '{}' at index {} to {:?}",
                 info_hash_hex, file_index, priority
             ))
+        }
+        ControlRequest::AddTorrentFile {
+            source_path,
+            download_path,
+            container_name,
+            file_priorities,
+        } => {
+            let name = source_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Queued Torrent")
+                .to_string();
+            settings.torrents.push(TorrentSettings {
+                torrent_or_magnet: source_path.to_string_lossy().to_string(),
+                name,
+                download_path: download_path.clone(),
+                container_name: container_name.clone(),
+                file_priorities: file_priorities_to_map(file_priorities),
+                ..TorrentSettings::default()
+            });
+            Ok(format!(
+                "Queued torrent file '{}' for the next runtime",
+                source_path.display()
+            ))
+        }
+        ControlRequest::AddMagnet {
+            magnet_link,
+            download_path,
+            container_name,
+            file_priorities,
+        } => {
+            settings.torrents.push(TorrentSettings {
+                torrent_or_magnet: magnet_link.clone(),
+                name: "Queued Magnet".to_string(),
+                download_path: download_path.clone(),
+                container_name: container_name.clone(),
+                file_priorities: file_priorities_to_map(file_priorities),
+                ..TorrentSettings::default()
+            });
+            Ok("Queued magnet for the next runtime".to_string())
         }
         ControlRequest::StatusNow
         | ControlRequest::StatusFollowStart { .. }
@@ -294,6 +369,7 @@ mod tests {
             &mut settings,
             &ControlRequest::Delete {
                 info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+                delete_files: false,
             },
         );
 

@@ -3,7 +3,7 @@
 
 use crate::app::{
     App, AppCommand, AppMode, BrowserPane, ConfigItem, ConfigUiState, FileBrowserMode,
-    FileMetadata, FilePriority, TorrentControlState, TorrentDisplayState, TorrentPreviewPayload,
+    FileMetadata, FilePriority, TorrentDisplayState, TorrentPreviewPayload,
 };
 use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
@@ -1589,26 +1589,33 @@ pub async fn execute_confirm_decision(
         }
         ConfirmDecision::Download(payload) => {
             if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
-                app.add_torrent_from_file(
+                match app.prepare_add_torrent_file_request(
                     pending_path,
                     Some(payload.base_path.clone()),
-                    false,
-                    TorrentControlState::Running,
-                    payload.file_priorities.clone(),
                     payload.container_name_to_use.clone(),
-                )
-                .await;
+                    payload.file_priorities.clone(),
+                ) {
+                    Ok(request) => {
+                        let _ = app
+                            .app_command_tx
+                            .send(AppCommand::SubmitControlRequest(request))
+                            .await;
+                    }
+                    Err(error) => {
+                        app.app_state.system_error = Some(error);
+                    }
+                }
             } else if !app.app_state.pending_torrent_link.is_empty() {
-                app.add_magnet_torrent(
-                    "Fetching name...".to_string(),
+                let request = app.prepare_add_magnet_request(
                     app.app_state.pending_torrent_link.clone(),
                     Some(payload.base_path),
-                    false,
-                    TorrentControlState::Running,
-                    payload.file_priorities,
                     payload.container_name_to_use,
-                )
-                .await;
+                    payload.file_priorities,
+                );
+                let _ = app
+                    .app_command_tx
+                    .send(AppCommand::SubmitControlRequest(request))
+                    .await;
                 app.app_state.pending_torrent_link.clear();
             } else {
                 tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");

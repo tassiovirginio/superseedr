@@ -224,6 +224,7 @@ pub struct TorrentSettings {
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
     pub torrent_control_state: TorrentControlState,
+    pub delete_files: bool,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
 }
@@ -286,7 +287,8 @@ mod string_usize_map {
 }
 
 const SHARED_CONFIG_DIR_ENV: &str = "SUPERSEEDR_SHARED_CONFIG_DIR";
-const SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_HOST_ID";
+const SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_SHARED_HOST_ID";
+const LEGACY_SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_HOST_ID";
 const SHARED_TORRENT_SOURCE_PREFIX: &str = "shared:";
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
@@ -298,6 +300,7 @@ struct CatalogTorrentSettings {
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
     pub torrent_control_state: TorrentControlState,
+    pub delete_files: bool,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
 }
@@ -510,6 +513,7 @@ impl CatalogTorrentSettings {
                 .transpose()?,
             container_name: settings.container_name.clone(),
             torrent_control_state: settings.torrent_control_state.clone(),
+            delete_files: settings.delete_files,
             file_priorities: settings.file_priorities.clone(),
         })
     }
@@ -529,6 +533,7 @@ impl CatalogTorrentSettings {
                 .transpose()?,
             container_name: self.container_name.clone(),
             torrent_control_state: self.torrent_control_state.clone(),
+            delete_files: self.delete_files,
             file_priorities: self.file_priorities.clone(),
         })
     }
@@ -785,7 +790,9 @@ fn resolve_host_id_from_sources(
 }
 
 fn resolve_host_id() -> String {
-    let explicit_host_id = env::var(SHARED_HOST_ID_ENV).ok();
+    let explicit_host_id = env::var(SHARED_HOST_ID_ENV)
+        .ok()
+        .or_else(|| env::var(LEGACY_SHARED_HOST_ID_ENV).ok());
     let env_hostnames = ["HOSTNAME", "COMPUTERNAME"]
         .into_iter()
         .filter_map(|key| env::var(key).ok())
@@ -1193,7 +1200,9 @@ impl SharedConfigBackend {
                 .map(|_| state.layered.settings.client_id.as_str()),
         )?;
 
-        if next_layered.settings != state.layered.settings || state.settings_fingerprint.is_none() {
+        let shared_settings_changed =
+            next_layered.settings != state.layered.settings || state.settings_fingerprint.is_none();
+        if shared_settings_changed {
             state.settings_fingerprint =
                 write_toml_atomically_with_fingerprint(
                     &self.paths.settings_path,
@@ -1201,7 +1210,9 @@ impl SharedConfigBackend {
                 )?;
         }
 
-        if next_layered.catalog != state.layered.catalog || state.catalog_fingerprint.is_none() {
+        let shared_catalog_changed =
+            next_layered.catalog != state.layered.catalog || state.catalog_fingerprint.is_none();
+        if shared_catalog_changed {
             state.catalog_fingerprint =
                 write_toml_atomically_with_fingerprint(
                     &self.paths.catalog_path,
@@ -1211,16 +1222,23 @@ impl SharedConfigBackend {
 
         let existing_metadata: TorrentMetadataConfig =
             read_toml_or_default(&self.paths.metadata_path)?;
-        let next_metadata = sync_torrent_metadata_with_settings(existing_metadata, settings);
-        state.metadata_fingerprint =
-            write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
+        let next_metadata =
+            sync_torrent_metadata_with_settings(existing_metadata.clone(), settings);
+        let shared_metadata_changed =
+            next_metadata != existing_metadata || state.metadata_fingerprint.is_none();
+        if shared_metadata_changed {
+            state.metadata_fingerprint =
+                write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
+        }
 
         if next_layered.host != state.layered.host || state.host_fingerprint.is_none() {
             state.host_fingerprint =
                 write_toml_atomically_with_fingerprint(&self.paths.host_path, &next_layered.host)?;
         }
 
-        write_shared_cluster_revision_marker(&self.paths.root_dir)?;
+        if shared_settings_changed || shared_catalog_changed || shared_metadata_changed {
+            write_shared_cluster_revision_marker(&self.paths.root_dir)?;
+        }
 
         state.layered = next_layered;
         state.resolved_settings = settings.clone();
@@ -2044,6 +2062,7 @@ mod tests {
 
     #[test]
     fn test_shared_backend_routes_shared_and_host_fields() {
+        let _guard = shared_backend_guard().lock().unwrap();
         clear_shared_config_state();
         let dir = tempdir().expect("create tempdir");
         let backend = SharedConfigBackend {
@@ -2127,6 +2146,7 @@ mod tests {
 
     #[test]
     fn test_shared_backend_requires_explicit_host_file() {
+        let _guard = shared_backend_guard().lock().unwrap();
         clear_shared_config_state();
         let dir = tempdir().expect("create tempdir");
         let shared_root = dir.path().join("superseedr-config");
@@ -2151,6 +2171,7 @@ mod tests {
 
     #[test]
     fn test_shared_backend_preserves_shared_client_id_when_host_override_exists() {
+        let _guard = shared_backend_guard().lock().unwrap();
         clear_shared_config_state();
         let dir = tempdir().expect("create tempdir");
         let backend = SharedConfigBackend {
@@ -2199,6 +2220,92 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_backend_host_only_save_does_not_bump_cluster_revision() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                root_dir: dir.path().to_path_buf(),
+                settings_path: dir.path().join("settings.toml"),
+                catalog_path: dir.path().join("catalog.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                host_path: dir.path().join("hosts").join("node-a.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed host file");
+
+        let mut loaded = backend.load_settings().expect("load shared settings");
+        loaded.global_download_limit_bps = 2048;
+        backend
+            .save_settings(&loaded)
+            .expect("save initial shared settings");
+
+        let revision_path = backend.paths.root_dir.join("cluster.revision");
+        let first_revision = fs::read_to_string(&revision_path).expect("read first revision");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        loaded.client_port = 7777;
+        loaded.watch_folder = Some(PathBuf::from("/host-watch"));
+        backend
+            .save_settings(&loaded)
+            .expect("save host-only settings");
+
+        let second_revision = fs::read_to_string(&revision_path).expect("read second revision");
+        assert_eq!(first_revision, second_revision);
+    }
+
+    #[test]
+    fn test_shared_backend_noop_save_does_not_rewrite_revision_or_metadata() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                root_dir: dir.path().to_path_buf(),
+                settings_path: dir.path().join("settings.toml"),
+                catalog_path: dir.path().join("catalog.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                host_path: dir.path().join("hosts").join("node-a.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed host file");
+
+        let mut loaded = backend.load_settings().expect("load shared settings");
+        loaded.global_download_limit_bps = 4096;
+        loaded.torrents.push(TorrentSettings {
+            torrent_or_magnet:
+                "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".to_string(),
+            name: "Sample Node".to_string(),
+            ..TorrentSettings::default()
+        });
+        backend.save_settings(&loaded).expect("save shared settings");
+
+        let revision_path = backend.paths.root_dir.join("cluster.revision");
+        let first_revision = fs::read_to_string(&revision_path).expect("read first revision");
+        let first_metadata =
+            fs::read_to_string(&backend.paths.metadata_path).expect("read first metadata");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        backend.save_settings(&loaded).expect("save noop settings");
+
+        let second_revision = fs::read_to_string(&revision_path).expect("read second revision");
+        let second_metadata =
+            fs::read_to_string(&backend.paths.metadata_path).expect("read second metadata");
+
+        assert_eq!(first_revision, second_revision);
+        assert_eq!(first_metadata, second_metadata);
+    }
+
+    #[test]
     fn test_metadata_syncs_file_priorities_from_settings() {
         let dir = tempdir().expect("create tempdir");
         let backend = NormalConfigBackend {
@@ -2239,15 +2346,22 @@ mod tests {
         GUARD.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    fn shared_backend_guard() -> &'static std::sync::Mutex<()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn test_configured_watch_paths_use_shared_inbox_in_shared_mode() {
         let _guard = watch_env_guard().lock().unwrap();
         let original_shared_dir = env::var_os(SHARED_CONFIG_DIR_ENV);
         let original_host_id = env::var_os(SHARED_HOST_ID_ENV);
+        let original_legacy_host_id = env::var_os(LEGACY_SHARED_HOST_ID_ENV);
         let dir = tempdir().expect("create tempdir");
 
         env::set_var(SHARED_CONFIG_DIR_ENV, dir.path());
         env::set_var(SHARED_HOST_ID_ENV, "node-a");
+        env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
         clear_shared_config_state();
 
         let explicit_watch = PathBuf::from("/host-watch");
@@ -2270,6 +2384,44 @@ mod tests {
             env::set_var(SHARED_HOST_ID_ENV, value);
         } else {
             env::remove_var(SHARED_HOST_ID_ENV);
+        }
+        if let Some(value) = original_legacy_host_id {
+            env::set_var(LEGACY_SHARED_HOST_ID_ENV, value);
+        } else {
+            env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
+        }
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_shared_host_id_prefers_canonical_env_var() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let original_shared_dir = env::var_os(SHARED_CONFIG_DIR_ENV);
+        let original_host_id = env::var_os(SHARED_HOST_ID_ENV);
+        let original_legacy_host_id = env::var_os(LEGACY_SHARED_HOST_ID_ENV);
+        let dir = tempdir().expect("create tempdir");
+
+        env::set_var(SHARED_CONFIG_DIR_ENV, dir.path());
+        env::set_var(SHARED_HOST_ID_ENV, "canonical-node");
+        env::set_var(LEGACY_SHARED_HOST_ID_ENV, "legacy-node");
+        clear_shared_config_state();
+
+        assert_eq!(shared_host_id().as_deref(), Some("canonical-node"));
+
+        if let Some(value) = original_shared_dir {
+            env::set_var(SHARED_CONFIG_DIR_ENV, value);
+        } else {
+            env::remove_var(SHARED_CONFIG_DIR_ENV);
+        }
+        if let Some(value) = original_host_id {
+            env::set_var(SHARED_HOST_ID_ENV, value);
+        } else {
+            env::remove_var(SHARED_HOST_ID_ENV);
+        }
+        if let Some(value) = original_legacy_host_id {
+            env::set_var(LEGACY_SHARED_HOST_ID_ENV, value);
+        } else {
+            env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
         }
         clear_shared_config_state();
     }

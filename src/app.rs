@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fs;
-use std::io::{ErrorKind, Stdout};
+use std::fs::File;
+use std::io::{self, ErrorKind, Stdout};
 use std::path::{Path, PathBuf};
 
 use std::collections::VecDeque;
@@ -22,7 +23,8 @@ use crate::config::{
     TorrentSettings, TorrentSortColumn,
 };
 use crate::control_service::{
-    control_event_details, find_torrent_settings_index_by_info_hash, resolve_priority_file_index,
+    control_event_details, file_priorities_to_map, find_torrent_settings_index_by_info_hash,
+    online_control_success_message, resolve_priority_file_index,
 };
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
@@ -62,7 +64,9 @@ use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningCon
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
 use crate::integrations::status::AppOutputState;
 use crate::integrations::{
-    control::{ControlPriorityTarget, ControlRequest},
+    control::{
+        write_control_request, ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
+    },
     rss_ingest, rss_service, status, watcher,
 };
 use crate::integrity_scheduler::{
@@ -97,7 +101,7 @@ type AsyncDht = ();
 use sha1::Digest;
 use sha2::Sha256;
 
-use notify::{Error as NotifyError, Event, RecommendedWatcher};
+use notify::{Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -128,6 +132,7 @@ pub const RSS_MAX_TORRENT_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
+const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
@@ -460,6 +465,7 @@ pub enum AppCommand {
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
     ReloadClusterState(PathBuf),
+    SubmitControlRequest(ControlRequest),
     ControlRequest {
         path: PathBuf,
         request: ControlRequest,
@@ -516,13 +522,15 @@ impl AppRuntimeMode {
         matches!(self, Self::SharedLeader | Self::SharedFollower)
     }
 
-    pub fn is_shared_leader(self) -> bool {
-        matches!(self, Self::SharedLeader)
-    }
-
     pub fn is_shared_follower(self) -> bool {
         matches!(self, Self::SharedFollower)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppClusterRole {
+    Leader,
+    Follower,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, EnumIter)]
@@ -656,6 +664,7 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TorrentMetrics {
     pub torrent_control_state: TorrentControlState,
+    pub delete_files: bool,
     pub info_hash: Vec<u8>,
     pub torrent_or_magnet: String,
     pub torrent_name: String,
@@ -699,6 +708,7 @@ impl Default for TorrentMetrics {
     fn default() -> Self {
         Self {
             torrent_control_state: TorrentControlState::default(),
+            delete_files: false,
             info_hash: Vec::new(),
             torrent_or_magnet: String::new(),
             torrent_name: String::new(),
@@ -1022,6 +1032,8 @@ pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
     pub runtime_mode: AppRuntimeMode,
+    pub shared_mode_enabled: bool,
+    pub current_cluster_role: Option<AppClusterRole>,
     pub watched_paths: Vec<PathBuf>,
     pub base_system_warning: Option<String>,
     #[cfg(feature = "dht")]
@@ -1049,6 +1061,10 @@ pub struct App {
     pub shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
+    pub rss_sync_rx: Option<mpsc::Receiver<()>>,
+    pub rss_downloaded_entry_rx: Option<mpsc::Receiver<RssHistoryEntry>>,
+    pub rss_settings_rx: Option<watch::Receiver<Settings>>,
+    pub rss_service_task: Option<tokio::task::JoinHandle<()>>,
     pub tui_task: Option<tokio::task::JoinHandle<()>>,
     pub notify_rx: mpsc::Receiver<Result<Event, NotifyError>>,
     pub watcher: RecommendedWatcher,
@@ -1058,6 +1074,7 @@ pub struct App {
     pub event_journal_host_id: Option<String>,
     pub status_dump_interval_override_secs: Option<u64>,
     pub next_status_dump_at: Option<time::Instant>,
+    pub app_lock_handle: Option<File>,
 }
 
 #[derive(Clone)]
@@ -1080,10 +1097,132 @@ pub struct PersistPayload {
     pub activity_history: Option<ActivityHistoryPersistRequest>,
     pub event_journal_state: EventJournalState,
 }
+
+fn initial_cluster_role_for_runtime_mode(runtime_mode: AppRuntimeMode) -> Option<AppClusterRole> {
+    match runtime_mode {
+        AppRuntimeMode::Normal => None,
+        AppRuntimeMode::SharedLeader => Some(AppClusterRole::Leader),
+        AppRuntimeMode::SharedFollower => Some(AppClusterRole::Follower),
+    }
+}
+
+fn spawn_persistence_writer(
+    app_command_tx: mpsc::Sender<AppCommand>,
+) -> (
+    watch::Sender<Option<PersistPayload>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (persistence_tx, mut persistence_rx) = watch::channel::<Option<PersistPayload>>(None);
+    let persistence_app_command_tx = app_command_tx.clone();
+    let persistence_task = tokio::spawn(async move {
+        while persistence_rx.changed().await.is_ok() {
+            let Some(payload) = persistence_rx.borrow().clone() else {
+                continue;
+            };
+            let network_history_request_id = payload
+                .network_history
+                .as_ref()
+                .map(|request| request.request_id);
+            let activity_history_request_id = payload
+                .activity_history
+                .as_ref()
+                .map(|request| request.request_id);
+            let write_result = tokio::task::spawn_blocking(move || {
+                save_settings(&payload.settings)
+                    .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
+                save_rss_state(&payload.rss_state)
+                    .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
+                if let Some(network_history) = payload.network_history {
+                    save_network_history_state(&network_history.state)
+                        .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
+                }
+                if let Some(activity_history) = payload.activity_history {
+                    save_activity_history_state(&activity_history.state)
+                        .map_err(|e| format!("Failed to auto-save activity history state: {}", e))?;
+                }
+                save_event_journal_state(&payload.event_journal_state)
+                    .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
+                Ok::<(), String>(())
+            })
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {
+                    tracing_event!(Level::DEBUG, "Persistence payload auto-saved successfully.");
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: true,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: true,
+                            })
+                            .await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing_event!(Level::ERROR, "{}", e);
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    });
+
+    (persistence_tx, persistence_task)
+}
+
 impl App {
     pub async fn new(
         client_configs: Settings,
         runtime_mode: AppRuntimeMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_lock(client_configs, runtime_mode, None).await
+    }
+
+    pub async fn new_with_lock(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+        app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let listener = Some(
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", client_configs.client_port))
@@ -1098,110 +1237,14 @@ impl App {
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (persistence_tx, persistence_task) = if runtime_mode.is_shared_follower() {
+        let shared_mode_enabled = runtime_mode.is_shared();
+        let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
+        let (persistence_tx, persistence_task) = if shared_mode_enabled
+            && matches!(current_cluster_role, Some(AppClusterRole::Follower))
+        {
             (None, None)
         } else {
-            let (persistence_tx, mut persistence_rx) =
-                watch::channel::<Option<PersistPayload>>(None);
-            let persistence_app_command_tx = app_command_tx.clone();
-            let persistence_task = tokio::spawn(async move {
-                while persistence_rx.changed().await.is_ok() {
-                    let Some(payload) = persistence_rx.borrow().clone() else {
-                        continue;
-                    };
-                    let network_history_request_id = payload
-                        .network_history
-                        .as_ref()
-                        .map(|request| request.request_id);
-                    let activity_history_request_id = payload
-                        .activity_history
-                        .as_ref()
-                        .map(|request| request.request_id);
-                    let write_result = tokio::task::spawn_blocking(move || {
-                        save_settings(&payload.settings)
-                            .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
-                        save_rss_state(&payload.rss_state)
-                            .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
-                        if let Some(network_history) = payload.network_history {
-                            save_network_history_state(&network_history.state).map_err(|e| {
-                                format!("Failed to auto-save network history state: {}", e)
-                            })?;
-                        }
-                        if let Some(activity_history) = payload.activity_history {
-                            save_activity_history_state(&activity_history.state).map_err(|e| {
-                                format!("Failed to auto-save activity history state: {}", e)
-                            })?;
-                        }
-                        save_event_journal_state(&payload.event_journal_state)
-                            .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
-                        Ok::<(), String>(())
-                    })
-                    .await;
-
-                    match write_result {
-                        Ok(Ok(())) => {
-                            tracing_event!(
-                                Level::DEBUG,
-                                "Persistence payload auto-saved successfully."
-                            );
-                            if let Some(request_id) = network_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::NetworkHistoryPersisted {
-                                        request_id,
-                                        success: true,
-                                    })
-                                    .await;
-                            }
-                            if let Some(request_id) = activity_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::ActivityHistoryPersisted {
-                                        request_id,
-                                        success: true,
-                                    })
-                                    .await;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing_event!(Level::ERROR, "{}", e);
-                            if let Some(request_id) = network_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::NetworkHistoryPersisted {
-                                        request_id,
-                                        success: false,
-                                    })
-                                    .await;
-                            }
-                            if let Some(request_id) = activity_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::ActivityHistoryPersisted {
-                                        request_id,
-                                        success: false,
-                                    })
-                                    .await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
-                            if let Some(request_id) = network_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::NetworkHistoryPersisted {
-                                        request_id,
-                                        success: false,
-                                    })
-                                    .await;
-                            }
-                            if let Some(request_id) = activity_history_request_id {
-                                let _ = persistence_app_command_tx
-                                    .send(AppCommand::ActivityHistoryPersisted {
-                                        request_id,
-                                        success: false,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            });
+            let (persistence_tx, persistence_task) = spawn_persistence_writer(app_command_tx.clone());
             (Some(persistence_tx), Some(persistence_task))
         };
 
@@ -1322,20 +1365,20 @@ impl App {
         if let Some(host_watch_path) = resolve_host_watch_path(&client_configs) {
             watched_paths.push(host_watch_path);
         }
-        if runtime_mode.is_shared() {
+        if shared_mode_enabled {
             if let Some(shared_root) = shared_root_path() {
                 if !watched_paths.iter().any(|path| path == &shared_root) {
                     watched_paths.push(shared_root);
                 }
             }
         }
-        if runtime_mode.is_shared_leader() {
+        if matches!(current_cluster_role, Some(AppClusterRole::Leader)) {
             if let Some(shared_inbox) = shared_inbox_path() {
                 if !watched_paths.iter().any(|path| path == &shared_inbox) {
                     watched_paths.push(shared_inbox);
                 }
             }
-        } else if !runtime_mode.is_shared() {
+        } else if !shared_mode_enabled {
             if let Some(command_watch_path) = resolve_command_watch_path(&client_configs) {
                 if !watched_paths.iter().any(|path| path == &command_watch_path) {
                     watched_paths.push(command_watch_path);
@@ -1352,6 +1395,8 @@ impl App {
             app_state,
             client_configs: client_configs.clone(),
             runtime_mode,
+            shared_mode_enabled,
+            current_cluster_role,
             watched_paths,
             base_system_warning: system_warning,
             #[cfg(feature = "dht")]
@@ -1376,6 +1421,10 @@ impl App {
             shutdown_tx,
             persistence_tx,
             persistence_task,
+            rss_sync_rx: Some(rss_sync_rx),
+            rss_downloaded_entry_rx: Some(rss_downloaded_entry_rx),
+            rss_settings_rx: Some(rss_settings_rx),
+            rss_service_task: None,
             tui_task: None,
             watcher,
             notify_rx,
@@ -1385,20 +1434,11 @@ impl App {
             event_journal_host_id: shared_host_id(),
             status_dump_interval_override_secs: None,
             next_status_dump_at: None,
+            app_lock_handle,
         };
         app.refresh_system_warning();
 
-        if !app.runtime_mode.is_shared_follower() {
-            let _rss_service_task = rss_service::spawn_rss_service(
-                app.client_configs.clone(),
-                app.app_state.rss_runtime.history.clone(),
-                app.app_command_tx.clone(),
-                rss_sync_rx,
-                rss_downloaded_entry_rx,
-                rss_settings_rx,
-                app.shutdown_tx.clone(),
-            );
-        }
+        app.ensure_leader_services_running();
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
         torrents_to_load.sort_by_key(|t| !t.validation_status);
@@ -1417,6 +1457,269 @@ impl App {
         app.refresh_rss_derived();
 
         Ok(app)
+    }
+
+    pub fn is_shared_mode_enabled(&self) -> bool {
+        self.shared_mode_enabled
+    }
+
+    pub fn is_current_shared_leader(&self) -> bool {
+        matches!(self.current_cluster_role, Some(AppClusterRole::Leader))
+    }
+
+    pub fn is_current_shared_follower(&self) -> bool {
+        self.is_shared_mode_enabled() && matches!(self.current_cluster_role, Some(AppClusterRole::Follower))
+    }
+
+    fn can_run_leader_services(&self) -> bool {
+        !self.is_shared_mode_enabled() || self.is_current_shared_leader()
+    }
+
+    fn can_write_shared_state(&self) -> bool {
+        !self.is_shared_mode_enabled() || self.is_current_shared_leader()
+    }
+
+    fn ensure_leader_services_running(&mut self) {
+        if !self.can_run_leader_services() {
+            return;
+        }
+
+        if self.persistence_tx.is_none() {
+            let (tx, task) = spawn_persistence_writer(self.app_command_tx.clone());
+            self.persistence_tx = Some(tx);
+            self.persistence_task = Some(task);
+        }
+
+        if self.rss_service_task.is_none() {
+            let Some(sync_now_rx) = self.rss_sync_rx.take() else {
+                return;
+            };
+            let Some(downloaded_entry_rx) = self.rss_downloaded_entry_rx.take() else {
+                return;
+            };
+            let Some(settings_rx) = self.rss_settings_rx.take() else {
+                return;
+            };
+            self.rss_service_task = Some(rss_service::spawn_rss_service(
+                self.client_configs.clone(),
+                self.app_state.rss_runtime.history.clone(),
+                self.app_command_tx.clone(),
+                sync_now_rx,
+                downloaded_entry_rx,
+                settings_rx,
+                self.shutdown_tx.clone(),
+            ));
+        }
+    }
+
+    fn current_shared_lock_path() -> io::Result<PathBuf> {
+        shared_root_path()
+            .map(|root| root.join("superseedr.lock"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Shared lock path unavailable"))
+    }
+
+    fn try_acquire_shared_runtime_lock() -> io::Result<Option<File>> {
+        let lock_path = Self::current_shared_lock_path()?;
+        let file = File::create(lock_path)?;
+        if file.try_lock().is_ok() {
+            Ok(Some(file))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn watch_path_if_needed(&mut self, path: PathBuf) -> io::Result<()> {
+        if self.watched_paths.iter().any(|existing| existing == &path) {
+            return Ok(());
+        }
+
+        self.watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .map_err(io::Error::other)?;
+        self.watched_paths.push(path);
+        Ok(())
+    }
+
+    fn control_priority_overrides(
+        file_priorities: &HashMap<usize, FilePriority>,
+    ) -> Vec<ControlFilePriorityOverride> {
+        let mut overrides: Vec<_> = file_priorities
+            .iter()
+            .map(|(file_index, priority)| ControlFilePriorityOverride {
+                file_index: *file_index,
+                priority: *priority,
+            })
+            .collect();
+        overrides.sort_by_key(|entry| entry.file_index);
+        overrides
+    }
+
+    fn shared_add_staging_dir() -> Result<PathBuf, String> {
+        shared_root_path()
+            .map(|root| root.join("staged-adds"))
+            .ok_or_else(|| "Shared add staging directory is unavailable".to_string())
+    }
+
+    fn is_shared_staged_add_path(path: &Path) -> bool {
+        Self::shared_add_staging_dir()
+            .map(|dir| path.starts_with(&dir))
+            .unwrap_or(false)
+    }
+
+    fn cleanup_staged_add_file(path: &Path) {
+        if !Self::is_shared_staged_add_path(path) {
+            return;
+        }
+
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != ErrorKind::NotFound {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to remove staged add file {:?}: {}",
+                    path,
+                    error
+                );
+            }
+        }
+    }
+
+    pub(crate) fn prepare_add_torrent_file_request(
+        &self,
+        source_path: PathBuf,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: HashMap<usize, FilePriority>,
+    ) -> Result<ControlRequest, String> {
+        let request_source_path = if self.is_current_shared_follower() {
+            let staging_dir = Self::shared_add_staging_dir()?;
+            fs::create_dir_all(&staging_dir)
+                .map_err(|error| format!("Failed to create shared staging directory: {}", error))?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let hash = hex::encode(sha1::Sha1::digest(
+                format!(
+                    "{}:{}:{}",
+                    source_path.display(),
+                    std::process::id(),
+                    now_ms
+                )
+                .as_bytes(),
+            ));
+            let staged_path = staging_dir.join(format!("staged-{}-{}.torrent", now_ms, &hash[..12]));
+            fs::copy(&source_path, &staged_path).map_err(|error| {
+                format!(
+                    "Failed to stage torrent file {:?} for leader processing: {}",
+                    source_path, error
+                )
+            })?;
+            staged_path
+        } else {
+            source_path
+        };
+
+        Ok(ControlRequest::AddTorrentFile {
+            source_path: request_source_path,
+            download_path,
+            container_name,
+            file_priorities: Self::control_priority_overrides(&file_priorities),
+        })
+    }
+
+    pub(crate) fn prepare_add_magnet_request(
+        &self,
+        magnet_link: String,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: HashMap<usize, FilePriority>,
+    ) -> ControlRequest {
+        ControlRequest::AddMagnet {
+            magnet_link,
+            download_path,
+            container_name,
+            file_priorities: Self::control_priority_overrides(&file_priorities),
+        }
+    }
+
+    fn queue_control_request_for_leader(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<String, String> {
+        let watch_path = resolve_command_watch_path(&self.client_configs)
+            .ok_or_else(|| "Could not resolve the shared command inbox".to_string())?;
+        let queued_path = write_control_request(&request, &watch_path)
+            .map_err(|error| format!("Failed to queue shared control request: {}", error))?;
+        self.record_control_queued(queued_path, request.clone());
+        self.save_state_to_disk();
+        Ok(format!(
+            "Queued for leader processing. {}",
+            online_control_success_message(&request)
+        ))
+    }
+
+    pub async fn dispatch_cluster_control_request(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<String, String> {
+        if self.is_current_shared_follower() {
+            self.queue_control_request_for_leader(request)
+        } else {
+            self.apply_control_request(&request).await
+        }
+    }
+
+    fn map_add_result_to_control_response(result: CommandIngestResult) -> Result<String, String> {
+        match result {
+            CommandIngestResult::Added { torrent_name, .. } => Ok(format!(
+                "Added torrent '{}'",
+                torrent_name.unwrap_or_else(|| "unknown".to_string())
+            )),
+            CommandIngestResult::Duplicate { torrent_name, .. } => Ok(format!(
+                "Torrent '{}' was already present",
+                torrent_name.unwrap_or_else(|| "unknown".to_string())
+            )),
+            CommandIngestResult::Invalid { message, .. }
+            | CommandIngestResult::Failed { message, .. } => Err(message),
+        }
+    }
+
+    async fn maybe_promote_to_shared_leader(&mut self) {
+        if !self.is_current_shared_follower() {
+            return;
+        }
+
+        let Ok(Some(lock_handle)) = Self::try_acquire_shared_runtime_lock() else {
+            return;
+        };
+
+        tracing_event!(Level::INFO, "Acquired shared lock; promoting node to cluster leader.");
+        self.app_lock_handle = Some(lock_handle);
+        self.current_cluster_role = Some(AppClusterRole::Leader);
+        self.runtime_mode = AppRuntimeMode::SharedLeader;
+
+        if let Some(shared_inbox) = shared_inbox_path() {
+            if let Err(error) = self.watch_path_if_needed(shared_inbox) {
+                tracing_event!(Level::WARN, "Failed to watch shared inbox after promotion: {}", error);
+            }
+        }
+
+        self.ensure_leader_services_running();
+
+        match crate::config::load_settings() {
+            Ok(new_settings) => {
+                if new_settings != self.client_configs {
+                    self.apply_settings_update(new_settings, false).await;
+                }
+            }
+            Err(error) => {
+                tracing_event!(Level::ERROR, "Failed to reload shared config after promotion: {}", error);
+                self.app_state.system_error =
+                    Some(format!("Failed to reload shared config after promotion: {}", error));
+            }
+        }
+
+        self.process_pending_commands().await;
     }
 
     pub async fn run(
@@ -1442,11 +1745,14 @@ impl App {
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
         let mut watch_folder_rescan_interval =
             time::interval(Duration::from_secs(WATCH_FOLDER_RESCAN_INTERVAL_SECS));
+        let mut shared_role_retry_interval =
+            time::interval(Duration::from_secs(SHARED_ROLE_RETRY_INTERVAL_SECS));
         let mut integrity_scheduler_interval = time::interval(INTEGRITY_SCHEDULER_TICK_INTERVAL);
         self.reschedule_tuning_deadline();
         dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         network_history_persist_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         watch_folder_rescan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        shared_role_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         integrity_scheduler_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         self.save_state_to_disk();
@@ -1500,6 +1806,9 @@ impl App {
 
                 _ = watch_folder_rescan_interval.tick() => {
                     self.process_pending_commands().await;
+                }
+                _ = shared_role_retry_interval.tick() => {
+                    self.maybe_promote_to_shared_leader().await;
                 }
 
                 _ = async {
@@ -1955,6 +2264,7 @@ impl App {
                 runtime.latest_state.container_name = torrent.container_name.clone();
                 runtime.latest_state.file_priorities = torrent.file_priorities.clone();
                 runtime.latest_state.torrent_control_state = torrent.torrent_control_state.clone();
+                runtime.latest_state.delete_files = torrent.delete_files;
             }
 
             let Some(previous) = old_by_hash.get(info_hash) else {
@@ -1966,7 +2276,13 @@ impl App {
                     let command = match torrent.torrent_control_state {
                         TorrentControlState::Paused => Some(ManagerCommand::Pause),
                         TorrentControlState::Running => Some(ManagerCommand::Resume),
-                        TorrentControlState::Deleting => Some(ManagerCommand::DeleteFile),
+                        TorrentControlState::Deleting => {
+                            if torrent.delete_files {
+                                Some(ManagerCommand::DeleteFile)
+                            } else {
+                                Some(ManagerCommand::Shutdown)
+                            }
+                        }
                     };
                     if let Some(command) = command {
                         let _ = manager_tx.try_send(command);
@@ -2002,9 +2318,10 @@ impl App {
             }
 
             if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                let _ = manager_tx.try_send(ManagerCommand::DeleteFile);
+                let _ = manager_tx.try_send(ManagerCommand::Shutdown);
                 if let Some(runtime) = self.app_state.torrents.get_mut(info_hash) {
                     runtime.latest_state.torrent_control_state = TorrentControlState::Deleting;
+                    runtime.latest_state.delete_files = false;
                 }
             } else {
                 self.remove_torrent_runtime(info_hash);
@@ -2035,7 +2352,7 @@ impl App {
             self.app_state.theme = Theme::builtin(new_settings.ui_theme);
         }
 
-        if new_settings.client_port != old_settings.client_port && !self.runtime_mode.is_shared_follower() {
+        if new_settings.client_port != old_settings.client_port {
             tracing::info!(
                 "Config update: Port changed to {}",
                 new_settings.client_port
@@ -2079,10 +2396,34 @@ impl App {
                 let is_watch_path =
                     self.is_host_watch_path(&path) || self.is_shared_inbox_path(&path);
 
-                if self.runtime_mode.is_shared_follower() && self.is_host_watch_path(&path) {
+                if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
                     self.app_state.pending_ingest_by_path.remove(&path);
                     self.relay_local_watch_file(&path, "torrent.forwarded");
                     self.save_state_to_disk();
+                    return;
+                }
+
+                if self.is_current_shared_follower()
+                    && !is_watch_path
+                    && self.client_configs.default_download_folder.is_some()
+                {
+                    let request = match self.prepare_add_torrent_file_request(
+                        path.clone(),
+                        self.client_configs.default_download_folder.clone(),
+                        None,
+                        HashMap::new(),
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            self.app_state.system_error = Some(error);
+                            self.app_state.ui.needs_redraw = true;
+                            return;
+                        }
+                    };
+                    if let Err(error) = self.dispatch_cluster_control_request(request).await {
+                        self.app_state.system_error = Some(error);
+                        self.app_state.ui.needs_redraw = true;
+                    }
                     return;
                 }
 
@@ -2220,7 +2561,7 @@ impl App {
                 }
             }
             AppCommand::AddTorrentFromPathFile(path) => {
-                if self.runtime_mode.is_shared_follower() && self.is_host_watch_path(&path) {
+                if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
                     self.app_state.pending_ingest_by_path.remove(&path);
                     self.relay_local_watch_file(&path, "path.forwarded");
                     self.save_state_to_disk();
@@ -2292,7 +2633,7 @@ impl App {
                 }
             }
             AppCommand::AddMagnetFromFile(path) => {
-                if self.runtime_mode.is_shared_follower() && self.is_host_watch_path(&path) {
+                if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
                     self.app_state.pending_ingest_by_path.remove(&path);
                     self.relay_local_watch_file(&path, "magnet.forwarded");
                     self.save_state_to_disk();
@@ -2301,7 +2642,22 @@ impl App {
 
                 match fs::read_to_string(&path) {
                     Ok(magnet_link) => {
-                        if let Some(download_path) =
+                        if self.is_current_shared_follower()
+                            && !self.is_shared_inbox_path(&path)
+                            && self.client_configs.default_download_folder.is_some()
+                        {
+                            let request = self.prepare_add_magnet_request(
+                                magnet_link.trim().to_string(),
+                                self.client_configs.default_download_folder.clone(),
+                                None,
+                                HashMap::new(),
+                            );
+                            if let Err(error) = self.dispatch_cluster_control_request(request).await
+                            {
+                                self.app_state.system_error = Some(error);
+                                self.app_state.ui.needs_redraw = true;
+                            }
+                        } else if let Some(download_path) =
                             self.client_configs.default_download_folder.clone()
                         {
                             let ingest_result = self
@@ -2362,8 +2718,14 @@ impl App {
                     );
                 }
             }
+            AppCommand::SubmitControlRequest(request) => {
+                if let Err(error) = self.dispatch_cluster_control_request(request).await {
+                    self.app_state.system_error = Some(error);
+                    self.app_state.ui.needs_redraw = true;
+                }
+            }
             AppCommand::ControlRequest { path, request } => {
-                if self.runtime_mode.is_shared_follower() && self.is_host_watch_path(&path) {
+                if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
                     self.app_state.pending_control_by_path.remove(&path);
                     self.relay_local_watch_file(&path, "control.forwarded");
                     self.save_state_to_disk();
@@ -2612,7 +2974,15 @@ impl App {
                 apply_activity_history_persist_result(&mut self.app_state, request_id, success);
             }
             AppCommand::UpdateConfig(new_settings) => {
-                self.apply_settings_update(new_settings, true).await;
+                if self.is_current_shared_follower() {
+                    self.app_state.system_error = Some(
+                        "Shared configuration edits are leader-only while this node is a follower."
+                            .to_string(),
+                    );
+                    self.app_state.ui.needs_redraw = true;
+                } else {
+                    self.apply_settings_update(new_settings, true).await;
+                }
             }
             AppCommand::ReloadClusterState(_path) => match crate::config::load_settings() {
                 Ok(new_settings) => {
@@ -2647,15 +3017,26 @@ impl App {
                 if let Err(e) = result {
                     tracing_event!(Level::ERROR, "Deletion failed for torrent: {}", e);
                 }
+                let should_remove_from_settings = self.can_write_shared_state()
+                    && self
+                        .client_configs
+                        .torrents
+                        .iter()
+                        .find(|torrent| {
+                            info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                                == Some(info_hash.as_slice())
+                        })
+                        .is_some_and(|torrent| {
+                            torrent.torrent_control_state == TorrentControlState::Deleting
+                                && torrent.delete_files
+                        });
 
-                self.client_configs.torrents.retain(|t| {
-                    let t_info_hash = info_hash_from_torrent_source(&t.torrent_or_magnet);
-
-                    match t_info_hash {
-                        Some(t_hash) => t_hash != info_hash,
-                        None => true,
-                    }
-                });
+                if should_remove_from_settings {
+                    self.client_configs.torrents.retain(|torrent| {
+                        info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                            != Some(info_hash.as_slice())
+                    });
+                }
 
                 self.app_state.torrents.remove(&info_hash);
                 self.torrent_manager_command_txs.remove(&info_hash);
@@ -3304,7 +3685,7 @@ impl App {
     }
 
     fn save_state_to_disk(&mut self) {
-        if self.runtime_mode.is_shared_follower() {
+        if self.is_current_shared_follower() {
             return;
         }
 
@@ -3622,7 +4003,7 @@ impl App {
             };
         }
 
-        if !self.runtime_mode.is_shared_follower() {
+        if self.can_write_shared_state() {
             if let Some(shared_path) = &shared_torrent_path {
                 if let Err(e) = persist_torrent_copy(shared_path, "shared config directory") {
                     let message = format!(
@@ -3658,6 +4039,7 @@ impl App {
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
                 torrent_control_state: torrent_control_state.clone(),
+                delete_files: false,
                 info_hash: info_hash.clone(),
                 torrent_or_magnet: shared_torrent_path
                     .clone()
@@ -3805,6 +4187,7 @@ impl App {
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
                 torrent_control_state: torrent_control_state.clone(),
+                delete_files: false,
                 info_hash: info_hash.clone(),
                 torrent_or_magnet: magnet_link.clone(),
                 torrent_name: resolved_name.clone(),
@@ -3945,7 +4328,7 @@ impl App {
         torrent: &crate::torrent_file::Torrent,
         file_priorities: &HashMap<usize, FilePriority>,
     ) {
-        if self.runtime_mode.is_shared_follower() {
+        if self.is_current_shared_follower() {
             return;
         }
 
@@ -4323,19 +4706,34 @@ impl App {
                 self.apply_settings_update(next_settings, true).await;
                 Ok(format!("Resumed torrent '{}'", info_hash_hex))
             }
-            ControlRequest::Delete { info_hash_hex } => {
+            ControlRequest::Delete {
+                info_hash_hex,
+                delete_files,
+            } => {
                 let info_hash = decode_info_hash(info_hash_hex)?;
-                let initial_len = self.client_configs.torrents.len();
                 let mut next_settings = self.client_configs.clone();
-                next_settings.torrents.retain(|torrent| {
-                    info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
-                        != Some(info_hash.as_slice())
-                });
-                if next_settings.torrents.len() == initial_len {
+                let Some(index) =
+                    find_torrent_settings_index_by_info_hash(&next_settings, &info_hash)
+                else {
                     return Err(format!("Torrent '{}' was not found", info_hash_hex));
+                };
+
+                if *delete_files {
+                    next_settings.torrents[index].torrent_control_state =
+                        TorrentControlState::Deleting;
+                    next_settings.torrents[index].delete_files = true;
+                } else {
+                    next_settings.torrents.retain(|torrent| {
+                        info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                            != Some(info_hash.as_slice())
+                    });
                 }
                 self.apply_settings_update(next_settings, true).await;
-                Ok(format!("Removed torrent '{}'", info_hash_hex))
+                Ok(if *delete_files {
+                    format!("Queued purge for torrent '{}'", info_hash_hex)
+                } else {
+                    format!("Removed torrent '{}'", info_hash_hex)
+                })
             }
             ControlRequest::SetFilePriority {
                 info_hash_hex,
@@ -4373,6 +4771,56 @@ impl App {
                     "Set file priority for torrent '{}' at index {} to {:?}",
                     info_hash_hex, file_index, priority
                 ))
+            }
+            ControlRequest::AddTorrentFile {
+                source_path,
+                download_path,
+                container_name,
+                file_priorities,
+            } => {
+                let ingest_result = self
+                    .add_torrent_from_file(
+                        source_path.clone(),
+                        download_path.clone(),
+                        false,
+                        TorrentControlState::Running,
+                        file_priorities_to_map(file_priorities),
+                        container_name.clone(),
+                    )
+                    .await;
+                Self::cleanup_staged_add_file(source_path);
+                if matches!(
+                    ingest_result,
+                    CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
+                ) {
+                    self.save_state_to_disk();
+                }
+                Self::map_add_result_to_control_response(ingest_result)
+            }
+            ControlRequest::AddMagnet {
+                magnet_link,
+                download_path,
+                container_name,
+                file_priorities,
+            } => {
+                let ingest_result = self
+                    .add_magnet_torrent(
+                        "Fetching name...".to_string(),
+                        magnet_link.clone(),
+                        download_path.clone(),
+                        false,
+                        TorrentControlState::Running,
+                        file_priorities_to_map(file_priorities),
+                        container_name.clone(),
+                    )
+                    .await;
+                if matches!(
+                    ingest_result,
+                    CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
+                ) {
+                    self.save_state_to_disk();
+                }
+                Self::map_add_result_to_control_response(ingest_result)
             }
         }
     }
@@ -5120,6 +5568,7 @@ fn build_persist_payload(
                 download_path: torrent_state.download_path.clone(),
                 container_name: torrent_state.container_name.clone(),
                 torrent_control_state: torrent_state.torrent_control_state.clone(),
+                delete_files: torrent_state.delete_files,
                 file_priorities: torrent_state.file_priorities.clone(),
             }
         })

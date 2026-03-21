@@ -47,6 +47,8 @@ pub enum Commands {
         info_hashes: Vec<String>,
     },
     Delete {
+        #[arg(long)]
+        with_files: bool,
         #[arg(value_name = "INFO_HASH_HEX")]
         info_hashes: Vec<String>,
     },
@@ -167,10 +169,16 @@ pub fn command_to_control_requests(
                 .map(|info_hash_hex| ControlRequest::Resume { info_hash_hex })
                 .collect(),
         )),
-        Commands::Delete { info_hashes } => Ok(Some(
+        Commands::Delete {
+            with_files,
+            info_hashes,
+        } => Ok(Some(
             require_info_hash_hexes(info_hashes, "delete")?
                 .into_iter()
-                .map(|info_hash_hex| ControlRequest::Delete { info_hash_hex })
+                .map(|info_hash_hex| ControlRequest::Delete {
+                    info_hash_hex,
+                    delete_files: *with_files,
+                })
                 .collect(),
         )),
         Commands::Priority {
@@ -475,6 +483,7 @@ mod tests {
     #[test]
     fn delete_without_info_hash_returns_helpful_error() {
         let error = command_to_control_request(&Commands::Delete {
+            with_files: false,
             info_hashes: Vec::new(),
         })
         .expect_err("missing hash should fail");
@@ -486,6 +495,7 @@ mod tests {
     #[test]
     fn delete_command_supports_multiple_hashes() {
         let requests = command_to_control_requests(&Commands::Delete {
+            with_files: false,
             info_hashes: vec![
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),

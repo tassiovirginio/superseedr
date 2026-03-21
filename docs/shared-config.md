@@ -34,6 +34,9 @@ Optional explicit host id for selecting `hosts/<host-id>.toml`.
 
 If unset, Superseedr falls back to a sanitized hostname.
 
+`SUPERSEEDR_HOST_ID` is still accepted as a legacy fallback, but
+`SUPERSEEDR_SHARED_HOST_ID` is the canonical name.
+
 Example:
 
 ```bash
@@ -105,6 +108,7 @@ Shared mode still uses the existing file-lock mechanism.
 
 - Leader: holds `/shared-root/superseedr.lock`
 - Non-leader node: does not hold the lock
+- If a non-leader later acquires the lock at runtime, it promotes itself to leader and starts leader-only services without requiring a restart.
 
 The leader is responsible for:
 
@@ -118,6 +122,8 @@ All nodes are still active clients.
 ## Cluster Convergence
 
 The leader writes `cluster.revision` after shared desired state changes.
+
+Host-only changes do not bump `cluster.revision`.
 
 Non-leader nodes:
 
@@ -135,6 +141,8 @@ Convergence includes:
 Delete is cluster-wide:
 
 - once the leader removes a torrent from `catalog.toml`, every node removes it locally
+- remove-only delete removes the torrent from all nodes but keeps payload data
+- purge delete marks the torrent for deletion in shared desired state, then every node deletes payload data before the leader removes the catalog entry
 
 ## Watch Folder Model
 
@@ -197,6 +205,7 @@ CLI and nodes may queue:
 - resume requests
 - delete requests
 - priority requests
+- shared config edits remain leader-only in the UI for now
 
 Those requests are dropped into `/shared-root/inbox/`.
 

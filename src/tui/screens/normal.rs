@@ -15,6 +15,7 @@ use crate::app::{
 };
 use crate::config::Settings;
 use crate::config::SortDirection;
+use crate::integrations::control::ControlRequest;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
@@ -4376,18 +4377,18 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         PastedContent::Magnet(magnet_link) => {
             let download_path = app.client_configs.default_download_folder.clone();
 
-            app.add_magnet_torrent(
-                "Fetching name...".to_string(),
-                magnet_link.to_string(),
-                download_path.clone(),
-                false,
-                TorrentControlState::Running,
-                HashMap::new(),
-                None,
-            )
-            .await;
-
-            if download_path.is_none() {
+            if let Some(download_path) = download_path {
+                let request = app.prepare_add_magnet_request(
+                    magnet_link.to_string(),
+                    Some(download_path),
+                    None,
+                    HashMap::new(),
+                );
+                let _ = app
+                    .app_command_tx
+                    .send(AppCommand::SubmitControlRequest(request))
+                    .await;
+            } else {
                 app.app_state.pending_torrent_link = magnet_link.to_string();
                 let initial_path = app.get_initial_destination_path();
                 let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
@@ -4409,15 +4410,22 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         }
         PastedContent::TorrentFile(path) => {
             if let Some(download_path) = app.client_configs.default_download_folder.clone() {
-                app.add_torrent_from_file(
+                match app.prepare_add_torrent_file_request(
                     path.to_path_buf(),
                     Some(download_path),
-                    false,
-                    TorrentControlState::Running,
-                    HashMap::new(),
                     None,
-                )
-                .await;
+                    HashMap::new(),
+                ) {
+                    Ok(request) => {
+                        let _ = app
+                            .app_command_tx
+                            .send(AppCommand::SubmitControlRequest(request))
+                            .await;
+                    }
+                    Err(error) => {
+                        app.app_state.system_error = Some(error);
+                    }
+                }
             } else {
                 let _ = app
                     .app_command_tx
@@ -4515,6 +4523,13 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             }
         }
         UiEffect::ApplyThemePrev => {
+            if app.is_current_shared_follower() {
+                app.app_state.system_error = Some(
+                    "Shared theme changes are leader-only while this node is a follower."
+                        .to_string(),
+                );
+                return;
+            }
             let themes = crate::theme::ThemeName::sorted_for_ui();
             let current_idx = themes
                 .iter()
@@ -4532,6 +4547,13 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
         }
         UiEffect::ApplyThemeNext => {
+            if app.is_current_shared_follower() {
+                app.app_state.system_error = Some(
+                    "Shared theme changes are leader-only while this node is a follower."
+                        .to_string(),
+                );
+                return;
+            }
             let themes = crate::theme::ThemeName::sorted_for_ui();
             let current_idx = themes
                 .iter()
@@ -4545,28 +4567,18 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
         }
         UiEffect::SendPause(info_hash) => {
-            if let Some(torrent_manager_command_tx) =
-                app.torrent_manager_command_txs.get(&info_hash)
-            {
-                let torrent_manager_command_tx_clone = torrent_manager_command_tx.clone();
-                tokio::spawn(async move {
-                    let _ = torrent_manager_command_tx_clone
-                        .send(crate::torrent_manager::ManagerCommand::Pause)
-                        .await;
-                });
-            }
+            let _ = app
+                .app_command_tx
+                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
         }
         UiEffect::SendResume(info_hash) => {
-            if let Some(torrent_manager_command_tx) =
-                app.torrent_manager_command_txs.get(&info_hash)
-            {
-                let torrent_manager_command_tx_clone = torrent_manager_command_tx.clone();
-                tokio::spawn(async move {
-                    let _ = torrent_manager_command_tx_clone
-                        .send(crate::torrent_manager::ManagerCommand::Resume)
-                        .await;
-                });
-            }
+            let _ = app
+                .app_command_tx
+                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
         }
         UiEffect::OpenHelpScreen => {
             app.app_state.mode = AppMode::Help;

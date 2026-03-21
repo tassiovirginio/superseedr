@@ -123,11 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_mode = is_shared_config_mode();
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
-    let mut _lock_file_handle = try_acquire_app_lock()?;
-    let leader_is_running = _lock_file_handle.is_none();
+    let lock_file_handle = try_acquire_app_lock()?;
+    let instance_already_running = lock_file_handle.is_none();
 
     if has_cli_request {
-        if let Err(error) = process_cli_request(&cli, &loaded_settings, shared_mode, leader_is_running) {
+        if let Err(error) =
+            process_cli_request(&cli, &loaded_settings, shared_mode, instance_already_running)
+        {
             eprintln!("[Error] Application failed: {}", error);
             std::process::exit(1);
         }
@@ -136,12 +138,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let runtime_mode = if shared_mode {
-        if _lock_file_handle.is_some() {
+        if lock_file_handle.is_some() {
             AppRuntimeMode::SharedLeader
         } else {
             AppRuntimeMode::SharedFollower
         }
-    } else if _lock_file_handle.is_some() {
+    } else if lock_file_handle.is_some() {
         AppRuntimeMode::Normal
     } else {
         println!("superseedr is already running.");
@@ -149,51 +151,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut client_configs = loaded_settings;
+    let can_persist_startup_settings = !runtime_mode.is_shared_follower();
 
-    if !runtime_mode.is_shared_follower() {
-        #[cfg(all(feature = "dht", feature = "pex"))]
-        {
-            if client_configs.private_client {
-                eprintln!("\n!!!ERROR: POTENTIAL LEAK!!!");
-                eprintln!("---------------------------------");
-                eprintln!("You are running the normal build of superseedr (with DHT/PEX enabled),");
-                eprintln!("but your configuration file indicates you last used a private build.");
-                eprintln!("\nThis safety check prevents accidental use of forbidden features on private trackers.");
+    #[cfg(all(feature = "dht", feature = "pex"))]
+    {
+        if client_configs.private_client {
+            eprintln!("\n!!!ERROR: POTENTIAL LEAK!!!");
+            eprintln!("---------------------------------");
+            eprintln!("You are running the normal build of superseedr (with DHT/PEX enabled),");
+            eprintln!("but your configuration file indicates you last used a private build.");
+            eprintln!("\nThis safety check prevents accidental use of forbidden features on private trackers.");
 
-                // Get the config file path to show the user
-                let config_path_str = config::shared_settings_path()
-                    .or_else(|| {
-                        config::get_app_paths()
-                            .map(|(config_dir, _)| config_dir.join("settings.toml"))
-                    })
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Unable to determine config path.".to_string());
+            let config_path_str = config::shared_settings_path()
+                .or_else(|| {
+                    config::get_app_paths().map(|(config_dir, _)| config_dir.join("settings.toml"))
+                })
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unable to determine config path.".to_string());
 
-                eprintln!("\nChoose an option:");
-                eprintln!("  1. If you want to use the PRIVATE build (for private trackers):");
-                eprintln!("     Install and run it:");
-                eprintln!("       cargo install superseedr --no-default-features");
-                eprintln!("       superseedr");
-                eprintln!(
-                    "\n  2. If you want to switch back to the NORMAL build (for public trackers):"
-                );
-                eprintln!("     Manually edit your configuration file:");
-                eprintln!("       {}", config_path_str); // Show the path
-                eprintln!(
-                    "     Change the line `private_client = true` to `private_client = false`"
-                );
-                eprintln!("     Then, run this normal build again.");
+            eprintln!("\nChoose an option:");
+            eprintln!("  1. If you want to use the PRIVATE build (for private trackers):");
+            eprintln!("     Install and run it:");
+            eprintln!("       cargo install superseedr --no-default-features");
+            eprintln!("       superseedr");
+            eprintln!("\n  2. If you want to switch back to the NORMAL build (for public trackers):");
+            eprintln!("     Manually edit your configuration file:");
+            eprintln!("       {}", config_path_str);
+            eprintln!("     Change the line `private_client = true` to `private_client = false`");
+            eprintln!("     Then, run this normal build again.");
 
-                eprintln!("\nExiting to prevent potential tracker issues.");
-                std::process::exit(1);
-            }
+            eprintln!("\nExiting to prevent potential tracker issues.");
+            std::process::exit(1);
         }
+    }
 
-        #[cfg(not(all(feature = "dht", feature = "pex")))]
-        {
-            if !client_configs.private_client {
-                tracing::info!("Setting private mode flag in configuration.");
-                client_configs.private_client = true;
+    #[cfg(not(all(feature = "dht", feature = "pex")))]
+    {
+        if !client_configs.private_client {
+            tracing::info!("Setting private mode flag in configuration.");
+            client_configs.private_client = true;
+            if can_persist_startup_settings {
                 if let Err(e) = config::save_settings(&client_configs) {
                     tracing::error!(
                         "Failed to save settings after setting private mode flag: {}",
@@ -202,47 +199,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
 
-        let port_file_path = PathBuf::from("/port-data/forwarded_port");
-        tracing::info!("Checking for dynamic port file at {:?}", port_file_path);
-        if let Ok(port_str) = fs::read_to_string(&port_file_path) {
-            match port_str.trim().parse::<u16>() {
-                Ok(dynamic_port) => {
-                    if dynamic_port > 0 {
-                        tracing::info!(
-                            "Successfully read dynamic port {}. Overriding settings.",
-                            dynamic_port
-                        );
-                        client_configs.client_port = dynamic_port;
-                    } else {
-                        tracing::warn!("Dynamic port file was empty or zero. Using config port.");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to parse port file content '{}': {}. Using config port.",
-                        port_str,
-                        e
+    let port_file_path = PathBuf::from("/port-data/forwarded_port");
+    tracing::info!("Checking for dynamic port file at {:?}", port_file_path);
+    if let Ok(port_str) = fs::read_to_string(&port_file_path) {
+        match port_str.trim().parse::<u16>() {
+            Ok(dynamic_port) => {
+                if dynamic_port > 0 {
+                    tracing::info!(
+                        "Successfully read dynamic port {}. Overriding settings.",
+                        dynamic_port
                     );
+                    client_configs.client_port = dynamic_port;
+                } else {
+                    tracing::warn!("Dynamic port file was empty or zero. Using config port.");
                 }
             }
-        } else {
-            tracing::info!(
-                "Dynamic file not found. Using port {} from settings.",
-                client_configs.client_port
-            );
+            Err(e) => {
+                tracing::error!(
+                    "Failed to parse port file content '{}': {}. Using config port.",
+                    port_str,
+                    e
+                );
+            }
         }
+    } else {
+        tracing::info!(
+            "Dynamic file not found. Using port {} from settings.",
+            client_configs.client_port
+        );
+    }
 
-        if client_configs.client_id.is_empty() {
-            client_configs.client_id = generate_client_id_string();
+    if client_configs.client_id.is_empty() {
+        client_configs.client_id = generate_client_id_string();
+        if can_persist_startup_settings {
             if let Err(e) = config::save_settings(&client_configs) {
                 tracing::error!("Failed to save settings after generating client ID: {}", e);
             }
+        } else {
+            tracing::info!("Generated in-memory client ID for shared follower startup.");
         }
     }
 
     tracing::info!("Initializing application state...");
-    let mut app = App::new(client_configs, runtime_mode).await?;
+    let mut app = App::new_with_lock(client_configs, runtime_mode, lock_file_handle).await?;
     tracing::info!("Application state initialized. Starting TUI.");
 
     let original_hook = std::panic::take_hook();
@@ -719,6 +720,7 @@ mod tests {
         let mut settings = sample_settings();
         let request = ControlRequest::Delete {
             info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+            delete_files: false,
         };
 
         let result = apply_offline_control_request(&mut settings, &request);

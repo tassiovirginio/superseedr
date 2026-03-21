@@ -18,6 +18,22 @@ pub enum ControlPriorityTarget {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct ControlFilePriorityOverride {
+    pub file_index: usize,
+    pub priority: FilePriority,
+}
+
+impl Default for ControlFilePriorityOverride {
+    fn default() -> Self {
+        Self {
+            file_index: 0,
+            priority: FilePriority::Normal,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ControlRequest {
     StatusNow,
@@ -33,11 +49,27 @@ pub enum ControlRequest {
     },
     Delete {
         info_hash_hex: String,
+        #[serde(default)]
+        delete_files: bool,
     },
     SetFilePriority {
         info_hash_hex: String,
         target: ControlPriorityTarget,
         priority: FilePriority,
+    },
+    AddTorrentFile {
+        source_path: PathBuf,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        #[serde(default)]
+        file_priorities: Vec<ControlFilePriorityOverride>,
+    },
+    AddMagnet {
+        magnet_link: String,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        #[serde(default)]
+        file_priorities: Vec<ControlFilePriorityOverride>,
     },
 }
 
@@ -51,6 +83,8 @@ impl ControlRequest {
             Self::Resume { .. } => "resume",
             Self::Delete { .. } => "delete",
             Self::SetFilePriority { .. } => "set_file_priority",
+            Self::AddTorrentFile { .. } => "add_torrent_file",
+            Self::AddMagnet { .. } => "add_magnet",
         }
     }
 
@@ -58,9 +92,13 @@ impl ControlRequest {
         match self {
             Self::Pause { info_hash_hex }
             | Self::Resume { info_hash_hex }
-            | Self::Delete { info_hash_hex }
+            | Self::Delete { info_hash_hex, .. }
             | Self::SetFilePriority { info_hash_hex, .. } => Some(info_hash_hex.as_str()),
-            Self::StatusNow | Self::StatusFollowStart { .. } | Self::StatusFollowStop => None,
+            Self::StatusNow
+            | Self::StatusFollowStart { .. }
+            | Self::StatusFollowStop
+            | Self::AddTorrentFile { .. }
+            | Self::AddMagnet { .. } => None,
         }
     }
 
