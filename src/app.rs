@@ -3327,9 +3327,6 @@ impl App {
                         "Failed to reload shared cluster state: {}",
                         error
                     );
-                    self.app_state.system_error =
-                        Some(format!("Failed to reload shared cluster state: {}", error));
-                    self.app_state.ui.needs_redraw = true;
                 }
             },
             AppCommand::UpdateVersionAvailable(latest_version) => {
