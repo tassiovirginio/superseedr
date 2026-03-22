@@ -7,10 +7,14 @@ use crate::integrations::control::{
     ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
 };
 use crate::persistence::event_journal::{ControlOrigin, EventDetails};
+use crate::storage::{FileInfo, MultiFileInfo};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
+use crate::torrent_manager::state::calculate_deletion_lists;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub fn find_torrent_settings_index_by_info_hash(
@@ -171,6 +175,371 @@ pub fn file_priorities_to_map(
         .filter(|value| !matches!(value.priority, FilePriority::Normal))
         .map(|value| (value.file_index, value.priority))
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TorrentFileListEntry {
+    pub file_index: usize,
+    pub relative_path: String,
+    pub full_path: Option<PathBuf>,
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflinePurgePlan {
+    pub info_hash_hex: String,
+    pub files: Vec<PathBuf>,
+    pub directories: Vec<PathBuf>,
+}
+
+fn torrent_settings_by_info_hash_hex<'a>(
+    settings: &'a Settings,
+    info_hash_hex: &str,
+) -> Result<(usize, &'a TorrentSettings, Vec<u8>), String> {
+    let info_hash = decode_info_hash(info_hash_hex)?;
+    let index = find_torrent_settings_index_by_info_hash(settings, &info_hash)
+        .ok_or_else(|| format!("Torrent '{}' was not found", info_hash_hex))?;
+    let torrent = settings
+        .torrents
+        .get(index)
+        .ok_or_else(|| format!("Torrent '{}' was not found", info_hash_hex))?;
+    Ok((index, torrent, info_hash))
+}
+
+fn torrent_name_for_manifest(
+    torrent_settings: &TorrentSettings,
+    metadata_entry: Option<&TorrentMetadataEntry>,
+) -> String {
+    if let Some(entry) = metadata_entry {
+        if !entry.torrent_name.is_empty() {
+            return entry.torrent_name.clone();
+        }
+    }
+    if !torrent_settings.name.is_empty() {
+        return torrent_settings.name.clone();
+    }
+    "Unnamed Torrent".to_string()
+}
+
+fn torrent_metadata_entry_for_settings(
+    torrent_settings: &TorrentSettings,
+) -> Result<Option<TorrentMetadataEntry>, String> {
+    let Some(info_hash) = info_hash_from_torrent_source(&torrent_settings.torrent_or_magnet) else {
+        return Ok(None);
+    };
+    let info_hash_hex = hex::encode(info_hash);
+    let metadata = match load_torrent_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    Ok(metadata
+        .torrents
+        .into_iter()
+        .find(|entry| entry.info_hash_hex == info_hash_hex))
+}
+
+fn manifest_entries_for_torrent_settings(
+    torrent_settings: &TorrentSettings,
+) -> Result<(String, bool, Vec<TorrentFileListEntry>), String> {
+    if let Some(entry) = torrent_metadata_entry_for_settings(torrent_settings)? {
+        if !entry.files.is_empty() {
+            let torrent_name = torrent_name_for_manifest(torrent_settings, Some(&entry));
+            let files = entry
+                .files
+                .into_iter()
+                .enumerate()
+                .map(|(file_index, file)| TorrentFileListEntry {
+                    file_index,
+                    relative_path: file.relative_path,
+                    full_path: None,
+                    length: file.length,
+                })
+                .collect();
+            return Ok((torrent_name, entry.is_multi_file, files));
+        }
+    }
+
+    if torrent_settings.torrent_or_magnet.starts_with("magnet:") {
+        return Err(
+            "This torrent does not have persisted file metadata yet. Start the torrent once or use INFO_HASH_HEX without a file path."
+                .to_string(),
+        );
+    }
+
+    let bytes = fs::read(&torrent_settings.torrent_or_magnet).map_err(|error| {
+        format!(
+            "Failed to read torrent metadata from '{}': {}",
+            torrent_settings.torrent_or_magnet, error
+        )
+    })?;
+    let torrent = from_bytes(&bytes).map_err(|error| {
+        format!(
+            "Failed to parse torrent metadata from '{}': {:?}",
+            torrent_settings.torrent_or_magnet, error
+        )
+    })?;
+    let files = torrent
+        .file_list()
+        .into_iter()
+        .enumerate()
+        .map(|(file_index, (parts, length))| TorrentFileListEntry {
+            file_index,
+            relative_path: parts.join("/"),
+            full_path: None,
+            length,
+        })
+        .collect();
+    Ok((
+        torrent.info.name.clone(),
+        !torrent.info.files.is_empty(),
+        files,
+    ))
+}
+
+fn normalize_match_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_torrent_roots(
+    settings: &Settings,
+    torrent_settings: &TorrentSettings,
+    info_hash_hex: &str,
+    is_multi_file: bool,
+    torrent_name: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let download_root = torrent_settings
+        .download_path
+        .clone()
+        .or_else(|| settings.default_download_folder.clone())
+        .ok_or_else(|| {
+            format!(
+                "Torrent '{}' does not have a resolved download path for purge",
+                info_hash_hex
+            )
+        })?;
+
+    let effective_root = if is_multi_file {
+        match &torrent_settings.container_name {
+            Some(name) if !name.is_empty() => download_root.join(name),
+            Some(_) => download_root.clone(),
+            None => download_root.join(format!("{} [{}]", torrent_name, info_hash_hex)),
+        }
+    } else {
+        download_root.clone()
+    };
+
+    Ok((download_root, effective_root))
+}
+
+fn full_file_paths_for_torrent(
+    settings: &Settings,
+    info_hash_hex: &str,
+    torrent_settings: &TorrentSettings,
+) -> Result<Vec<PathBuf>, String> {
+    let (torrent_name, is_multi_file, files) =
+        manifest_entries_for_torrent_settings(torrent_settings)?;
+    let (_, effective_root) = resolve_torrent_roots(
+        settings,
+        torrent_settings,
+        info_hash_hex,
+        is_multi_file,
+        &torrent_name,
+    )?;
+
+    Ok(files
+        .into_iter()
+        .map(|file| {
+            let mut path = effective_root.clone();
+            for segment in file
+                .relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
+                path.push(segment);
+            }
+            path
+        })
+        .collect())
+}
+
+pub fn list_torrent_files(
+    settings: &Settings,
+    info_hash_hex: &str,
+) -> Result<Vec<TorrentFileListEntry>, String> {
+    let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
+    let (_, _, mut files) = manifest_entries_for_torrent_settings(torrent_settings)?;
+    if let Ok(paths) = full_file_paths_for_torrent(settings, info_hash_hex, torrent_settings) {
+        for (entry, path) in files.iter_mut().zip(paths) {
+            entry.full_path = Some(path);
+        }
+    }
+    Ok(files)
+}
+
+pub fn resolve_target_info_hash(
+    settings: &Settings,
+    target: &str,
+    command_name: &str,
+) -> Result<String, String> {
+    if decode_info_hash(target).is_ok() {
+        let (_, _, _) = torrent_settings_by_info_hash_hex(settings, target)?;
+        return Ok(target.to_string());
+    }
+
+    let normalized_target = normalize_match_path(Path::new(target));
+    let mut matches = Vec::new();
+
+    for torrent in &settings.torrents {
+        let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
+            continue;
+        };
+        let info_hash_hex = hex::encode(info_hash);
+        let Ok(paths) = full_file_paths_for_torrent(settings, &info_hash_hex, torrent) else {
+            continue;
+        };
+        if paths
+            .into_iter()
+            .map(|path| normalize_match_path(&path))
+            .any(|path| path == normalized_target)
+        {
+            matches.push(info_hash_hex);
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+
+    match matches.len() {
+        0 => Err(format!(
+            "No torrent matched file path '{}'. Use `superseedr files <info-hash>` to inspect a torrent or rerun `superseedr {} <info-hash>`.",
+            target, command_name
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "File path '{}' matched multiple torrents. Re-run with INFO_HASH_HEX using `superseedr {} <info-hash>`.",
+            target, command_name
+        )),
+    }
+}
+
+pub fn resolve_purge_target_info_hash(settings: &Settings, target: &str) -> Result<String, String> {
+    resolve_target_info_hash(settings, target, "purge")
+}
+
+pub fn build_offline_purge_plan(
+    settings: &Settings,
+    info_hash_hex: &str,
+) -> Result<OfflinePurgePlan, String> {
+    let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
+    let (torrent_name, is_multi_file, files) =
+        manifest_entries_for_torrent_settings(torrent_settings)?;
+    if files.is_empty() {
+        return Err(format!(
+            "Torrent '{}' does not have persisted file paths available for offline purge",
+            info_hash_hex
+        ));
+    }
+
+    let (download_root, effective_root) = resolve_torrent_roots(
+        settings,
+        torrent_settings,
+        info_hash_hex,
+        is_multi_file,
+        &torrent_name,
+    )?;
+
+    let mut current_offset = 0;
+    let multi_file_info = MultiFileInfo {
+        files: files
+            .into_iter()
+            .map(|file| {
+                let mut path = effective_root.clone();
+                for segment in file
+                    .relative_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                {
+                    path.push(segment);
+                }
+
+                let file_info = FileInfo {
+                    path,
+                    length: file.length,
+                    global_start_offset: current_offset,
+                    is_padding: false,
+                    is_skipped: matches!(
+                        torrent_settings.file_priorities.get(&file.file_index),
+                        Some(FilePriority::Skip)
+                    ),
+                };
+                current_offset += file.length;
+                file_info
+            })
+            .collect(),
+        total_size: current_offset,
+    };
+
+    let (files, directories) = calculate_deletion_lists(
+        &multi_file_info,
+        &download_root,
+        torrent_settings.container_name.as_deref(),
+    );
+
+    Ok(OfflinePurgePlan {
+        info_hash_hex: info_hash_hex.to_string(),
+        files,
+        directories,
+    })
+}
+
+pub fn apply_offline_purge(settings: &mut Settings, info_hash_hex: &str) -> Result<String, String> {
+    let plan = build_offline_purge_plan(settings, info_hash_hex)?;
+
+    for file_path in &plan.files {
+        if let Err(error) = fs::remove_file(file_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("Failed to delete file {:?}: {}", file_path, error));
+            }
+        }
+    }
+
+    for dir_path in &plan.directories {
+        if let Err(error) = fs::remove_dir(dir_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::info!("Skipped dir deletion {:?}: {}", dir_path, error);
+            }
+        }
+    }
+
+    let info_hash = decode_info_hash(info_hash_hex)?;
+    settings.torrents.retain(|torrent| {
+        info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+            != Some(info_hash.as_slice())
+    });
+
+    Ok(format!("Purged torrent '{}'", info_hash_hex))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,11 +790,47 @@ pub fn apply_offline_control_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_offline_control_request, find_torrent_settings_index_by_info_hash,
-        plan_control_request, ControlExecutionPlan,
+        apply_offline_control_request, apply_offline_purge,
+        find_torrent_settings_index_by_info_hash, list_torrent_files, plan_control_request,
+        resolve_purge_target_info_hash, resolve_target_info_hash, ControlExecutionPlan,
     };
     use crate::config::{Settings, TorrentSettings};
     use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
+    use std::fs;
+
+    fn write_sample_torrent_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "sample-pack".to_string(),
+                piece_length: 16_384,
+                pieces: vec![0; 20],
+                files: vec![
+                    crate::torrent_file::InfoFile {
+                        length: 10,
+                        path: vec!["folder".to_string(), "alpha.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 20,
+                        path: vec!["folder".to_string(), "beta.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            announce: Some("http://tracker.test".to_string()),
+            ..Default::default()
+        };
+        let bytes = serde_bencode::to_bytes(&torrent).expect("serialize torrent");
+        let path = dir
+            .path()
+            .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.torrent");
+        fs::write(&path, bytes).expect("write torrent fixture");
+        (dir, path.to_string_lossy().to_string())
+    }
 
     #[test]
     fn offline_hybrid_magnet_lookup_prefers_btih_identity() {
@@ -497,6 +902,113 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn files_list_uses_torrent_source_when_metadata_is_missing() {
+        let (_dir, torrent_path) = write_sample_torrent_file();
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let files = list_torrent_files(&settings, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("list files");
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].relative_path, "folder/alpha.bin");
+        assert_eq!(files[1].relative_path, "folder/beta.bin");
+    }
+
+    #[test]
+    fn purge_target_can_resolve_from_unique_file_path() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
+        let download_root = dir.path().join("downloads");
+        let target = download_root
+            .join("payload")
+            .join("folder")
+            .join("beta.bin");
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                download_path: Some(download_root),
+                container_name: Some("payload".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let resolved =
+            resolve_purge_target_info_hash(&settings, target.to_str().expect("target path"))
+                .expect("resolve path");
+
+        assert_eq!(resolved, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn command_specific_target_resolution_uses_callers_command_name() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
+        let download_root = dir.path().join("downloads");
+        let target = download_root.join("payload").join("missing.bin");
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                download_path: Some(download_root),
+                container_name: Some("payload".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = resolve_target_info_hash(&settings, target.to_str().expect("target"), "info")
+            .expect_err("missing file should fail");
+
+        assert!(error.contains("superseedr info <info-hash>"));
+        assert!(!error.contains("superseedr purge <info-hash>"));
+    }
+
+    #[test]
+    fn offline_purge_deletes_files_and_removes_torrent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
+        let download_root = dir.path().join("downloads");
+        let file_a = download_root
+            .join("payload")
+            .join("folder")
+            .join("alpha.bin");
+        let file_b = download_root
+            .join("payload")
+            .join("folder")
+            .join("beta.bin");
+        fs::create_dir_all(file_a.parent().expect("parent")).expect("create dirs");
+        fs::write(&file_a, b"alpha").expect("write alpha");
+        fs::write(&file_b, b"beta").expect("write beta");
+
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Pack".to_string(),
+                download_path: Some(download_root),
+                container_name: Some("payload".to_string()),
+                ..Default::default()
+            }],
+            ..Settings::default()
+        };
+
+        let result = apply_offline_purge(&mut settings, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        assert!(result.is_ok());
+        assert!(settings.torrents.is_empty());
+        assert!(!file_a.exists());
+        assert!(!file_b.exists());
     }
 
     #[test]

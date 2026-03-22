@@ -16,6 +16,9 @@ use std::time::{Duration, SystemTime};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
+    #[arg(long, global = true)]
+    pub json: bool,
+
     pub input: Option<String>,
 
     #[command(subcommand)]
@@ -30,6 +33,11 @@ pub enum Commands {
     },
     StopClient,
     Journal,
+    Torrents,
+    Info {
+        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        target: String,
+    },
     Status {
         #[arg(long)]
         follow: bool,
@@ -46,11 +54,17 @@ pub enum Commands {
         #[arg(value_name = "INFO_HASH_HEX")]
         info_hashes: Vec<String>,
     },
-    Delete {
-        #[arg(long)]
-        with_files: bool,
+    Remove {
         #[arg(value_name = "INFO_HASH_HEX")]
         info_hashes: Vec<String>,
+    },
+    Purge {
+        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        targets: Vec<String>,
+    },
+    Files {
+        #[arg(value_name = "INFO_HASH_HEX")]
+        info_hash: String,
     },
     Priority {
         #[arg(value_name = "INFO_HASH_HEX")]
@@ -169,15 +183,12 @@ pub fn command_to_control_requests(
                 .map(|info_hash_hex| ControlRequest::Resume { info_hash_hex })
                 .collect(),
         )),
-        Commands::Delete {
-            with_files,
-            info_hashes,
-        } => Ok(Some(
-            require_info_hash_hexes(info_hashes, "delete")?
+        Commands::Remove { info_hashes } => Ok(Some(
+            require_info_hash_hexes(info_hashes, "remove")?
                 .into_iter()
                 .map(|info_hash_hex| ControlRequest::Delete {
                     info_hash_hex,
-                    delete_files: *with_files,
+                    delete_files: false,
                 })
                 .collect(),
         )),
@@ -201,7 +212,13 @@ pub fn command_to_control_requests(
                 priority: (*priority).into(),
             }]))
         }
-        Commands::Add { .. } | Commands::StopClient | Commands::Journal => Ok(None),
+        Commands::Add { .. }
+        | Commands::StopClient
+        | Commands::Journal
+        | Commands::Torrents
+        | Commands::Info { .. }
+        | Commands::Purge { .. }
+        | Commands::Files { .. } => Ok(None),
     }
 }
 
@@ -267,6 +284,25 @@ fn require_info_hash_hexes(values: &[String], command_name: &str) -> Result<Vec<
     }
 
     Ok(hashes)
+}
+
+pub fn require_cli_targets(values: &[String], command_name: &str) -> Result<Vec<String>, String> {
+    let targets = values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if targets.is_empty() {
+        return Err(format!(
+            "Missing target for `superseedr {}`. Use either INFO_HASH_HEX or a file path.",
+            command_name
+        ));
+    }
+
+    Ok(targets)
 }
 
 pub fn expand_add_inputs(inputs: &[String]) -> Vec<String> {
@@ -481,9 +517,26 @@ mod tests {
     }
 
     #[test]
-    fn delete_without_info_hash_returns_helpful_error() {
-        let error = command_to_control_request(&Commands::Delete {
-            with_files: false,
+    fn torrents_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::Torrents),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn info_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::Info {
+                target: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn remove_without_info_hash_returns_helpful_error() {
+        let error = command_to_control_request(&Commands::Remove {
             info_hashes: Vec::new(),
         })
         .expect_err("missing hash should fail");
@@ -493,9 +546,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_command_supports_multiple_hashes() {
-        let requests = command_to_control_requests(&Commands::Delete {
-            with_files: false,
+    fn remove_command_supports_multiple_hashes() {
+        let requests = command_to_control_requests(&Commands::Remove {
             info_hashes: vec![
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
@@ -504,6 +556,12 @@ mod tests {
         .expect("map delete commands")
         .expect("requests");
         assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn purge_requires_at_least_one_target() {
+        let error = require_cli_targets(&[], "purge").expect_err("missing target should fail");
+        assert!(error.contains("Missing target"));
     }
 
     #[test]

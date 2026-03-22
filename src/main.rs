@@ -40,10 +40,11 @@ use crate::config::{
     is_shared_config_mode, load_settings, resolve_command_watch_path, shared_lock_path,
 };
 use crate::control_service::{
-    apply_offline_control_request, control_event_details, online_control_success_message,
+    apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
+    online_control_success_message, resolve_purge_target_info_hash, resolve_target_info_hash,
 };
 use crate::integrations::cli::{
-    command_to_control_requests, expand_add_inputs, status_control_request,
+    command_to_control_requests, expand_add_inputs, require_cli_targets, status_control_request,
     status_file_modified_at, status_should_stream, wait_for_status_json_after,
     write_control_command, write_input_command, write_stop_command, Cli, Commands,
 };
@@ -53,6 +54,8 @@ use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventJournalEntry, EventType,
 };
+use crate::torrent_identity::info_hash_from_torrent_source;
+use serde_json::{json, Value};
 
 use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::rolling::Rotation;
@@ -78,6 +81,12 @@ use crossterm::event::{
 use clap::Parser;
 
 const DEFAULT_LOG_FILTER: LevelFilter = LevelFilter::INFO;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Text,
+    Json,
+}
 
 // CLI types and process_input moved to integrations::cli
 
@@ -117,14 +126,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("STARTING SUPERSEEDR");
 
     let cli = Cli::parse();
-    let loaded_settings = load_settings()?;
+    let output_mode = if cli.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Text
+    };
+    let has_cli_request = cli.input.is_some() || cli.command.is_some();
+    let loaded_settings = match load_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            if has_cli_request && output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+                std::process::exit(1);
+            }
+            return Err(Box::new(error) as Box<dyn std::error::Error>);
+        }
+    };
 
     if let Err(e) = config::ensure_watch_directories(&loaded_settings) {
         tracing::error!("Failed to create watch directories: {}", e);
     }
 
     let shared_mode = is_shared_config_mode();
-    let has_cli_request = cli.input.is_some() || cli.command.is_some();
     let lock_file_handle = try_acquire_app_lock()?;
     let instance_already_running = lock_file_handle.is_none();
 
@@ -134,8 +157,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &loaded_settings,
             shared_mode,
             instance_already_running,
+            output_mode,
         ) {
-            eprintln!("[Error] Application failed: {}", error);
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
             std::process::exit(1);
         }
         tracing::info!("Command processed, exiting temporary instance.");
@@ -311,11 +339,22 @@ fn process_cli_request(
     settings: &Settings,
     shared_mode: bool,
     leader_is_running: bool,
+    output_mode: OutputMode,
 ) -> io::Result<()> {
     if let Some(direct_input) = &cli.input {
         tracing::info!("Processing direct input: {}", direct_input);
         let command_path = queue_direct_input_command(settings, direct_input)?;
-        println!("Queued add command at {}", command_path.display());
+        print_success(
+            output_mode,
+            "add",
+            &format!("Queued add command at {}", command_path.display()),
+            json!({
+                "queued": [{
+                    "input": direct_input,
+                    "command_path": command_path,
+                }]
+            }),
+        );
         return Ok(());
     }
 
@@ -325,16 +364,41 @@ fn process_cli_request(
 
     match command {
         Commands::Add { inputs } => {
+            let mut queued = Vec::new();
             for input in expand_add_inputs(inputs) {
                 tracing::info!("Processing Add subcommand input: {}", input);
                 let command_path = queue_direct_input_command(settings, &input)?;
-                println!("Queued add command at {}", command_path.display());
+                if output_mode == OutputMode::Text {
+                    println!("Queued add command at {}", command_path.display());
+                }
+                queued.push(json!({
+                    "input": input,
+                    "command_path": command_path,
+                }));
+            }
+            if output_mode == OutputMode::Json {
+                print_success(
+                    output_mode,
+                    "add",
+                    "Queued add command(s).",
+                    json!({ "queued": queued }),
+                );
             }
             Ok(())
         }
         Commands::Journal => {
-            println!("{}", event_journal_json()?);
+            let raw = event_journal_json()?;
+            print_json_passthrough(output_mode, "journal", &raw)?;
             Ok(())
+        }
+        Commands::Torrents => {
+            process_torrents_command(settings, output_mode).map_err(io::Error::other)
+        }
+        Commands::Info { target } => {
+            process_info_command(settings, target, output_mode).map_err(io::Error::other)
+        }
+        Commands::Files { info_hash } => {
+            process_files_command(settings, info_hash, output_mode).map_err(io::Error::other)
         }
         Commands::Status { .. } => {
             let request = status_control_request(command)
@@ -345,21 +409,63 @@ fn process_cli_request(
                     &request,
                     status_should_stream(command),
                     leader_is_running,
+                    output_mode,
                 )
             } else if leader_is_running {
-                process_online_status_request(settings, &request, status_should_stream(command))
+                process_online_status_request(
+                    settings,
+                    &request,
+                    status_should_stream(command),
+                    output_mode,
+                )
             } else {
-                process_offline_control_request(settings, &request)
+                process_offline_control_request(settings, &request, output_mode)
             }
         }
         Commands::StopClient => {
             if !leader_is_running {
-                println!("superseedr is not running.");
+                print_success(
+                    output_mode,
+                    "stop-client",
+                    "superseedr is not running.",
+                    json!({ "running": false }),
+                );
                 return Ok(());
             }
             tracing::info!("Processing StopClient command.");
             let _ = queue_runtime_stop_command(settings)?;
-            println!("Queued stop request.");
+            print_success(
+                output_mode,
+                "stop-client",
+                "Queued stop request.",
+                json!({ "queued": true }),
+            );
+            Ok(())
+        }
+        Commands::Purge { targets } => {
+            let resolved_targets = require_cli_targets(targets, "purge")
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            for target in resolved_targets {
+                let info_hash_hex =
+                    resolve_purge_target_info_hash(settings, &target).map_err(io::Error::other)?;
+                let request = ControlRequest::Delete {
+                    info_hash_hex,
+                    delete_files: true,
+                };
+
+                if shared_mode {
+                    process_shared_control_request(
+                        settings,
+                        &request,
+                        leader_is_running,
+                        output_mode,
+                    )?;
+                } else if leader_is_running {
+                    process_online_control_request(settings, &request, output_mode)?;
+                } else {
+                    process_offline_control_request(settings, &request, output_mode)?;
+                }
+            }
             Ok(())
         }
         _ => {
@@ -371,11 +477,16 @@ fn process_cli_request(
 
             for request in requests {
                 if shared_mode {
-                    process_shared_control_request(settings, &request, leader_is_running)?;
+                    process_shared_control_request(
+                        settings,
+                        &request,
+                        leader_is_running,
+                        output_mode,
+                    )?;
                 } else if leader_is_running {
-                    process_online_control_request(settings, &request)?;
+                    process_online_control_request(settings, &request, output_mode)?;
                 } else {
-                    process_offline_control_request(settings, &request)?;
+                    process_offline_control_request(settings, &request, output_mode)?;
                 }
             }
             Ok(())
@@ -414,14 +525,31 @@ fn print_queued_control_message(
     request: &ControlRequest,
     shared_mode: bool,
     leader_is_running: bool,
+    output_mode: OutputMode,
 ) {
-    if shared_mode && !leader_is_running {
-        println!(
+    let message = if shared_mode && !leader_is_running {
+        format!(
             "Queued {} request pending leader availability.",
             request.action_name()
+        )
+    } else {
+        online_control_success_message(request)
+    };
+
+    if shared_mode && !leader_is_running {
+        print_success(
+            output_mode,
+            request.action_name(),
+            &message,
+            json!({ "queued": true, "pending_leader": true, "request": request }),
         );
     } else {
-        println!("{}", online_control_success_message(request));
+        print_success(
+            output_mode,
+            request.action_name(),
+            &message,
+            json!({ "queued": true, "pending_leader": false, "request": request }),
+        );
     }
 }
 
@@ -430,40 +558,51 @@ fn process_shared_status_request(
     request: &ControlRequest,
     stream: bool,
     _leader_is_running: bool,
+    output_mode: OutputMode,
 ) -> io::Result<()> {
     match request {
         ControlRequest::StatusNow => match fs::read_to_string(status_file_path()?) {
-            Ok(json) => {
-                println!("{}", json);
-                Ok(())
-            }
+            Ok(raw) => print_json_passthrough(output_mode, "status", &raw),
             Err(_) => {
-                println!("{}", offline_output_json(settings)?);
-                Ok(())
+                let raw = offline_output_json(settings)?;
+                print_json_passthrough(output_mode, "status", &raw)
             }
         },
         ControlRequest::StatusFollowStart { interval_secs } if stream => {
             let mut last_modified_at = status_file_modified_at()?;
             loop {
-                let json = wait_for_status_json_after(
+                let raw = wait_for_status_json_after(
                     last_modified_at,
                     Duration::from_secs(interval_secs.saturating_mul(3).max(15)),
                 )?;
-                println!("{}", json);
+                print_json_passthrough(output_mode, "status", &raw)?;
                 io::stdout().flush()?;
                 last_modified_at = status_file_modified_at()?;
             }
         }
         ControlRequest::StatusFollowStart { .. } => {
             let status_path = status_file_path()?;
-            println!(
-                "Cluster mode status follows the current leader snapshot.\nStatus file: {}",
-                status_path.display()
+            print_success(
+                output_mode,
+                "status",
+                &format!(
+                    "Cluster mode status follows the current leader snapshot.\nStatus file: {}",
+                    status_path.display()
+                ),
+                json!({
+                    "message": "Cluster mode status follows the current leader snapshot.",
+                    "status_file": status_path,
+                }),
             );
             Ok(())
         }
         ControlRequest::StatusFollowStop => {
-            println!("Cluster mode status streaming follows the current leader snapshot.");
+            print_success(
+                output_mode,
+                "status",
+                "Cluster mode status streaming follows the current leader snapshot.",
+                json!({ "message": "Cluster mode status streaming follows the current leader snapshot." }),
+            );
             Ok(())
         }
         _ => unreachable!("status request handler received non-status control request"),
@@ -474,24 +613,24 @@ fn process_online_status_request(
     settings: &Settings,
     request: &ControlRequest,
     stream: bool,
+    output_mode: OutputMode,
 ) -> io::Result<()> {
     match request {
         ControlRequest::StatusNow => {
             let previous_modified_at = status_file_modified_at()?;
             let _ = queue_control_request_command(settings, request)?;
-            let json = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
-            println!("{}", json);
-            Ok(())
+            let raw = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+            print_json_passthrough(output_mode, "status", &raw)
         }
         ControlRequest::StatusFollowStart { interval_secs } if stream => {
             let mut last_modified_at = status_file_modified_at()?;
             let _ = queue_control_request_command(settings, request)?;
             loop {
-                let json = wait_for_status_json_after(
+                let raw = wait_for_status_json_after(
                     last_modified_at,
                     Duration::from_secs(interval_secs.saturating_mul(3).max(15)),
                 )?;
-                println!("{}", json);
+                print_json_passthrough(output_mode, "status", &raw)?;
                 io::stdout().flush()?;
                 last_modified_at = status_file_modified_at()?;
             }
@@ -499,52 +638,79 @@ fn process_online_status_request(
         ControlRequest::StatusFollowStart { interval_secs } => {
             let _ = queue_control_request_command(settings, request)?;
             let status_path = status_file_path()?;
-            println!(
-                "Set status output interval to {} seconds.\nStatus file: {}",
-                interval_secs,
-                status_path.display()
+            print_success(
+                output_mode,
+                "status",
+                &format!(
+                    "Set status output interval to {} seconds.\nStatus file: {}",
+                    interval_secs,
+                    status_path.display()
+                ),
+                json!({
+                    "message": "Set status output interval.",
+                    "interval_secs": interval_secs,
+                    "status_file": status_path,
+                }),
             );
             Ok(())
         }
         ControlRequest::StatusFollowStop => {
             let _ = queue_control_request_command(settings, request)?;
-            println!("Queued status streaming stop request.");
+            print_success(
+                output_mode,
+                "status",
+                "Queued status streaming stop request.",
+                json!({ "queued": true, "follow": false }),
+            );
             Ok(())
         }
         _ => unreachable!("status request handler received non-status control request"),
     }
 }
 
-fn process_online_control_request(settings: &Settings, request: &ControlRequest) -> io::Result<()> {
+fn process_online_control_request(
+    settings: &Settings,
+    request: &ControlRequest,
+    output_mode: OutputMode,
+) -> io::Result<()> {
     match request {
         ControlRequest::StatusNow => {
             let previous_modified_at = status_file_modified_at()?;
             let _ = queue_control_request_command(settings, request)?;
-            let json = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
-            println!("{}", json);
-            Ok(())
+            let raw = wait_for_status_json_after(previous_modified_at, Duration::from_secs(15))?;
+            print_json_passthrough(output_mode, "status", &raw)
         }
         ControlRequest::StatusFollowStart { interval_secs } => {
             let mut last_modified_at = status_file_modified_at()?;
             let _ = queue_control_request_command(settings, request)?;
             loop {
-                let json = wait_for_status_json_after(
+                let raw = wait_for_status_json_after(
                     last_modified_at,
                     Duration::from_secs(interval_secs.saturating_mul(3).max(15)),
                 )?;
-                println!("{}", json);
+                print_json_passthrough(output_mode, "status", &raw)?;
                 io::stdout().flush()?;
                 last_modified_at = status_file_modified_at()?;
             }
         }
         ControlRequest::StatusFollowStop => {
             let _ = queue_control_request_command(settings, request)?;
-            println!("Queued status streaming stop request.");
+            print_success(
+                output_mode,
+                "status",
+                "Queued status streaming stop request.",
+                json!({ "queued": true, "follow": false }),
+            );
             Ok(())
         }
         _ => {
             let _ = queue_control_request_command(settings, request)?;
-            println!("{}", online_control_success_message(request));
+            print_success(
+                output_mode,
+                request.action_name(),
+                &online_control_success_message(request),
+                json!({ "queued": true, "request": request }),
+            );
             Ok(())
         }
     }
@@ -554,20 +720,22 @@ fn process_shared_control_request(
     settings: &Settings,
     request: &ControlRequest,
     leader_is_running: bool,
+    output_mode: OutputMode,
 ) -> io::Result<()> {
     let _ = queue_control_request_command(settings, request)?;
-    print_queued_control_message(request, true, leader_is_running);
+    print_queued_control_message(request, true, leader_is_running, output_mode);
     Ok(())
 }
 
 fn process_offline_control_request(
     settings: &Settings,
     request: &ControlRequest,
+    output_mode: OutputMode,
 ) -> io::Result<()> {
     match request {
         ControlRequest::StatusNow => {
-            println!("{}", offline_output_json(settings)?);
-            return Ok(());
+            let raw = offline_output_json(settings)?;
+            return print_json_passthrough(output_mode, "status", &raw);
         }
         ControlRequest::StatusFollowStart { .. } | ControlRequest::StatusFollowStop => {
             return Err(io::Error::other(
@@ -578,7 +746,13 @@ fn process_offline_control_request(
     }
 
     let mut next_settings = settings.clone();
-    let mut result = apply_offline_control_request(&mut next_settings, request);
+    let mut result = match request {
+        ControlRequest::Delete {
+            info_hash_hex,
+            delete_files: true,
+        } => apply_offline_purge(&mut next_settings, info_hash_hex),
+        _ => apply_offline_control_request(&mut next_settings, request),
+    };
     if result.is_ok() {
         if let Err(error) = config::save_settings(&next_settings) {
             result = Err(format!("Failed to save updated settings: {}", error));
@@ -586,8 +760,249 @@ fn process_offline_control_request(
     }
     record_offline_control_journal_entry(request, &result);
     let message = result.map_err(io::Error::other)?;
-    println!("{}", message);
+    print_success(
+        output_mode,
+        request.action_name(),
+        &message,
+        json!({ "applied": true, "request": request, "message": message }),
+    );
     Ok(())
+}
+
+fn process_files_command(
+    settings: &Settings,
+    info_hash_hex: &str,
+    output_mode: OutputMode,
+) -> Result<(), String> {
+    let files = list_torrent_files(settings, info_hash_hex)?;
+    if files.is_empty() {
+        return Err(format!(
+            "Torrent '{}' does not have any persisted file entries",
+            info_hash_hex
+        ));
+    }
+
+    if output_mode == OutputMode::Json {
+        print_success(
+            output_mode,
+            "files",
+            "Listed torrent files.",
+            json!({ "info_hash_hex": info_hash_hex, "files": files }),
+        );
+    } else {
+        for file in files {
+            println!(
+                "{}\t{}\t{}\t{}",
+                file.file_index,
+                file.length,
+                file.relative_path,
+                file.full_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn process_torrents_command(settings: &Settings, output_mode: OutputMode) -> Result<(), String> {
+    if settings.torrents.is_empty() {
+        print_success(
+            output_mode,
+            "torrents",
+            "No torrents configured.",
+            json!({ "torrents": [] }),
+        );
+        return Ok(());
+    }
+
+    if output_mode == OutputMode::Json {
+        let torrents = settings
+            .torrents
+            .iter()
+            .map(|torrent| torrent_details_value(settings, torrent))
+            .collect::<Vec<_>>();
+        print_success(
+            output_mode,
+            "torrents",
+            "Listed torrents.",
+            json!({ "torrents": torrents }),
+        );
+    } else {
+        for (index, torrent) in settings.torrents.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+
+            print_torrent_details(settings, torrent);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_info_command(
+    settings: &Settings,
+    target: &str,
+    output_mode: OutputMode,
+) -> Result<(), String> {
+    let info_hash_hex = resolve_target_info_hash(settings, target, "info")?;
+    let torrent = settings
+        .torrents
+        .iter()
+        .find(|torrent| {
+            info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                .map(hex::encode)
+                .as_deref()
+                == Some(info_hash_hex.as_str())
+        })
+        .ok_or_else(|| format!("Torrent '{}' was not found", info_hash_hex))?;
+
+    if output_mode == OutputMode::Json {
+        print_success(
+            output_mode,
+            "info",
+            "Loaded torrent info.",
+            json!({ "torrent": torrent_details_value(settings, torrent) }),
+        );
+    } else {
+        print_torrent_details(settings, torrent);
+    }
+    Ok(())
+}
+
+fn print_torrent_details(settings: &Settings, torrent: &crate::config::TorrentSettings) {
+    let info_hash_hex = info_hash_from_torrent_source(&torrent.torrent_or_magnet).map(hex::encode);
+
+    println!("Name: {}", torrent.name);
+    println!(
+        "Hex: {}",
+        info_hash_hex.as_deref().unwrap_or("<unavailable>")
+    );
+    println!("Source: {}", torrent.torrent_or_magnet);
+    println!("Files:");
+
+    match info_hash_hex.as_deref() {
+        Some(info_hash_hex) => match list_torrent_files(settings, info_hash_hex) {
+            Ok(files) if !files.is_empty() => {
+                for file in files {
+                    println!(
+                        "  {}\t{}\t{}\t{}",
+                        file.file_index,
+                        file.length,
+                        file.relative_path,
+                        file.full_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    );
+                }
+            }
+            Ok(_) => println!("  <none>"),
+            Err(error) => println!("  <unavailable: {}>", error),
+        },
+        None => println!("  <unavailable: info hash could not be derived>"),
+    }
+}
+
+fn torrent_details_value(settings: &Settings, torrent: &crate::config::TorrentSettings) -> Value {
+    let info_hash_hex = info_hash_from_torrent_source(&torrent.torrent_or_magnet).map(hex::encode);
+    let (files, files_error) = match info_hash_hex.as_deref() {
+        Some(info_hash_hex) => match list_torrent_files(settings, info_hash_hex) {
+            Ok(files) => (json!(files), Value::Null),
+            Err(error) => (json!([]), json!(error)),
+        },
+        None => (json!([]), json!("info hash could not be derived")),
+    };
+
+    json!({
+        "name": torrent.name,
+        "info_hash_hex": info_hash_hex,
+        "source": torrent.torrent_or_magnet,
+        "download_path": torrent.download_path,
+        "container_name": torrent.container_name,
+        "torrent_control_state": torrent.torrent_control_state,
+        "delete_files": torrent.delete_files,
+        "file_priorities": torrent.file_priorities,
+        "files": files,
+        "files_error": files_error,
+    })
+}
+
+fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
+    match command {
+        Some(Commands::Add { .. }) => Some("add"),
+        Some(Commands::StopClient) => Some("stop-client"),
+        Some(Commands::Journal) => Some("journal"),
+        Some(Commands::Torrents) => Some("torrents"),
+        Some(Commands::Info { .. }) => Some("info"),
+        Some(Commands::Status { .. }) => Some("status"),
+        Some(Commands::Pause { .. }) => Some("pause"),
+        Some(Commands::Resume { .. }) => Some("resume"),
+        Some(Commands::Remove { .. }) => Some("remove"),
+        Some(Commands::Purge { .. }) => Some("purge"),
+        Some(Commands::Files { .. }) => Some("files"),
+        Some(Commands::Priority { .. }) => Some("priority"),
+        None => None,
+    }
+}
+
+fn print_success(output_mode: OutputMode, command: &str, message: &str, data: Value) {
+    match output_mode {
+        OutputMode::Text => println!("{}", message),
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "command": command,
+                    "data": data,
+                }))
+                .expect("serialize cli success envelope")
+            );
+        }
+    }
+}
+
+fn print_json_error(command: Option<&str>, error: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": false,
+            "command": command,
+            "error": error,
+        }))
+        .expect("serialize cli error envelope")
+    );
+}
+
+fn print_json_passthrough(
+    output_mode: OutputMode,
+    command: &str,
+    raw_json: &str,
+) -> io::Result<()> {
+    match output_mode {
+        OutputMode::Text => {
+            println!("{}", raw_json);
+            Ok(())
+        }
+        OutputMode::Json => {
+            let parsed: Value = serde_json::from_str(raw_json)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "command": command,
+                    "data": parsed,
+                }))
+                .map_err(io::Error::other)?
+            );
+            Ok(())
+        }
+    }
 }
 
 fn record_offline_control_journal_entry(request: &ControlRequest, result: &Result<String, String>) {
