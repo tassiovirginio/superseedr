@@ -4987,6 +4987,7 @@ impl App {
                 success_message,
             } => {
                 self.apply_settings_update(next_settings, true).await;
+                self.trigger_status_dump_after_successful_cluster_mutation();
                 Ok(success_message)
             }
             ControlExecutionPlan::AddTorrentFile {
@@ -5011,6 +5012,7 @@ impl App {
                     CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
                 ) {
                     self.save_state_to_disk();
+                    self.trigger_status_dump_after_successful_cluster_mutation();
                 }
                 Self::map_add_result_to_control_response(ingest_result)
             }
@@ -5036,6 +5038,7 @@ impl App {
                     CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
                 ) {
                     self.save_state_to_disk();
+                    self.trigger_status_dump_after_successful_cluster_mutation();
                 }
                 Self::map_add_result_to_control_response(ingest_result)
             }
@@ -5426,8 +5429,14 @@ impl App {
     }
 
     fn effective_status_dump_interval_secs(&self) -> u64 {
-        self.status_dump_interval_override_secs
-            .unwrap_or(self.client_configs.output_status_interval)
+        let configured_interval = self
+            .status_dump_interval_override_secs
+            .unwrap_or(self.client_configs.output_status_interval);
+        if configured_interval == 0 && self.is_current_shared_leader() {
+            5
+        } else {
+            configured_interval
+        }
     }
 
     fn reschedule_status_dump_deadline(&mut self) {
@@ -5442,6 +5451,12 @@ impl App {
     fn trigger_status_dump_now(&mut self) {
         self.dump_status_to_file();
         self.reschedule_status_dump_deadline();
+    }
+
+    fn trigger_status_dump_after_successful_cluster_mutation(&mut self) {
+        if self.is_current_shared_leader() {
+            self.trigger_status_dump_now();
+        }
     }
 
     fn set_runtime_status_dump_interval_override(&mut self, interval_secs: Option<u64>) {
@@ -7346,6 +7361,47 @@ mod tests {
         )
         .expect("parse leader status");
         assert_eq!(host_snapshot, leader_snapshot);
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_leader_defaults_status_follow_to_five_seconds() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts")).expect("create hosts dir");
+        std::fs::write(
+            effective_root.join("hosts").join("node-a.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let app = App::new(settings, AppRuntimeMode::SharedLeader)
+            .await
+            .expect("build shared leader app");
+
+        assert_eq!(app.client_configs.output_status_interval, 0);
+        assert_eq!(app.effective_status_dump_interval_secs(), 5);
 
         let _ = app.shutdown_tx.send(());
         if let Some(value) = original_shared_dir {
