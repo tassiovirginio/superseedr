@@ -33,6 +33,12 @@ pub enum Commands {
     },
     StopClient,
     Journal,
+    SetSharedConfig {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+    ClearSharedConfig,
+    ShowSharedConfig,
     Torrents,
     Info {
         #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
@@ -215,6 +221,9 @@ pub fn command_to_control_requests(
         Commands::Add { .. }
         | Commands::StopClient
         | Commands::Journal
+        | Commands::SetSharedConfig { .. }
+        | Commands::ClearSharedConfig
+        | Commands::ShowSharedConfig
         | Commands::Torrents
         | Commands::Info { .. }
         | Commands::Purge { .. }
@@ -546,6 +555,24 @@ mod tests {
     }
 
     #[test]
+    fn shared_config_commands_are_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::SetSharedConfig {
+                path: PathBuf::from("C:/shared-root")
+            }),
+            Ok(None)
+        ));
+        assert!(matches!(
+            command_to_control_request(&Commands::ClearSharedConfig),
+            Ok(None)
+        ));
+        assert!(matches!(
+            command_to_control_request(&Commands::ShowSharedConfig),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn remove_command_supports_multiple_hashes() {
         let requests = command_to_control_requests(&Commands::Remove {
             info_hashes: vec![
@@ -598,6 +625,25 @@ mod tests {
                 assert_eq!(file_index, Some(0));
                 assert_eq!(file_path, None);
                 assert_eq!(priority, CliPriority::Skip);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_set_shared_config_command_parses_without_panicking() {
+        Cli::command().debug_assert();
+
+        let parsed = Cli::try_parse_from([
+            "superseedr",
+            "set-shared-config",
+            "C:\\shared-root\\superseedr-config",
+        ])
+        .expect("set-shared-config command should parse");
+
+        match parsed.command.expect("subcommand") {
+            Commands::SetSharedConfig { path } => {
+                assert_eq!(path, PathBuf::from("C:\\shared-root\\superseedr-config"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

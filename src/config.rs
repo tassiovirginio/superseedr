@@ -291,6 +291,27 @@ const SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_SHARED_HOST_ID";
 const LEGACY_SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_HOST_ID";
 const SHARED_TORRENT_SOURCE_PREFIX: &str = "shared:";
 const SHARED_CONFIG_SUBDIR: &str = "superseedr-config";
+const LAUNCHER_SHARED_CONFIG_FILE: &str = "launcher_shared_config.toml";
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+struct LauncherSharedConfig {
+    shared_config_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedConfigSource {
+    Env,
+    Launcher,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct SharedConfigSelection {
+    pub source: SharedConfigSource,
+    pub mount_root: PathBuf,
+    pub config_root: PathBuf,
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
@@ -443,8 +464,24 @@ struct SharedConfigState {
 
 static SHARED_CONFIG_STATE: OnceLock<Mutex<Option<SharedConfigState>>> = OnceLock::new();
 
+#[cfg(test)]
+static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
+
+#[cfg(test)]
+static SHARED_ENV_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
 fn shared_config_state() -> &'static Mutex<Option<SharedConfigState>> {
     SHARED_CONFIG_STATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn app_paths_override() -> &'static Mutex<Option<(PathBuf, PathBuf)>> {
+    APP_PATHS_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn shared_env_guard_for_tests() -> &'static Mutex<()> {
+    SHARED_ENV_TEST_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 impl LayeredConfig {
@@ -828,20 +865,62 @@ fn resolve_shared_mount_and_config_root(path: PathBuf) -> (PathBuf, PathBuf) {
     }
 }
 
-fn shared_mount_root() -> Option<PathBuf> {
-    env::var_os(SHARED_CONFIG_DIR_ENV)
+fn launcher_shared_config_path() -> io::Result<PathBuf> {
+    let (config_dir, _) = get_app_paths().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not resolve application config directory",
+        )
+    })?;
+    Ok(config_dir.join(LAUNCHER_SHARED_CONFIG_FILE))
+}
+
+fn load_launcher_shared_config() -> io::Result<Option<PathBuf>> {
+    let path = launcher_shared_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let sidecar: LauncherSharedConfig = read_toml_or_default(&path)?;
+    Ok(sidecar.shared_config_dir.filter(|value| !value.as_os_str().is_empty()))
+}
+
+fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
+    if let Some(path) = env::var_os(SHARED_CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .map(resolve_shared_mount_and_config_root)
-        .map(|(mount_root, _)| mount_root)
+    {
+        let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
+        return Ok(Some(SharedConfigSelection {
+            source: SharedConfigSource::Env,
+            mount_root,
+            config_root,
+        }));
+    }
+
+    let Some(path) = load_launcher_shared_config()? else {
+        return Ok(None);
+    };
+    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
+    Ok(Some(SharedConfigSelection {
+        source: SharedConfigSource::Launcher,
+        mount_root,
+        config_root,
+    }))
+}
+
+fn shared_mount_root() -> Option<PathBuf> {
+    resolve_shared_config_selection()
+        .ok()
+        .flatten()
+        .map(|selection| selection.mount_root)
 }
 
 fn shared_config_root() -> Option<PathBuf> {
-    env::var_os(SHARED_CONFIG_DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(resolve_shared_mount_and_config_root)
-        .map(|(_, config_root)| config_root)
+    resolve_shared_config_selection()
+        .ok()
+        .flatten()
+        .map(|selection| selection.config_root)
 }
 
 fn sanitized_host_id_candidate(raw: &str) -> Option<String> {
@@ -891,11 +970,11 @@ fn resolve_host_id() -> String {
 }
 
 fn resolve_shared_config_paths() -> io::Result<Option<SharedConfigPaths>> {
-    let Some(mount_dir) = shared_mount_root() else {
+    let Some(selection) = resolve_shared_config_selection()? else {
         return Ok(None);
     };
-    let root_dir =
-        shared_config_root().ok_or_else(|| io::Error::other("Shared config root unavailable"))?;
+    let mount_dir = selection.mount_root;
+    let root_dir = selection.config_root;
     let host_id = resolve_host_id();
     Ok(Some(SharedConfigPaths {
         mount_dir,
@@ -1155,6 +1234,14 @@ fn clear_shared_config_state() {
 #[cfg(test)]
 pub(crate) fn clear_shared_config_state_for_tests() {
     clear_shared_config_state();
+}
+
+#[cfg(test)]
+pub(crate) fn set_app_paths_override_for_tests(paths: Option<(PathBuf, PathBuf)>) {
+    let mut guard = app_paths_override()
+        .lock()
+        .expect("app paths override lock poisoned");
+    *guard = paths;
 }
 
 fn first_run_settings() -> Settings {
@@ -1442,6 +1529,17 @@ fn upsert_torrent_metadata_entry(
 }
 
 pub fn get_app_paths() -> Option<(PathBuf, PathBuf)> {
+    #[cfg(test)]
+    if let Some(paths) = app_paths_override()
+        .lock()
+        .expect("app paths override lock poisoned")
+        .clone()
+    {
+        fs::create_dir_all(&paths.0).ok()?;
+        fs::create_dir_all(&paths.1).ok()?;
+        return Some(paths);
+    }
+
     if let Some(proj_dirs) = ProjectDirs::from("com", "github", "jagalite.superseedr") {
         let config_dir = proj_dirs.config_dir().to_path_buf();
         let data_dir = proj_dirs.data_local_dir().to_path_buf();
@@ -1453,6 +1551,52 @@ pub fn get_app_paths() -> Option<(PathBuf, PathBuf)> {
     } else {
         None
     }
+}
+
+pub fn effective_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
+    resolve_shared_config_selection()
+}
+
+pub fn persisted_shared_config_path() -> io::Result<PathBuf> {
+    launcher_shared_config_path()
+}
+
+pub fn set_persisted_shared_config(path: &Path) -> io::Result<SharedConfigSelection> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shared config path must be absolute",
+        ));
+    }
+
+    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path.to_path_buf());
+    let sidecar_path = launcher_shared_config_path()?;
+    if let Some(parent) = sidecar_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_toml_atomically(
+        &sidecar_path,
+        &LauncherSharedConfig {
+            shared_config_dir: Some(mount_root.clone()),
+        },
+    )?;
+    clear_shared_config_state();
+
+    Ok(SharedConfigSelection {
+        source: SharedConfigSource::Launcher,
+        mount_root,
+        config_root,
+    })
+}
+
+pub fn clear_persisted_shared_config() -> io::Result<bool> {
+    let sidecar_path = launcher_shared_config_path()?;
+    let existed = sidecar_path.exists();
+    if existed {
+        fs::remove_file(&sidecar_path)?;
+    }
+    clear_shared_config_state();
+    Ok(existed)
 }
 
 pub fn is_shared_config_mode() -> bool {
@@ -2609,13 +2753,108 @@ mod tests {
     }
 
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+        shared_env_guard_for_tests()
     }
 
     fn shared_backend_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+        shared_env_guard_for_tests()
+    }
+
+    fn set_temp_app_paths() -> tempfile::TempDir {
+        let dir = tempdir().expect("create tempdir");
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        set_app_paths_override_for_tests(Some((config_dir, data_dir)));
+        dir
+    }
+
+    #[test]
+    fn test_persisted_shared_config_normalizes_explicit_subdir_to_mount_root() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let explicit_root = temp.path().join("shared-root").join(SHARED_CONFIG_SUBDIR);
+
+        let selection =
+            set_persisted_shared_config(&explicit_root).expect("persist shared config path");
+
+        assert_eq!(selection.source, SharedConfigSource::Launcher);
+        assert_eq!(selection.mount_root, temp.path().join("shared-root"));
+        assert_eq!(selection.config_root, explicit_root);
+
+        let effective = effective_shared_config_selection()
+            .expect("resolve effective shared config")
+            .expect("shared config enabled");
+        assert_eq!(effective, selection);
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_shared_config_env_takes_precedence_over_persisted_launcher_config() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let original_shared_dir = env::var_os(SHARED_CONFIG_DIR_ENV);
+        let temp = set_temp_app_paths();
+        let launcher_root = temp.path().join("launcher-root");
+        let env_root = temp.path().join("env-root");
+
+        set_persisted_shared_config(&launcher_root).expect("persist launcher config");
+        env::set_var(SHARED_CONFIG_DIR_ENV, &env_root);
+        clear_shared_config_state();
+
+        let effective = effective_shared_config_selection()
+            .expect("resolve effective shared config")
+            .expect("shared config enabled");
+        assert_eq!(effective.source, SharedConfigSource::Env);
+        assert_eq!(effective.mount_root, env_root);
+        assert_eq!(
+            effective.config_root,
+            temp.path().join("env-root").join(SHARED_CONFIG_SUBDIR)
+        );
+
+        if let Some(value) = original_shared_dir {
+            env::set_var(SHARED_CONFIG_DIR_ENV, value);
+        } else {
+            env::remove_var(SHARED_CONFIG_DIR_ENV);
+        }
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_clearing_persisted_shared_config_disables_shared_mode_without_env() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let launcher_root = temp.path().join("launcher-root");
+
+        set_persisted_shared_config(&launcher_root).expect("persist launcher config");
+        clear_shared_config_state();
+        assert!(is_shared_config_mode());
+
+        let cleared = clear_persisted_shared_config().expect("clear launcher config");
+        assert!(cleared);
+        assert_eq!(
+            effective_shared_config_selection().expect("resolve effective shared config"),
+            None
+        );
+        assert!(!is_shared_config_mode());
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_set_persisted_shared_config_rejects_relative_paths() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let _temp = set_temp_app_paths();
+
+        let error = set_persisted_shared_config(Path::new("relative/shared-root"))
+            .expect_err("relative path should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("absolute"));
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
     }
 
     #[test]

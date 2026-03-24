@@ -9,7 +9,14 @@ Shared config mode is now a layered cluster mode.
 - The leader is the only node allowed to mutate shared desired state and consume the shared inbox.
 - Other nodes follow leader-written shared catalog changes and apply them locally.
 
-Shared mode is enabled only when `SUPERSEEDR_SHARED_CONFIG_DIR` is set.
+Shared mode is enabled from the first available source in this order:
+
+1. `SUPERSEEDR_SHARED_CONFIG_DIR`
+2. persisted launcher sidecar config set by the CLI
+3. normal mode
+
+This makes installed browser and OS protocol launches work even when they do not
+inherit your shell environment.
 
 ## Environment Variables
 
@@ -35,6 +42,8 @@ Example:
 SUPERSEEDR_SHARED_CONFIG_DIR=/mnt/shared-drive
 ```
 
+This still has highest precedence and overrides any persisted launcher config.
+
 ### `SUPERSEEDR_SHARED_HOST_ID`
 Optional explicit host id for selecting `hosts/<host-id>.toml`.
 
@@ -47,6 +56,32 @@ Example:
 
 ```bash
 SUPERSEEDR_SHARED_HOST_ID=seedbox-a
+```
+
+## Launcher Commands
+
+Use these commands to persist shared mode in the normal per-user config area
+without editing runtime `settings.toml`:
+
+```bash
+superseedr set-shared-config /mnt/shared-drive
+superseedr show-shared-config
+superseedr clear-shared-config
+```
+
+Rules:
+
+- `set-shared-config` requires an absolute path
+- the path may be either the mount root or an explicit `.../superseedr-config`
+- Superseedr normalizes and stores the mount root in a dedicated launcher sidecar file
+- `show-shared-config` reports the effective source and resolved paths
+- `clear-shared-config` disables persisted shared mode unless the env var is still set
+
+Examples:
+
+```bash
+superseedr set-shared-config /mnt/shared-drive
+superseedr set-shared-config /mnt/shared-drive/superseedr-config
 ```
 
 ## Shared Root Layout
@@ -78,7 +113,11 @@ Each host can mount that same shared drive at a different local path, for exampl
 - Windows: `C:\Users\jagat\Documents\seedbox`
 - macOS: `/Volumes/seedbox`
 
-Both hosts should set `SUPERSEEDR_SHARED_CONFIG_DIR` to their local mount root.
+Each host may either:
+
+- set `SUPERSEEDR_SHARED_CONFIG_DIR` to its local mount root, or
+- run `superseedr set-shared-config <mount-root>` once for that user account
+
 Superseedr will then use `<mount-root>/superseedr-config/` automatically.
 
 Examples:
@@ -221,7 +260,8 @@ name = "Shared Collection"
 download_path = "library/shared-collection"
 ```
 
-At runtime, those resolve under `SUPERSEEDR_SHARED_CONFIG_DIR`.
+At runtime, those resolve under the effective shared mount root, whether it came
+from `SUPERSEEDR_SHARED_CONFIG_DIR` or the persisted launcher config.
 
 ## Shared Mutation Model
 
@@ -311,6 +351,7 @@ watch_folder = "/srv/local-watch"
 ## Notes
 
 - Shared mode is opt-in.
+- Environment configuration still overrides persisted launcher configuration.
 - The layered file layout is preserved.
 - Shared desired state still has a single writer.
 - Runtime torrent activity is cluster-wide across all nodes.

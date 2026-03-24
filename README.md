@@ -62,6 +62,32 @@ superseedr
 > Add torrents by clicking magnet links in your browser or opening .torrent files.
 > Copying and pasting (ctrl + v) magnet links or paths to torrent files will also work.
 
+### Shared Config Launcher Setup
+
+If you use shared mode and want installed browser or OS magnet launches to keep
+working even when they do not inherit your shell environment, persist the shared
+root once:
+
+```bash
+superseedr set-shared-config "/path/to/seedbox"
+superseedr show-shared-config
+```
+
+Clear it later with:
+
+```bash
+superseedr clear-shared-config
+```
+
+Startup precedence is:
+
+1. `SUPERSEEDR_SHARED_CONFIG_DIR`
+2. persisted launcher shared config
+3. normal mode
+
+You can pass either the shared mount root or an explicit
+`/path/to/seedbox/superseedr-config`. Superseedr normalizes both forms.
+
 ## Troubleshooting
 
 **Connection or Disk issues?**
@@ -214,6 +240,12 @@ superseedr add "magnet:?xt=urn:btih:..."
 
 # Add a torrent file by path
 superseedr add "/path/to/linux.iso.torrent"
+
+# Persist shared launcher config for installed/protocol launches
+superseedr set-shared-config "/path/to/seedbox"
+
+# Inspect the effective shared launcher config
+superseedr show-shared-config
 
 # Stop the client gracefully
 superseedr stop-client

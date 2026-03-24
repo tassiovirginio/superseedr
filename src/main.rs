@@ -37,7 +37,9 @@ use std::time::Duration;
 
 use crate::config::Settings;
 use crate::config::{
-    is_shared_config_mode, load_settings, resolve_command_watch_path, shared_lock_path,
+    clear_persisted_shared_config, effective_shared_config_selection, is_shared_config_mode,
+    load_settings, persisted_shared_config_path, resolve_command_watch_path,
+    set_persisted_shared_config, shared_lock_path, SharedConfigSource,
 };
 use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
@@ -132,6 +134,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OutputMode::Text
     };
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
+
+    if let Some(result) = process_launcher_shared_config_command(&cli, output_mode) {
+        if let Err(error) = result {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!("Launcher shared config command processed, exiting temporary instance.");
+        return Ok(());
+    }
+
     let loaded_settings = match load_settings() {
         Ok(settings) => settings,
         Err(error) => {
@@ -334,6 +350,118 @@ fn try_acquire_app_lock() -> io::Result<Option<File>> {
     }
 }
 
+fn process_launcher_shared_config_command(
+    cli: &Cli,
+    output_mode: OutputMode,
+) -> Option<io::Result<()>> {
+    let command = cli.command.as_ref()?;
+    match command {
+        Commands::SetSharedConfig { path } => Some(process_set_shared_config_command(path, output_mode)),
+        Commands::ClearSharedConfig => Some(process_clear_shared_config_command(output_mode)),
+        Commands::ShowSharedConfig => Some(process_show_shared_config_command(output_mode)),
+        _ => None,
+    }
+}
+
+fn shared_config_selection_json(selection: &crate::config::SharedConfigSelection) -> Value {
+    json!({
+        "source": selection.source,
+        "mount_root": selection.mount_root,
+        "config_root": selection.config_root,
+    })
+}
+
+fn process_set_shared_config_command(path: &std::path::Path, output_mode: OutputMode) -> io::Result<()> {
+    let selection = set_persisted_shared_config(path)?;
+    let sidecar_path = persisted_shared_config_path()?;
+    print_success(
+        output_mode,
+        "set-shared-config",
+        &format!(
+            "Persisted shared config root at {}.",
+            selection.mount_root.display()
+        ),
+        json!({
+            "enabled": true,
+            "selection": shared_config_selection_json(&selection),
+            "sidecar_path": sidecar_path,
+        }),
+    );
+    Ok(())
+}
+
+fn process_clear_shared_config_command(output_mode: OutputMode) -> io::Result<()> {
+    let cleared = clear_persisted_shared_config()?;
+    let sidecar_path = persisted_shared_config_path()?;
+    let message = if cleared {
+        "Cleared persisted shared config."
+    } else {
+        "No persisted shared config was set."
+    };
+    print_success(
+        output_mode,
+        "clear-shared-config",
+        message,
+        json!({
+            "enabled": false,
+            "cleared": cleared,
+            "sidecar_path": sidecar_path,
+        }),
+    );
+    Ok(())
+}
+
+fn process_show_shared_config_command(output_mode: OutputMode) -> io::Result<()> {
+    let selection = effective_shared_config_selection()?;
+    let sidecar_path = persisted_shared_config_path()?;
+
+    match (output_mode, selection) {
+        (OutputMode::Json, Some(selection)) => {
+            print_success(
+                output_mode,
+                "show-shared-config",
+                "Shared config is enabled.",
+                json!({
+                    "enabled": true,
+                    "selection": shared_config_selection_json(&selection),
+                    "sidecar_path": sidecar_path,
+                }),
+            );
+        }
+        (OutputMode::Json, None) => {
+            print_success(
+                output_mode,
+                "show-shared-config",
+                "Shared config is disabled.",
+                json!({
+                    "enabled": false,
+                    "selection": Value::Null,
+                    "sidecar_path": sidecar_path,
+                }),
+            );
+        }
+        (OutputMode::Text, Some(selection)) => {
+            println!("Shared config is enabled.");
+            println!(
+                "Source: {}",
+                match selection.source {
+                    SharedConfigSource::Env => "env",
+                    SharedConfigSource::Launcher => "launcher",
+                }
+            );
+            println!("Mount Root: {}", selection.mount_root.display());
+            println!("Config Root: {}", selection.config_root.display());
+            println!("Sidecar Path: {}", sidecar_path.display());
+        }
+        (OutputMode::Text, None) => {
+            println!("Shared config is disabled.");
+            println!("Sidecar Path: {}", sidecar_path.display());
+        }
+    }
+
+    Ok(())
+}
+
 fn process_cli_request(
     cli: &Cli,
     settings: &Settings,
@@ -390,6 +518,9 @@ fn process_cli_request(
             process_journal_command(output_mode)?;
             Ok(())
         }
+        Commands::SetSharedConfig { path } => process_set_shared_config_command(path, output_mode),
+        Commands::ClearSharedConfig => process_clear_shared_config_command(output_mode),
+        Commands::ShowSharedConfig => process_show_shared_config_command(output_mode),
         Commands::Torrents => {
             process_torrents_command(settings, output_mode).map_err(io::Error::other)
         }
@@ -1028,6 +1159,9 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Add { .. }) => Some("add"),
         Some(Commands::StopClient) => Some("stop-client"),
         Some(Commands::Journal) => Some("journal"),
+        Some(Commands::SetSharedConfig { .. }) => Some("set-shared-config"),
+        Some(Commands::ClearSharedConfig) => Some("clear-shared-config"),
+        Some(Commands::ShowSharedConfig) => Some("show-shared-config"),
         Some(Commands::Torrents) => Some("torrents"),
         Some(Commands::Info { .. }) => Some("info"),
         Some(Commands::Status { .. }) => Some("status"),

@@ -5973,8 +5973,7 @@ mod tests {
     }
 
     fn shared_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+        crate::config::shared_env_guard_for_tests()
     }
 
     fn lock_shared_env() -> std::sync::MutexGuard<'static, ()> {
