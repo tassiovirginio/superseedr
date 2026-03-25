@@ -4492,10 +4492,15 @@ impl App {
         };
 
         let (v1_hash, v2_hash) = parse_hybrid_hashes(&magnet_link);
-        let info_hash = v1_hash
-            .clone()
-            .or_else(|| v2_hash.clone())
-            .expect("Magnet link missing both btih and btmh hashes");
+        let Some(info_hash) = v1_hash.clone().or_else(|| v2_hash.clone()) else {
+            let message = "Magnet link is missing both btih and btmh hashes".to_string();
+            tracing_event!(Level::ERROR, "{}", message);
+            return CommandIngestResult::Invalid {
+                info_hash: None,
+                torrent_name: None,
+                message,
+            };
+        };
         let resolved_name = resolve_magnet_torrent_name(&torrent_name, &magnet_link, &info_hash);
         let resolved_torrent_name = resolved_name.clone();
 
@@ -7591,6 +7596,40 @@ mod tests {
         }
 
         assert_eq!(app.app_state.pending_watch_commands.len(), 1);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn add_magnet_torrent_rejects_hashless_magnet_without_panicking() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let result = app
+            .add_magnet_torrent(
+                "Fetching name...".to_string(),
+                "magnet:?dn=SampleNoHash".to_string(),
+                None,
+                false,
+                TorrentControlState::Running,
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            CommandIngestResult::Invalid {
+                info_hash: None,
+                torrent_name: None,
+                message: "Magnet link is missing both btih and btmh hashes".to_string(),
+            }
+        );
 
         let _ = app.shutdown_tx.send(());
     }
