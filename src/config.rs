@@ -1979,6 +1979,10 @@ pub fn runtime_log_dir() -> Option<PathBuf> {
     runtime_data_dir().map(|data_dir| data_dir.join("logs"))
 }
 
+pub fn local_runtime_log_dir() -> Option<PathBuf> {
+    local_runtime_data_dir().map(|data_dir| data_dir.join("logs"))
+}
+
 pub fn local_cli_log_dir() -> Option<PathBuf> {
     local_runtime_data_dir().map(|data_dir| data_dir.join("logs").join("cli"))
 }

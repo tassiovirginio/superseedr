@@ -97,12 +97,12 @@ enum OutputMode {
 
 // CLI types and process_input moved to integrations::cli
 
-fn init_tracing(log_dir: Option<PathBuf>, filename_prefix: &str) {
+fn init_tracing(log_dirs: Vec<PathBuf>, filename_prefix: &str) {
     let quiet_filter = Targets::new()
         .with_default(DEFAULT_LOG_FILTER)
         .with_target("mainline::rpc::socket", LevelFilter::ERROR);
 
-    if let Some(log_dir) = log_dir {
+    for log_dir in log_dirs {
         if let Err(error) = fs::create_dir_all(&log_dir) {
             eprintln!(
                 "[Warn] Failed to create log directory at {}: {}",
@@ -157,14 +157,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OutputMode::Text
     };
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
-    let log_dir = if has_cli_request {
-        config::local_cli_log_dir()
-            .or_else(config::local_runtime_data_dir)
-            .or_else(|| env::current_dir().ok())
+    let log_dirs = if has_cli_request {
+        let mut dirs = Vec::new();
+        if let Some(dir) = config::local_cli_log_dir() {
+            dirs.push(dir);
+        }
+        if let Some(dir) = config::local_runtime_data_dir() {
+            dirs.push(dir);
+        }
+        if let Some(dir) = env::current_dir().ok() {
+            dirs.push(dir);
+        }
+        dirs
     } else {
-        config::runtime_log_dir().or_else(|| env::current_dir().ok())
+        let mut dirs = Vec::new();
+        if let Some(dir) = config::runtime_log_dir() {
+            dirs.push(dir);
+        }
+        if let Some(dir) = config::local_runtime_log_dir() {
+            if !dirs.iter().any(|existing| existing == &dir) {
+                dirs.push(dir);
+            }
+        }
+        if let Some(dir) = env::current_dir().ok() {
+            if !dirs.iter().any(|existing| existing == &dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
     };
-    init_tracing(log_dir, if has_cli_request { "cli" } else { "app" });
+    init_tracing(log_dirs, if has_cli_request { "cli" } else { "app" });
 
     tracing::info!("STARTING SUPERSEEDR");
 
