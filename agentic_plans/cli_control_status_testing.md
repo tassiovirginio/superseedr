@@ -522,6 +522,8 @@ Prove that a second node can take leadership and the CLI surface still behaves c
 4. Stop runtime A cleanly or otherwise remove its leadership.
 5. Wait until runtime B takes leadership.
 6. Confirm runtime B is now leader before issuing more commands.
+7. Restart runtime A as follower if failover validation needs both nodes alive again.
+8. After post-failover validation is complete, optionally fail back and repeat a short final leader round.
 
 ### Required operator checks
 - record which node was original leader
@@ -545,12 +547,74 @@ Prove that a second node can take leadership and the CLI surface still behaves c
 - `priority`
 - `stop-client`
 
+### Full Manual Sequence Used In This Round
+
+The end-to-end cluster round that fully closed this matrix used these phases:
+
+1. Leader round
+- start this machine as leader on the shared root
+- start the second machine as follower on the same shared root
+- seed at least one disposable torrent into shared state
+- run the full leader-side read and mutating command set
+
+2. Failover round
+- stop the original leader
+- confirm the original leader process is actually gone
+- wait for the other node to become leader
+- restart the old leader as follower
+- rerun read commands from the restarted follower
+- rerun follower-issued mutating commands and confirm the new leader applies them
+
+3. Failback round
+- move leadership back to the original node
+- confirm the original node is leader again
+- run a short final confirmation set:
+  - `show-shared-config`
+  - `show-host-id`
+  - `status`
+  - `journal`
+  - `torrents`
+  - one `add`
+  - one control mutation
+  - one cleanup mutation
+
+### Recommended Concrete Operator Procedure
+
+1. Create a dedicated test folder inside the mounted shared volume.
+2. Copy disposable `.torrent` fixtures into a shared `shared-fixtures/` folder under that test root.
+3. Start runtime A with explicit env vars for shared root and host id.
+4. Start runtime B with the same shared root and a different host id.
+5. Run the full leader-side matrix first.
+6. For cluster `.path` add testing, only use `.torrent` files that live on the shared volume.
+7. Stop the current leader and verify the process is actually gone before assuming failover occurred.
+8. Confirm leadership transfer using multiple signals:
+   - live node screen
+   - `journal`
+   - `torrents`
+   - shared status artifacts
+9. Restart the old leader as follower and run follower-side read and mutating checks.
+10. Fail back if desired and run one short final leader-side confirmation round.
+
 ### Expected
 - the new leader accepts and applies shared mutating commands
 - read commands reflect the post-failover shared state
 - no command falls back to stale routing from the former leader
 - journal continues to record shared command events after failover
 - status and shared files converge after leadership transfer
+
+### Required Post-Failover Mutations
+
+Do not stop at `pause` or `resume` only.
+
+At minimum, the post-failover round should include:
+- one `add`
+- `pause`
+- `resume`
+- `priority`
+- `remove`
+- `purge`
+
+If `stop-client` is run, do it only at the very end of the overall round.
 
 ### Required note
 - if any command only worked after a delay, record the delay and what artifact finally proved leadership transfer
@@ -621,6 +685,54 @@ For failover specifically, at minimum validate:
 
 10. Record magnet quality honestly
 - if only a fabricated magnet string was used, state that it validates routing and queueing only
+
+11. Use shared-mounted `.torrent` files for cross-host `.path` validation
+- a host-local repo path is not a valid cross-host success-path fixture
+- for cluster `.path` testing, the `.torrent` file must live on the shared volume
+
+12. Confirm final cleanup
+- after the last `remove` and `purge`, confirm `torrents` returns an empty list
+
+## Findings From This Round
+
+Record these as learned expectations for future rounds:
+
+1. Dedicated mounted test root is required
+- use a dedicated subfolder inside the mounted shared volume, not the volume root
+
+2. Shared `.path` adds must use portable payloads
+- in shared mode, queued `.path` payloads must be shared-root-relative, not host-local absolute paths
+
+3. Cluster `.path` success requires shared-mounted `.torrent` fixtures
+- cross-host `.path` add only succeeds when the referenced `.torrent` lives on the shared volume
+
+4. CLI should not bootstrap runtime/shared state
+- CLI should read or mutate existing state, not create host/runtime directories as a side effect
+
+5. CLI logging must not depend on shared log path writeability
+- local CLI logging or safe fallback is needed so read commands still work when shared log creation fails
+
+6. Runtime logging should fall back locally
+- runtime should try shared host logs first, then local logs if shared log creation fails
+
+7. Shared runtime startup errors should be explicit
+- missing mount or unwritable host paths should produce mount/accessibility errors, not raw generic permission failures
+
+8. `stop-client` in shared mode targets the leader
+- do not treat it as a local-only follower stop
+
+9. Failover confirmation needs more than one signal
+- process exit alone is not enough
+- use leader screen, journal activity, shared state reads, and status artifacts together
+
+10. Brief leader/status lag during failover or failback is expected
+- watcher timing and manual transition steps can leave a stale leader snapshot briefly
+- treat short-lived lag as expected unless it persists
+
+11. Full failover validation requires three rounds
+- original leader round
+- post-failover follower round
+- failback confirmation round
 
 ## Evidence To Record
 
