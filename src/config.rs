@@ -1335,6 +1335,13 @@ fn first_run_settings() -> Settings {
     settings
 }
 
+fn client_never_started_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "superseedr client has never started yet; start the client once before using CLI commands",
+    )
+}
+
 impl NormalConfigBackend {
     fn load_settings(&self) -> io::Result<Settings> {
         if !self.paths.settings_path.exists() {
@@ -1345,6 +1352,25 @@ impl NormalConfigBackend {
             let settings = first_run_settings();
             self.save_settings(&settings)?;
             return Ok(settings);
+        }
+
+        tracing_event!(
+            Level::INFO,
+            "Found existing settings at: {:?}",
+            self.paths.settings_path
+        );
+
+        let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
+        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
+        let layered = LayeredConfig::from_flat_settings(&flat_settings);
+        let mut resolved_settings = layered.resolve_flat_settings()?;
+        apply_metadata_to_settings(&mut resolved_settings, &metadata);
+        apply_env_overrides(&resolved_settings)
+    }
+
+    fn load_settings_for_cli(&self) -> io::Result<Settings> {
+        if !self.paths.settings_path.exists() {
+            return Err(client_never_started_error());
         }
 
         tracing_event!(
@@ -1403,6 +1429,48 @@ impl SharedConfigBackend {
             );
             bootstrap_shared_host_config(&self.paths.host_path)?
         };
+
+        let layered = LayeredConfig {
+            settings: settings_config,
+            catalog,
+            host,
+        };
+        let mut resolved_settings =
+            layered.resolve_shared_settings(&self.paths.mount_dir, &self.paths.root_dir)?;
+        apply_metadata_to_settings(&mut resolved_settings, &metadata);
+        let resolved_settings = apply_env_overrides(&resolved_settings)?;
+        validate_shared_runtime_settings(&resolved_settings, &self.paths.mount_dir)?;
+        let settings_fingerprint = fingerprint_for_path(&self.paths.settings_path)?;
+        let catalog_fingerprint = fingerprint_for_path(&self.paths.catalog_path)?;
+        let metadata_fingerprint = fingerprint_for_path(&self.paths.metadata_path)?;
+        let host_fingerprint = fingerprint_for_path(&self.paths.host_path)?;
+
+        let mut guard = shared_config_state()
+            .lock()
+            .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
+        *guard = Some(SharedConfigState {
+            paths: self.paths.clone(),
+            layered,
+            resolved_settings: resolved_settings.clone(),
+            settings_fingerprint,
+            catalog_fingerprint,
+            metadata_fingerprint,
+            host_fingerprint,
+        });
+
+        Ok(resolved_settings)
+    }
+
+    fn load_settings_for_cli(&self) -> io::Result<Settings> {
+        if !self.paths.settings_path.exists() || !self.paths.host_path.exists() {
+            return Err(client_never_started_error());
+        }
+
+        let settings_config: SharedSettingsConfig =
+            read_toml_or_default(&self.paths.settings_path)?;
+        let catalog: CatalogConfig = read_toml_or_default(&self.paths.catalog_path)?;
+        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
+        let host: HostConfig = read_toml_or_default(&self.paths.host_path)?;
 
         let layered = LayeredConfig {
             settings: settings_config,
@@ -1537,6 +1605,24 @@ impl ConfigBackend {
                     backend.paths.host_id
                 );
                 backend.load_settings()
+            }
+        }
+    }
+
+    fn load_settings_for_cli(&self) -> io::Result<Settings> {
+        match self {
+            ConfigBackend::Normal(backend) => {
+                clear_shared_config_state();
+                backend.load_settings_for_cli()
+            }
+            ConfigBackend::Shared(backend) => {
+                tracing_event!(
+                    Level::INFO,
+                    "Using shared config root {:?} with host id {}",
+                    backend.paths.root_dir,
+                    backend.paths.host_id
+                );
+                backend.load_settings_for_cli()
             }
         }
     }
@@ -1893,6 +1979,10 @@ pub fn runtime_log_dir() -> Option<PathBuf> {
     runtime_data_dir().map(|data_dir| data_dir.join("logs"))
 }
 
+pub fn local_cli_log_dir() -> Option<PathBuf> {
+    local_runtime_data_dir().map(|data_dir| data_dir.join("logs").join("cli"))
+}
+
 pub fn runtime_persistence_dir() -> Option<PathBuf> {
     runtime_data_dir().map(|data_dir| data_dir.join("persistence"))
 }
@@ -2057,6 +2147,10 @@ pub fn ensure_watch_directories(settings: &Settings) -> io::Result<()> {
 
 pub fn load_settings() -> io::Result<Settings> {
     resolve_config_backend()?.load_settings()
+}
+
+pub fn load_settings_for_cli() -> io::Result<Settings> {
+    resolve_config_backend()?.load_settings_for_cli()
 }
 
 pub fn save_settings(settings: &Settings) -> io::Result<()> {
@@ -2813,6 +2907,70 @@ mod tests {
         let host: HostConfig =
             read_toml_or_default(&backend.paths.host_path).expect("read bootstrapped host file");
         assert_eq!(host, HostConfig::default());
+    }
+
+    #[test]
+    fn test_normal_backend_cli_load_does_not_bootstrap_missing_settings() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+
+        let error = backend
+            .load_settings_for_cli()
+            .expect_err("missing standalone settings should fail for cli");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("client has never started"),
+            "unexpected error: {error}"
+        );
+        assert!(!backend.paths.settings_path.exists());
+        assert!(!backend.paths.metadata_path.exists());
+        assert!(!backend.paths.backup_dir.exists());
+    }
+
+    #[test]
+    fn test_shared_backend_cli_load_does_not_bootstrap_missing_host_file() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path().join("superseedr-config");
+        let host_dir = shared_root.join("hosts").join("windows-node");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: shared_root.clone(),
+                settings_path: shared_root.join("settings.toml"),
+                catalog_path: shared_root.join("catalog.toml"),
+                metadata_path: shared_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "windows-node".to_string(),
+            },
+        };
+
+        fs::create_dir_all(&backend.paths.root_dir).expect("create shared root");
+        write_toml_atomically(
+            &backend.paths.settings_path,
+            &SharedSettingsConfig::default(),
+        )
+        .expect("seed shared settings");
+
+        let error = backend
+            .load_settings_for_cli()
+            .expect_err("missing host file should fail for cli");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("client has never started"),
+            "unexpected error: {error}"
+        );
+        assert!(!backend.paths.host_path.exists());
     }
 
     #[test]

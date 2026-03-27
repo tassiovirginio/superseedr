@@ -39,7 +39,7 @@ use crate::config::Settings;
 use crate::config::{
     clear_persisted_host_id, clear_persisted_shared_config, convert_shared_to_standalone,
     convert_standalone_to_shared, effective_host_id_selection,
-    effective_shared_config_selection, is_shared_config_mode, load_settings,
+    effective_shared_config_selection, is_shared_config_mode, load_settings, load_settings_for_cli,
     persisted_host_id_path, persisted_shared_config_path, resolve_command_watch_path,
     set_persisted_host_id, set_persisted_shared_config, shared_lock_path, HostIdSource,
     SharedConfigSource,
@@ -97,39 +97,59 @@ enum OutputMode {
 
 // CLI types and process_input moved to integrations::cli
 
+fn init_tracing(log_dir: Option<PathBuf>, filename_prefix: &str) {
+    let quiet_filter = Targets::new()
+        .with_default(DEFAULT_LOG_FILTER)
+        .with_target("mainline::rpc::socket", LevelFilter::ERROR);
+
+    if let Some(log_dir) = log_dir {
+        if let Err(error) = fs::create_dir_all(&log_dir) {
+            eprintln!(
+                "[Warn] Failed to create log directory at {}: {}",
+                log_dir.display(),
+                error
+            );
+        } else {
+            match RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .max_log_files(31)
+                .filename_prefix(filename_prefix)
+                .filename_suffix("log")
+                .build(&log_dir)
+            {
+                Ok(general_log) => {
+                    let (non_blocking_general, _guard_general) =
+                        tracing_appender::non_blocking(general_log);
+                    let general_layer = fmt::layer()
+                        .with_writer(non_blocking_general)
+                        .with_ansi(false)
+                        .with_filter(quiet_filter.clone());
+                    if tracing_subscriber::registry()
+                        .with(general_layer)
+                        .try_init()
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Warn] Failed to initialize file logging at {}: {}",
+                        log_dir.display(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = tracing_subscriber::registry()
+        .with(fmt::layer().with_filter(quiet_filter))
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_dir = config::runtime_log_dir()
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let general_log = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .max_log_files(31)
-        .filename_prefix("app")
-        .filename_suffix("log")
-        .build(&log_dir)
-        .expect("Failed to initialize rolling file appender");
-    let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
-    let _subscriber_result = {
-        if fs::create_dir_all(&log_dir).is_ok() {
-            let quiet_filter = Targets::new()
-                .with_default(DEFAULT_LOG_FILTER)
-                .with_target("mainline::rpc::socket", LevelFilter::ERROR);
-
-            let general_layer = fmt::layer()
-                .with_writer(non_blocking_general)
-                .with_ansi(false)
-                .with_filter(quiet_filter);
-
-            tracing_subscriber::registry()
-                .with(general_layer)
-                .try_init()
-        } else {
-            tracing_subscriber::registry().try_init()
-        }
-    };
-
-    tracing::info!("STARTING SUPERSEEDR");
-
     let cli = Cli::parse();
     let output_mode = if cli.json {
         OutputMode::Json
@@ -137,6 +157,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OutputMode::Text
     };
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
+    let log_dir = if has_cli_request {
+        config::local_cli_log_dir()
+            .or_else(config::local_runtime_data_dir)
+            .or_else(|| env::current_dir().ok())
+    } else {
+        config::runtime_log_dir().or_else(|| env::current_dir().ok())
+    };
+    init_tracing(log_dir, if has_cli_request { "cli" } else { "app" });
+
+    tracing::info!("STARTING SUPERSEEDR");
 
     if let Some(result) = process_launcher_setup_command(&cli, output_mode) {
         if let Err(error) = result {
@@ -151,7 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let loaded_settings = match load_settings() {
+    let loaded_settings = match if has_cli_request {
+        load_settings_for_cli()
+    } else {
+        load_settings()
+    } {
         Ok(settings) => settings,
         Err(error) => {
             if has_cli_request && output_mode == OutputMode::Json {
@@ -162,8 +196,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Err(e) = config::ensure_watch_directories(&loaded_settings) {
+    if !has_cli_request {
+        if let Err(e) = config::ensure_watch_directories(&loaded_settings) {
         tracing::error!("Failed to create watch directories: {}", e);
+        }
     }
 
     let shared_mode = is_shared_config_mode();
