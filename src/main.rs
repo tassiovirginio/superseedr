@@ -1648,6 +1648,7 @@ mod tests {
         let _guard = shared_env_guard().lock().unwrap();
         let dir = tempdir().expect("create tempdir");
         let shared_root = dir.path().join("shared-root");
+        std::fs::create_dir_all(&shared_root).expect("create shared root");
         let previous_shared_dir = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
         let previous_host_id = std::env::var_os("SUPERSEEDR_SHARED_HOST_ID");
 

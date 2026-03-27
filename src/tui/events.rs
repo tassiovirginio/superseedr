@@ -187,11 +187,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             journal::handle_event(event, &mut app.app_state);
         }
         AppMode::Welcome => {
-            if matches!(event, CrosstermEvent::Paste(_)) {
-                normal::handle_event(event, app).await;
-            } else {
-                welcome::handle_event(event, &mut app.app_state);
-            }
+            welcome::handle_event(event, &mut app.app_state);
         }
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
@@ -629,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_paste_on_welcome_screen_uses_normal_paste_handler() {
+    async fn explicit_paste_on_welcome_screen_is_ignored() {
         let mut app = build_test_app().await;
         app.app_state.mode = AppMode::Welcome;
         let magnet = "magnet:?xt=urn:btih:00112233445566778899aabbccddeeff00112233";
@@ -641,8 +637,8 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(app.app_state.mode, AppMode::Normal));
-        assert_eq!(app.app_state.pending_torrent_link, magnet);
+        assert!(matches!(app.app_state.mode, AppMode::Welcome));
+        assert!(app.app_state.pending_torrent_link.is_empty());
         let _ = app.shutdown_tx.send(());
     }
 
