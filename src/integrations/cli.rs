@@ -138,27 +138,12 @@ pub fn write_input_command(input_str: &str, watch_path: &Path) -> io::Result<Pat
         let torrent_path = PathBuf::from(input_str);
         match fs::canonicalize(&torrent_path) {
             Ok(absolute_path) => {
-                let hash_bytes = Sha1::digest(absolute_path.to_string_lossy().as_bytes());
-                let file_hash_hex = hex::encode(hash_bytes);
-                let final_filename = format!("{}.path", file_hash_hex);
-                let final_dest_path = watch_path.join(final_filename);
-
                 let absolute_path_cow = absolute_path.to_string_lossy();
-                let content = absolute_path_cow.as_bytes();
-
-                tracing::info!(
-                    "Attempting to write torrent path atomically to final path: {:?}",
-                    final_dest_path
+                return write_path_command_payload(
+                    absolute_path_cow.as_ref(),
+                    absolute_path_cow.as_ref(),
+                    watch_path,
                 );
-                match write_bytes_atomically(&final_dest_path, content) {
-                    Ok(_) => {
-                        return Ok(final_dest_path);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to write path file atomically: {}", e);
-                        return Err(e);
-                    }
-                }
             }
             Err(e) => {
                 // Don't treat as error if launched by macOS without a valid path
@@ -172,6 +157,31 @@ pub fn write_input_command(input_str: &str, watch_path: &Path) -> io::Result<Pat
                 }
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
             }
+        }
+    }
+}
+
+pub fn write_path_command_payload(
+    path_payload: &str,
+    hash_key: &str,
+    watch_path: &Path,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(watch_path)?;
+
+    let hash_bytes = Sha1::digest(hash_key.as_bytes());
+    let file_hash_hex = hex::encode(hash_bytes);
+    let final_filename = format!("{}.path", file_hash_hex);
+    let final_dest_path = watch_path.join(final_filename);
+
+    tracing::info!(
+        "Attempting to write torrent path atomically to final path: {:?}",
+        final_dest_path
+    );
+    match write_bytes_atomically(&final_dest_path, path_payload.as_bytes()) {
+        Ok(_) => Ok(final_dest_path),
+        Err(e) => {
+            tracing::error!("Failed to write path file atomically: {}", e);
+            Err(e)
         }
     }
 }

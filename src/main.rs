@@ -51,8 +51,8 @@ use crate::control_service::{
 use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
     status_control_request, status_file_modified_at, status_should_stream,
-    wait_for_status_json_after, write_control_command, write_input_command, write_stop_command,
-    Cli, Commands,
+    wait_for_status_json_after, write_control_command, write_input_command,
+    write_path_command_payload, write_stop_command, Cli, Commands,
 };
 use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::{offline_output_json, status_file_path};
@@ -801,6 +801,21 @@ fn resolve_cli_command_sink(settings: &Settings) -> io::Result<PathBuf> {
 
 fn queue_direct_input_command(settings: &Settings, input: &str) -> io::Result<PathBuf> {
     let watch_path = resolve_cli_command_sink(settings)?;
+    if input.starts_with("magnet:") {
+        return write_input_command(input, &watch_path);
+    }
+
+    let absolute_path = fs::canonicalize(input)?;
+    if is_shared_config_mode() {
+        if let Some(relative_payload) = config::encode_shared_cli_torrent_path(&absolute_path)? {
+            return write_path_command_payload(
+                &relative_payload,
+                absolute_path.to_string_lossy().as_ref(),
+                &watch_path,
+            );
+        }
+    }
+
     write_input_command(input, &watch_path)
 }
 

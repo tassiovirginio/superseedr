@@ -955,7 +955,7 @@ fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>
     }))
 }
 
-fn shared_mount_root() -> Option<PathBuf> {
+pub fn shared_mount_root() -> Option<PathBuf> {
     resolve_shared_config_selection()
         .ok()
         .flatten()
@@ -1149,7 +1149,7 @@ fn encode_shared_data_path(
         return normalize_shared_relative_path(path, context, true);
     }
 
-    let relative = path.strip_prefix(shared_mount_root).map_err(|_| {
+    let relative = strip_shared_mount_prefix(path, shared_mount_root).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -1159,7 +1159,34 @@ fn encode_shared_data_path(
         )
     })?;
 
-    normalize_shared_relative_path(relative, context, true)
+    normalize_shared_relative_path(&relative, context, true)
+}
+
+fn strip_shared_mount_prefix(path: &Path, shared_mount_root: &Path) -> Result<PathBuf, ()> {
+    if let Ok(relative) = path.strip_prefix(shared_mount_root) {
+        return Ok(relative.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    {
+        let normalized_path = path_without_verbatim_prefix(path);
+        let normalized_root = path_without_verbatim_prefix(shared_mount_root);
+        if let Ok(relative) = normalized_path.strip_prefix(&normalized_root) {
+            return Ok(relative.to_path_buf());
+        }
+    }
+
+    Err(())
+}
+
+#[cfg(windows)]
+fn path_without_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn resolve_shared_data_path(
@@ -2062,6 +2089,27 @@ pub fn runtime_persistence_dir() -> Option<PathBuf> {
 
 pub fn local_lock_path() -> Option<PathBuf> {
     local_runtime_data_dir().map(|data_dir| data_dir.join("superseedr.lock"))
+}
+
+pub fn encode_shared_cli_torrent_path(path: &Path) -> io::Result<Option<String>> {
+    let Some(shared_root) = shared_mount_root() else {
+        return Ok(None);
+    };
+
+    let relative = encode_shared_data_path(path, Some(&shared_root), "torrent path")?;
+    Ok(Some(portable_relative_path_string(&relative)))
+}
+
+pub fn resolve_shared_cli_torrent_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let Some(shared_root) = shared_mount_root() else {
+        return Ok(path.to_path_buf());
+    };
+
+    resolve_shared_data_path(path, Some(&shared_root), "torrent path")
 }
 
 pub fn shared_cluster_revision_path() -> Option<PathBuf> {
@@ -3152,6 +3200,55 @@ mod tests {
             loaded.default_download_folder,
             Some(dir.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn test_encode_shared_cli_torrent_path_returns_portable_relative_path() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let nested = dir.path().join("shared-fixtures").join("sample-input.torrent");
+        fs::create_dir_all(nested.parent().expect("parent")).expect("create nested dir");
+        fs::write(&nested, "payload").expect("write fixture");
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", dir.path());
+
+        let encoded = encode_shared_cli_torrent_path(&nested)
+            .expect("encode shared cli torrent path")
+            .expect("shared mode should encode");
+
+        assert_eq!(encoded, "shared-fixtures/sample-input.torrent");
+
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_resolve_shared_cli_torrent_path_expands_relative_path_against_mount_root() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", dir.path());
+
+        let resolved = resolve_shared_cli_torrent_path(Path::new("shared-fixtures/sample-input.torrent"))
+            .expect("resolve shared cli torrent path");
+
+        assert_eq!(
+            resolved,
+            dir.path().join("shared-fixtures").join("sample-input.torrent")
+        );
+
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        clear_shared_config_state();
     }
 
     #[test]

@@ -1903,8 +1903,17 @@ impl App {
                         path, error
                     )
                 })?;
+                let source_path = crate::config::resolve_shared_cli_torrent_path(Path::new(
+                    payload.trim(),
+                ))
+                .map_err(|error| {
+                    format!(
+                        "Failed to resolve shared torrent path from file {:?}: {}",
+                        path, error
+                    )
+                })?;
                 Ok(ResolvedAddPayload::TorrentFile {
-                    source_path: PathBuf::from(payload.trim()),
+                    source_path,
                 })
             }
             IngestSource::MagnetFile => {
