@@ -1439,6 +1439,35 @@ fn client_never_started_error() -> io::Error {
     )
 }
 
+fn runtime_lock_is_held(lock_path: Option<&Path>) -> bool {
+    let Some(lock_path) = lock_path else {
+        return false;
+    };
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            tracing_event!(
+                Level::WARN,
+                "Failed to inspect runtime lock at {:?}: {}",
+                lock_path,
+                error
+            );
+            return false;
+        }
+    };
+
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(_) => true,
+    }
+}
+
 impl NormalConfigBackend {
     fn load_settings(&self) -> io::Result<Settings> {
         if !self.paths.settings_path.exists() {
@@ -1467,7 +1496,20 @@ impl NormalConfigBackend {
 
     fn load_settings_for_cli(&self) -> io::Result<Settings> {
         if !self.paths.settings_path.exists() {
-            return Err(client_never_started_error());
+            tracing_event!(
+                Level::INFO,
+                "No standalone settings found during CLI load."
+            );
+            let settings = first_run_settings();
+            if runtime_lock_is_held(local_lock_path().as_deref()) {
+                tracing_event!(
+                    Level::INFO,
+                    "Local runtime lock is held; returning first-run settings without bootstrapping."
+                );
+                return Ok(settings);
+            }
+            self.save_settings(&settings)?;
+            return Ok(settings);
         }
 
         tracing_event!(
@@ -1560,7 +1602,8 @@ impl SharedConfigBackend {
     }
 
     fn load_settings_for_cli(&self) -> io::Result<Settings> {
-        if !self.paths.settings_path.exists() || !self.paths.host_path.exists() {
+        validate_shared_runtime_root(&self.paths)?;
+        if !self.paths.settings_path.exists() {
             return Err(client_never_started_error());
         }
 
@@ -1568,7 +1611,16 @@ impl SharedConfigBackend {
             read_toml_or_default(&self.paths.settings_path)?;
         let catalog: CatalogConfig = read_toml_or_default(&self.paths.catalog_path)?;
         let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
-        let host: HostConfig = read_toml_or_default(&self.paths.host_path)?;
+        let host = if self.paths.host_path.exists() {
+            read_toml_or_default(&self.paths.host_path)?
+        } else {
+            tracing_event!(
+                Level::INFO,
+                "Bootstrapping missing shared host config at {:?} for CLI load",
+                self.paths.host_path
+            );
+            bootstrap_shared_host_config(&self.paths)?
+        };
 
         let layered = LayeredConfig {
             settings: settings_config,
@@ -3112,32 +3164,66 @@ mod tests {
     }
 
     #[test]
-    fn test_normal_backend_cli_load_does_not_bootstrap_missing_settings() {
-        let dir = tempdir().expect("create tempdir");
+    fn test_normal_backend_cli_load_bootstraps_missing_settings_when_local_client_is_not_running() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
         let backend = NormalConfigBackend {
             paths: NormalConfigPaths {
-                settings_path: dir.path().join("settings.toml"),
-                metadata_path: dir.path().join("torrent_metadata.toml"),
-                backup_dir: dir.path().join("backups_settings_files"),
+                settings_path: temp.path().join("settings.toml"),
+                metadata_path: temp.path().join("torrent_metadata.toml"),
+                backup_dir: temp.path().join("backups_settings_files"),
             },
         };
 
-        let error = backend
+        let loaded = backend
             .load_settings_for_cli()
-            .expect_err("missing standalone settings should fail for cli");
+            .expect("missing standalone settings should bootstrap for cli");
 
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert!(
-            error.to_string().contains("client has never started"),
-            "unexpected error: {error}"
-        );
-        assert!(!backend.paths.settings_path.exists());
-        assert!(!backend.paths.metadata_path.exists());
-        assert!(!backend.paths.backup_dir.exists());
+        assert_eq!(loaded, first_run_settings());
+        assert!(backend.paths.settings_path.exists());
+        assert!(backend.paths.metadata_path.exists());
+        assert!(backend.paths.backup_dir.exists());
+
+        set_app_paths_override_for_tests(None);
     }
 
     #[test]
-    fn test_shared_backend_cli_load_does_not_bootstrap_missing_host_file() {
+    fn test_normal_backend_cli_load_stays_read_only_when_local_client_is_running() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let lock_path = local_lock_path().expect("local lock path");
+        fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("create lock dir");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock().expect("hold local runtime lock");
+
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: temp.path().join("standalone-settings.toml"),
+                metadata_path: temp.path().join("standalone-metadata.toml"),
+                backup_dir: temp.path().join("standalone-backups"),
+            },
+        };
+
+        let loaded = backend
+            .load_settings_for_cli()
+            .expect("locked runtime should still allow read-only cli load");
+
+        assert_eq!(loaded, first_run_settings());
+        assert!(!backend.paths.settings_path.exists());
+        assert!(!backend.paths.metadata_path.exists());
+        assert!(!backend.paths.backup_dir.exists());
+
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[test]
+    fn test_shared_backend_cli_load_bootstraps_missing_host_file() {
         let _guard = shared_backend_guard().lock().unwrap();
         clear_shared_config_state();
         let dir = tempdir().expect("create tempdir");
@@ -3163,16 +3249,12 @@ mod tests {
         )
         .expect("seed shared settings");
 
-        let error = backend
+        let loaded = backend
             .load_settings_for_cli()
-            .expect_err("missing host file should fail for cli");
+            .expect("missing host file should bootstrap for cli");
 
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert!(
-            error.to_string().contains("client has never started"),
-            "unexpected error: {error}"
-        );
-        assert!(!backend.paths.host_path.exists());
+        assert_eq!(loaded.default_download_folder, Some(dir.path().to_path_buf()));
+        assert!(backend.paths.host_path.exists());
     }
 
     #[test]
