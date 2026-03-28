@@ -187,8 +187,11 @@ Keep superseedr-config/ inside that folder so the container sees it at /seedbox/
 
 ## 🔗 Integrations & Automation
 
-Superseedr includes several integration points designed for automation, headless operation, and easy pairing with VPN containers like Gluetun.
-For dockerized interoperability tests, see `docs/integration-harness.md`.
+Superseedr is built around a local CLI and a file-based automation model, so
+you can script, queue, and inspect work without exposing a network control
+stack. The same command flow works when a client is online, when it is offline,
+and in shared mode when you are operating against a remote leader through a
+mounted shared root.
 
 Check out the [Superseedr Plugins Repository](https://github.com/Jagalite/superseedr-plugins) for plugins (beta testing).
 
@@ -239,13 +242,9 @@ superseedr add "/path/to/linux.iso.torrent"
 
 # Inspect the current shared launcher selection
 superseedr show-shared-config
-superseedr show-host-id
 
 # Persist shared launcher config for installed/protocol launches
 superseedr set-shared-config "/path/to/seedbox"
-
-# Persist a launcher host id for shared mode
-superseedr set-host-id "desktop-a"
 
 # Convert local config into layered shared config
 superseedr to-shared "/path/to/seedbox"
@@ -278,8 +277,17 @@ Set this variable in your Docker config to change the update frequency (in secon
 SUPERSEEDR_OUTPUT_STATUS_INTERVAL=5
 ```
 
-### 4. RSS History Retention
-RSS download history is persisted for deduplication and UI metadata, but it is capped at **1000 entries**.
+### 4. RSS Feeds & History
+Superseedr can track RSS feeds in-app, evaluate feed items against your configured
+matching rules, and automatically ingest matching releases without needing an
+external automation stack.
+
+* **Feed Tracking:** monitor RSS feeds directly from the client.
+* **Rule-Based Matching:** use configured match rules to decide what should be ingested.
+* **Auto-Ingest:** matching items can be queued into the normal torrent ingest path.
+* **History & Deduplication:** downloaded feed history is persisted so the same item is not re-ingested repeatedly.
+
+RSS download history is capped at **1000 entries**.
 
 * When the history grows past 1000, the **oldest entries are pruned** first.
 * This limit applies to persisted runtime history in `persistence/rss.toml`.

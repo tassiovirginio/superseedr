@@ -887,17 +887,24 @@ fn process_shared_status_request(
     settings: &Settings,
     request: &ControlRequest,
     stream: bool,
-    _leader_is_running: bool,
+    leader_is_running: bool,
     output_mode: OutputMode,
 ) -> io::Result<()> {
     match request {
-        ControlRequest::StatusNow => match fs::read_to_string(status_file_path()?) {
-            Ok(raw) => print_json_passthrough(output_mode, "status", &raw),
-            Err(_) => {
+        ControlRequest::StatusNow => {
+            if !leader_is_running {
                 let raw = offline_output_json(settings)?;
-                print_json_passthrough(output_mode, "status", &raw)
+                return print_json_passthrough(output_mode, "status", &raw);
             }
-        },
+
+            match fs::read_to_string(status_file_path()?) {
+                Ok(raw) => print_json_passthrough(output_mode, "status", &raw),
+                Err(_) => {
+                    let raw = offline_output_json(settings)?;
+                    print_json_passthrough(output_mode, "status", &raw)
+                }
+            }
+        }
         ControlRequest::StatusFollowStart { interval_secs } if stream => {
             let mut last_modified_at = status_file_modified_at()?;
             loop {
@@ -1738,5 +1745,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Shared mode leader status snapshots are always enabled every 5 seconds"));
+    }
+
+    #[test]
+    fn shared_status_now_uses_offline_snapshot_when_no_leader_is_running() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path().join("shared-root");
+        std::fs::create_dir_all(&shared_root).expect("create shared root");
+        let previous_shared_dir = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let previous_host_id = std::env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", &shared_root);
+        std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", "host-a");
+        clear_shared_config_state_for_tests();
+
+        let status_path = status_file_path().expect("shared status path");
+        let status_parent = status_path.parent().expect("status parent");
+        std::fs::create_dir_all(status_parent).expect("create status dir");
+        std::fs::write(&status_path, "{not valid json").expect("write stale invalid status file");
+
+        let result = process_shared_status_request(
+            &Settings::default(),
+            &ControlRequest::StatusNow,
+            false,
+            false,
+            OutputMode::Json,
+        );
+
+        assert!(
+            result.is_ok(),
+            "shared status should fall back to offline output"
+        );
+
+        if let Some(value) = previous_shared_dir {
+            std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = previous_host_id {
+            std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
     }
 }

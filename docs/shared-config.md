@@ -79,7 +79,6 @@ You can use environment variables:
 
 ```bash
 export SUPERSEEDR_SHARED_CONFIG_DIR=/mnt/shared-drive/test
-export SUPERSEEDR_SHARED_HOST_ID=seedbox-a
 superseedr
 ```
 
@@ -87,9 +86,7 @@ Or persist launcher-side setup once per user account:
 
 ```bash
 superseedr set-shared-config /mnt/shared-drive/test
-superseedr set-host-id seedbox-a
 superseedr show-shared-config
-superseedr show-host-id
 ```
 
 Then start the client normally:
@@ -98,7 +95,7 @@ Then start the client normally:
 superseedr
 ```
 
-Repeat on every host with the same shared root and a different host id.
+Repeat on every host with the same shared root.
 
 ### 3. Confirm the Cluster
 
@@ -112,7 +109,6 @@ Useful checks:
 
 ```bash
 superseedr show-shared-config
-superseedr show-host-id
 superseedr status
 superseedr journal
 superseedr torrents

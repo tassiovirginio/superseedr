@@ -14,11 +14,17 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "A BitTorrent client with local CLI automation and optional shared cluster mode.",
+    long_about = None
+)]
 pub struct Cli {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
 
+    #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 
     #[command(subcommand)]
@@ -27,69 +33,136 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    #[command(about = "Add one or more torrent paths or magnet links")]
     Add {
-        #[arg(value_name = "INPUT", num_args = 1..)]
+        #[arg(
+            value_name = "INPUT",
+            num_args = 1..,
+            help = "Torrent file path(s) or magnet link(s)"
+        )]
         inputs: Vec<String>,
     },
+    #[command(about = "Request graceful shutdown of the running client or shared leader")]
     StopClient,
+    #[command(about = "Show the event journal")]
     Journal,
+    #[command(about = "Persist the shared root used for launcher and protocol-handler starts")]
     SetSharedConfig {
-        #[arg(value_name = "PATH")]
+        #[arg(
+            value_name = "PATH",
+            help = "Shared mount root or explicit superseedr-config path"
+        )]
         path: PathBuf,
     },
+    #[command(about = "Clear the persisted shared root launcher setting")]
     ClearSharedConfig,
+    #[command(about = "Show the effective shared root selection and its source")]
     ShowSharedConfig,
+    #[command(about = "Persist an explicit host identity for shared mode (optional)")]
     SetHostId {
-        #[arg(value_name = "HOST_ID")]
+        #[arg(
+            value_name = "HOST_ID",
+            help = "Stable host identity to use in shared mode"
+        )]
         host_id: String,
     },
+    #[command(about = "Clear the persisted shared host identity")]
     ClearHostId,
+    #[command(about = "Show the effective host identity selection and its source")]
     ShowHostId,
+    #[command(about = "Convert the current standalone config into layered shared config")]
     ToShared {
-        #[arg(value_name = "PATH")]
+        #[arg(
+            value_name = "PATH",
+            help = "Shared mount root or explicit superseedr-config path"
+        )]
         path: PathBuf,
     },
+    #[command(about = "Convert the active shared config back into standalone local config")]
     ToStandalone,
+    #[command(about = "List configured torrents")]
     Torrents,
+    #[command(about = "Show one torrent by info hash, or resolve it from a unique file path")]
     Info {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "Torrent info hash or unique file path"
+        )]
         target: String,
     },
+    #[command(about = "Read status once, stream status updates, or stop status streaming")]
     Status {
-        #[arg(long)]
+        #[arg(long, help = "Continuously print updated status snapshots")]
         follow: bool,
-        #[arg(long)]
+        #[arg(long, help = "Stop runtime status streaming in standalone mode")]
         stop: bool,
-        #[arg(long, value_name = "SECONDS")]
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            help = "Set the runtime status dump interval"
+        )]
         interval: Option<u64>,
     },
+    #[command(about = "Pause one or more torrents by info hash or unique file path")]
     Pause {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "One or more torrent targets"
+        )]
         targets: Vec<String>,
     },
+    #[command(about = "Resume one or more torrents by info hash or unique file path")]
     Resume {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "One or more torrent targets"
+        )]
         targets: Vec<String>,
     },
+    #[command(about = "Remove one or more torrents without deleting payload data")]
     Remove {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "One or more torrent targets"
+        )]
         targets: Vec<String>,
     },
+    #[command(about = "Remove one or more torrents and delete payload data when safe")]
     Purge {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "One or more torrent targets"
+        )]
         targets: Vec<String>,
     },
+    #[command(about = "List files for a torrent by info hash or unique file path")]
     Files {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "Torrent info hash or unique file path"
+        )]
         target: String,
     },
+    #[command(about = "Set file priority for a torrent by file index or relative path")]
     Priority {
-        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        #[arg(
+            value_name = "INFO_HASH_HEX_OR_PATH",
+            help = "Torrent info hash or unique file path"
+        )]
         target: String,
-        #[arg(long, conflicts_with = "file_path")]
+        #[arg(
+            long,
+            conflicts_with = "file_path",
+            help = "Target a file by zero-based file index"
+        )]
         file_index: Option<usize>,
-        #[arg(long, conflicts_with = "file_index")]
+        #[arg(
+            long,
+            conflicts_with = "file_index",
+            help = "Target a file by relative file path"
+        )]
         file_path: Option<String>,
+        #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
 }
