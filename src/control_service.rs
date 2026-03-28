@@ -18,6 +18,18 @@ use std::path::Path;
 use std::path::PathBuf;
 
 type TorrentFileList = Vec<(Vec<String>, u64)>;
+type TorrentMetadataByInfoHash = HashMap<String, TorrentMetadataEntry>;
+
+fn load_torrent_metadata_snapshot() -> Option<TorrentMetadataByInfoHash> {
+    let metadata = load_torrent_metadata().ok()?;
+    Some(
+        metadata
+            .torrents
+            .into_iter()
+            .map(|entry| (entry.info_hash_hex.clone(), entry))
+            .collect(),
+    )
+}
 
 pub fn find_torrent_settings_index_by_info_hash(
     settings: &Settings,
@@ -102,7 +114,10 @@ pub fn control_event_details(request: &ControlRequest, origin: ControlOrigin) ->
 pub fn load_torrent_file_list_for_settings(
     torrent_settings: &TorrentSettings,
 ) -> Result<Vec<(Vec<String>, u64)>, String> {
-    if let Some(metadata_files) = load_torrent_file_list_from_metadata(torrent_settings)? {
+    let metadata_by_info_hash = load_torrent_metadata_snapshot();
+    if let Some(metadata_files) =
+        load_torrent_file_list_from_metadata(torrent_settings, metadata_by_info_hash.as_ref())?
+    {
         return Ok(metadata_files);
     }
 
@@ -130,19 +145,13 @@ pub fn load_torrent_file_list_for_settings(
 
 fn load_torrent_file_list_from_metadata(
     torrent_settings: &TorrentSettings,
+    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
 ) -> Result<Option<TorrentFileList>, String> {
     let Some(info_hash) = info_hash_from_torrent_source(&torrent_settings.torrent_or_magnet) else {
         return Ok(None);
     };
     let info_hash_hex = hex::encode(info_hash);
-    let metadata = match load_torrent_metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
-    };
-    let Some(entry) = metadata
-        .torrents
-        .iter()
-        .find(|entry| entry.info_hash_hex == info_hash_hex)
+    let Some(entry) = metadata_by_info_hash.and_then(|metadata| metadata.get(&info_hash_hex))
     else {
         return Ok(None);
     };
@@ -225,25 +234,22 @@ fn torrent_name_for_manifest(
 
 fn torrent_metadata_entry_for_settings(
     torrent_settings: &TorrentSettings,
+    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
 ) -> Result<Option<TorrentMetadataEntry>, String> {
     let Some(info_hash) = info_hash_from_torrent_source(&torrent_settings.torrent_or_magnet) else {
         return Ok(None);
     };
     let info_hash_hex = hex::encode(info_hash);
-    let metadata = match load_torrent_metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
-    };
-    Ok(metadata
-        .torrents
-        .into_iter()
-        .find(|entry| entry.info_hash_hex == info_hash_hex))
+    Ok(metadata_by_info_hash.and_then(|metadata| metadata.get(&info_hash_hex).cloned()))
 }
 
 fn manifest_entries_for_torrent_settings(
     torrent_settings: &TorrentSettings,
+    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
 ) -> Result<(String, bool, Vec<TorrentFileListEntry>), String> {
-    if let Some(entry) = torrent_metadata_entry_for_settings(torrent_settings)? {
+    if let Some(entry) =
+        torrent_metadata_entry_for_settings(torrent_settings, metadata_by_info_hash)?
+    {
         if !entry.files.is_empty() {
             let torrent_name = torrent_name_for_manifest(torrent_settings, Some(&entry));
             let files = entry
@@ -359,9 +365,10 @@ fn full_file_paths_for_torrent(
     settings: &Settings,
     info_hash_hex: &str,
     torrent_settings: &TorrentSettings,
+    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
 ) -> Result<Vec<PathBuf>, String> {
     let (torrent_name, is_multi_file, files) =
-        manifest_entries_for_torrent_settings(torrent_settings)?;
+        manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash)?;
     let (_, effective_root) = resolve_torrent_roots(
         settings,
         torrent_settings,
@@ -390,9 +397,16 @@ pub fn list_torrent_files(
     settings: &Settings,
     info_hash_hex: &str,
 ) -> Result<Vec<TorrentFileListEntry>, String> {
+    let metadata_by_info_hash = load_torrent_metadata_snapshot();
     let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
-    let (_, _, mut files) = manifest_entries_for_torrent_settings(torrent_settings)?;
-    if let Ok(paths) = full_file_paths_for_torrent(settings, info_hash_hex, torrent_settings) {
+    let (_, _, mut files) =
+        manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash.as_ref())?;
+    if let Ok(paths) = full_file_paths_for_torrent(
+        settings,
+        info_hash_hex,
+        torrent_settings,
+        metadata_by_info_hash.as_ref(),
+    ) {
         for (entry, path) in files.iter_mut().zip(paths) {
             entry.full_path = Some(path);
         }
@@ -412,13 +426,19 @@ pub fn resolve_target_info_hash(
 
     let normalized_target = normalize_match_path(Path::new(target));
     let mut matches = Vec::new();
+    let metadata_by_info_hash = load_torrent_metadata_snapshot();
 
     for torrent in &settings.torrents {
         let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
             continue;
         };
         let info_hash_hex = hex::encode(info_hash);
-        let Ok(paths) = full_file_paths_for_torrent(settings, &info_hash_hex, torrent) else {
+        let Ok(paths) = full_file_paths_for_torrent(
+            settings,
+            &info_hash_hex,
+            torrent,
+            metadata_by_info_hash.as_ref(),
+        ) else {
             continue;
         };
         if paths
@@ -454,9 +474,10 @@ pub fn build_offline_purge_plan(
     settings: &Settings,
     info_hash_hex: &str,
 ) -> Result<OfflinePurgePlan, String> {
+    let metadata_by_info_hash = load_torrent_metadata_snapshot();
     let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
     let (torrent_name, is_multi_file, files) =
-        manifest_entries_for_torrent_settings(torrent_settings)?;
+        manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash.as_ref())?;
     if files.is_empty() {
         return Err(format!(
             "Torrent '{}' does not have persisted file paths available for offline purge",

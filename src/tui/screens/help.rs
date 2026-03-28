@@ -717,30 +717,27 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
 
     if is_shared_config_mode() && matches!(mode, AppMode::Normal | AppMode::Welcome | AppMode::Help)
     {
-        rows.splice(
-            10..10,
-            [
-                Row::new(vec![Cell::from(Span::styled(
-                    "Cluster Mode",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Leader",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Downloads, seeds, and publishes cluster progress"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Follower",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Reads leader progress and may seed complete shared data"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-            ],
-        );
+        rows.extend([
+            Row::new(vec![Cell::from(Span::styled(
+                "Cluster Mode",
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ))]),
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    "Leader",
+                    ctx.apply(Style::default().fg(ctx.state_success())),
+                )),
+                Cell::from("Downloads, seeds, and publishes cluster progress"),
+            ]),
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    "Follower",
+                    ctx.apply(Style::default().fg(ctx.state_info())),
+                )),
+                Cell::from("Reads leader progress and may seed complete shared data"),
+            ]),
+            Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+        ]);
     }
 
     let help_table = Table::new(rows, [Constraint::Length(20), Constraint::Min(30)]).block(

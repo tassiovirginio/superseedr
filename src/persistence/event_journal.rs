@@ -73,6 +73,10 @@ pub enum ControlOrigin {
     #[default]
     CliOnline,
     CliOffline,
+    WatchFolder,
+    RssAuto,
+    RssManual,
+    SharedRelay,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]

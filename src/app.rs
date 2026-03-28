@@ -89,6 +89,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -628,6 +629,7 @@ pub(crate) struct PendingIngestRecord {
 pub(crate) struct PendingControlRecord {
     correlation_id: String,
     request: ControlRequest,
+    origin: ControlOrigin,
     source_watch_folder: Option<PathBuf>,
     source_path: PathBuf,
 }
@@ -1133,6 +1135,7 @@ pub struct App {
     pub event_journal_host_id: Option<String>,
     pub status_dump_interval_override_secs: Option<u64>,
     pub next_status_dump_at: Option<time::Instant>,
+    pub status_dump_generation: Arc<AtomicU64>,
     pub app_lock_handle: Option<File>,
     pub leader_status_snapshot: Option<AppOutputState>,
 }
@@ -1478,6 +1481,7 @@ impl App {
             event_journal_host_id: shared_host_id(),
             status_dump_interval_override_secs: None,
             next_status_dump_at: None,
+            status_dump_generation: Arc::new(AtomicU64::new(0)),
             app_lock_handle,
             leader_status_snapshot: None,
         };
@@ -2159,10 +2163,11 @@ impl App {
                 self.save_state_to_disk();
             }
             AddIngressAction::QueueControlRequest(request) => {
+                let origin = self.control_origin_for_ingest_path(&path);
                 if self.is_host_watch_path(&path) {
                     self.app_state.pending_ingest_by_path.remove(&path);
                 }
-                match self.dispatch_cluster_control_request(request).await {
+                match self.dispatch_cluster_control_request(request, origin).await {
                     Ok(_message) => {
                         self.archive_processed_ingest(source, &path);
                     }
@@ -2242,6 +2247,7 @@ impl App {
     fn queue_control_request_for_leader(
         &mut self,
         request: ControlRequest,
+        origin: ControlOrigin,
     ) -> Result<String, String> {
         if !self.cluster_capabilities().can_queue_shared_commands {
             return Err("Shared command queue is unavailable in this mode".to_string());
@@ -2250,7 +2256,7 @@ impl App {
             .ok_or_else(|| "Could not resolve the shared command inbox".to_string())?;
         let queued_path = write_control_request(&request, &watch_path)
             .map_err(|error| format!("Failed to queue shared control request: {}", error))?;
-        self.record_control_queued(queued_path, request.clone());
+        self.record_control_queued(queued_path, request.clone(), origin);
         self.save_state_to_disk();
         Ok(format!(
             "Queued for leader processing. {}",
@@ -2261,9 +2267,10 @@ impl App {
     pub async fn dispatch_cluster_control_request(
         &mut self,
         request: ControlRequest,
+        origin: ControlOrigin,
     ) -> Result<String, String> {
         if self.is_current_shared_follower() {
-            self.queue_control_request_for_leader(request)
+            self.queue_control_request_for_leader(request, origin)
         } else {
             self.apply_control_request(&request).await
         }
@@ -3044,7 +3051,10 @@ impl App {
                     .await;
             }
             AppCommand::SubmitControlRequest(request) => {
-                if let Err(error) = self.dispatch_cluster_control_request(request).await {
+                if let Err(error) = self
+                    .dispatch_cluster_control_request(request, ControlOrigin::CliOnline)
+                    .await
+                {
                     self.app_state.system_error = Some(error);
                     self.app_state.ui.needs_redraw = true;
                 }
@@ -4793,7 +4803,35 @@ impl App {
         }
     }
 
-    fn record_control_queued(&mut self, path: PathBuf, request: ControlRequest) -> bool {
+    fn control_origin_for_command_path(&self, path: &Path) -> ControlOrigin {
+        if self.is_shared_inbox_path(path) {
+            ControlOrigin::SharedRelay
+        } else if self.is_host_watch_path(path) {
+            ControlOrigin::WatchFolder
+        } else {
+            ControlOrigin::CliOnline
+        }
+    }
+
+    fn control_origin_for_ingest_path(&self, path: &Path) -> ControlOrigin {
+        match self
+            .app_state
+            .pending_ingest_by_path
+            .get(path)
+            .map(|record| record.origin)
+        {
+            Some(IngestOrigin::RssAuto) => ControlOrigin::RssAuto,
+            Some(IngestOrigin::RssManual) => ControlOrigin::RssManual,
+            Some(IngestOrigin::WatchFolder) | None => ControlOrigin::WatchFolder,
+        }
+    }
+
+    fn record_control_queued(
+        &mut self,
+        path: PathBuf,
+        request: ControlRequest,
+        origin: ControlOrigin,
+    ) -> bool {
         if self.app_state.pending_control_by_path.contains_key(&path) {
             return false;
         }
@@ -4805,6 +4843,7 @@ impl App {
             PendingControlRecord {
                 correlation_id: correlation_id.clone(),
                 request: request.clone(),
+                origin,
                 source_watch_folder: source_watch_folder.clone(),
                 source_path: path.clone(),
             },
@@ -4819,7 +4858,7 @@ impl App {
             source_path: Some(path),
             correlation_id: Some(correlation_id),
             message: Some(format!("Queued control action '{}'", request.action_name())),
-            details: control_event_details(&request, ControlOrigin::CliOnline),
+            details: control_event_details(&request, origin),
             ..Default::default()
         });
         true
@@ -4836,12 +4875,13 @@ impl App {
             .as_ref()
             .map(|record| record.correlation_id.clone())
             .unwrap_or_else(|| event_correlation_id_for_path(path));
-        let (source_watch_folder, source_path, request) = pending
+        let (source_watch_folder, source_path, request, origin) = pending
             .map(|record| {
                 (
                     record.source_watch_folder,
                     Some(record.source_path),
                     record.request,
+                    record.origin,
                 )
             })
             .unwrap_or_else(|| {
@@ -4849,6 +4889,7 @@ impl App {
                     self.source_watch_folder_for_path(path),
                     Some(path.clone()),
                     request.clone(),
+                    self.control_origin_for_command_path(path),
                 )
             });
         let (event_type, message) = match result {
@@ -4865,7 +4906,7 @@ impl App {
             source_path,
             correlation_id: Some(correlation_id),
             message,
-            details: control_event_details(&request, ControlOrigin::CliOnline),
+            details: control_event_details(&request, origin),
             ..Default::default()
         });
     }
@@ -5101,7 +5142,8 @@ impl App {
                 .insert(path.clone(), now);
             match &cmd {
                 AppCommand::ControlRequest { request, .. } => {
-                    if self.record_control_queued(path, request.clone()) {
+                    let origin = self.control_origin_for_command_path(&path);
+                    if self.record_control_queued(path, request.clone(), origin) {
                         self.save_state_to_disk();
                     }
                 }
@@ -5449,10 +5491,17 @@ impl App {
             return;
         }
 
+        let generation = self
+            .status_dump_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
         status::dump(
             self.generate_output_state(),
             self.shutdown_tx.clone(),
             self.is_current_shared_leader(),
+            generation,
+            self.status_dump_generation.clone(),
         );
     }
 
@@ -5973,10 +6022,11 @@ mod tests {
     };
     use crate::config::{clear_shared_config_state_for_tests, TorrentSettings};
     use crate::errors::StorageError;
+    use crate::control_service::control_event_details;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::persistence::event_journal::{
-        EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
+        ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
     };
     use crate::telemetry::ui_telemetry::UiTelemetry;
     use crate::torrent_manager::{
@@ -6558,6 +6608,69 @@ mod tests {
                 origin: IngestOrigin::WatchFolder,
                 ingest_kind: IngestKind::MagnetFile,
             }
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn control_journal_preserves_watch_folder_origin() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let queued_path = std::env::temp_dir().join("event-journal-alpha.control");
+        let request = ControlRequest::Pause {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+
+        assert!(app.record_control_queued(
+            queued_path.clone(),
+            request.clone(),
+            ControlOrigin::WatchFolder
+        ));
+        app.record_control_result(&queued_path, &request, Ok("Paused torrent".to_string()));
+
+        let entries = &app.app_state.event_journal_state.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event_type, EventType::ControlQueued);
+        assert_eq!(entries[1].event_type, EventType::ControlApplied);
+        assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
+        assert_eq!(
+            entries[0].details,
+            control_event_details(&request, ControlOrigin::WatchFolder)
+        );
+        assert_eq!(
+            entries[1].details,
+            control_event_details(&request, ControlOrigin::WatchFolder)
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn control_origin_for_ingest_path_uses_rss_origin_when_available() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let queued_path = std::env::temp_dir().join("event-journal-rss.magnet");
+
+        app.record_rss_queued(
+            queued_path.clone(),
+            IngestOrigin::RssManual,
+            IngestKind::MagnetFile,
+        );
+
+        assert_eq!(
+            app.control_origin_for_ingest_path(&queued_path),
+            ControlOrigin::RssManual
         );
 
         let _ = app.shutdown_tx.send(());

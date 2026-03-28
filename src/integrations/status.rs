@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::torrent_identity::info_hash_from_torrent_source;
 
@@ -145,6 +147,8 @@ pub fn dump(
     output_data: AppOutputState,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     mirror_to_leader_path: bool,
+    generation: u64,
+    latest_generation: Arc<AtomicU64>,
 ) {
     let file_path = host_status_file_path().unwrap_or_else(|_| {
         std::env::current_dir()
@@ -165,12 +169,21 @@ pub fn dump(
                 tracing::debug!("Status dump aborted due to application shutdown");
             }
             result = tokio::task::spawn_blocking(move || {
+                if should_skip_status_dump(generation, &latest_generation) {
+                    return Ok::<(), io::Error>(());
+                }
                 if let Some(parent) = file_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let json = serde_json::to_string_pretty(&output_data).map_err(io::Error::other)?;
+                if should_skip_status_dump(generation, &latest_generation) {
+                    return Ok::<(), io::Error>(());
+                }
                 write_string_atomically(&file_path, &json)?;
                 if let Some(leader_path) = leader_path {
+                    if should_skip_status_dump(generation, &latest_generation) {
+                        return Ok::<(), io::Error>(());
+                    }
                     if let Some(parent) = leader_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -184,6 +197,10 @@ pub fn dump(
             }
         }
     });
+}
+
+fn should_skip_status_dump(generation: u64, latest_generation: &AtomicU64) -> bool {
+    generation != latest_generation.load(Ordering::Acquire)
 }
 
 pub fn host_status_file_path() -> io::Result<PathBuf> {
@@ -354,5 +371,13 @@ mod tests {
         assert!(json.contains("\"default_download_folder\": \"/downloads\""));
         assert!(json.contains("\"1111111111111111111111111111111111111111\""));
         assert!(json.contains("Offline settings snapshot"));
+    }
+
+    #[test]
+    fn stale_status_dump_generations_are_skipped() {
+        let latest_generation = AtomicU64::new(4);
+
+        assert!(should_skip_status_dump(3, &latest_generation));
+        assert!(!should_skip_status_dump(4, &latest_generation));
     }
 }
