@@ -233,6 +233,8 @@ either:
 That makes the CLI easy to script from shells, containers, task runners, and
 other local automation.
 
+See [`docs/cli.md`](docs/cli.md) for the full CLI guide.
+
 ```bash
 # Add a magnet link
 superseedr add "magnet:?xt=urn:btih:..."
@@ -256,8 +258,9 @@ superseedr to-standalone
 superseedr stop-client
 ```
 
-See [`docs/shared-config.md`](docs/shared-config.md) for shared CLI behavior,
-offline behavior, and leader/follower routing.
+See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
+[`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
+routing.
 
 ### 3. Status API & Monitoring
 For external dashboards, health checks, and lightweight automation, Superseedr

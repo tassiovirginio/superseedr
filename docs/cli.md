@@ -1,0 +1,438 @@
+# CLI Guide
+
+## What The CLI Is For
+
+The Superseedr CLI is the main user-facing control surface for scripting,
+automation, and headless operation.
+
+It works in:
+
+- standalone mode
+- shared cluster mode
+- online mode with a running client
+- offline mode from persisted state when supported
+
+The CLI is file-oriented rather than network-oriented. Commands either talk to a
+running client through local/shared control files or operate directly on
+persisted state when offline behavior is supported.
+
+## Global Options
+
+### `--json`
+
+Return structured JSON output instead of text output.
+
+Example:
+
+```bash
+superseedr --json status
+```
+
+## Quick Start
+
+Add a torrent:
+
+```bash
+superseedr add "/path/to/example.torrent"
+```
+
+Add a magnet:
+
+```bash
+superseedr add "magnet:?xt=urn:btih:..."
+```
+
+Inspect current state:
+
+```bash
+superseedr status
+superseedr torrents
+superseedr journal
+```
+
+Pause and resume:
+
+```bash
+superseedr pause <INFO_HASH_HEX_OR_PATH>
+superseedr resume <INFO_HASH_HEX_OR_PATH>
+```
+
+## Targeting Torrents
+
+Many commands accept either:
+
+- `INFO_HASH_HEX`
+- a unique file path belonging to the torrent
+
+Supported commands:
+
+- `info`
+- `files`
+- `pause`
+- `resume`
+- `remove`
+- `purge`
+- `priority`
+
+Behavior:
+
+- if the target is already an info hash, Superseedr uses it directly
+- if the target is a file path, Superseedr reverse-resolves it to the owning torrent
+- if the file path matches more than one torrent, the command fails and asks for the info hash
+- if no torrent matches, the command returns an error
+
+## Command Reference
+
+### `add`
+
+```bash
+superseedr add <INPUT>...
+```
+
+Add one or more torrent file paths or magnet links.
+
+Inputs can be:
+
+- `.torrent` paths
+- magnet links
+
+In shared mode, cross-host `.path` adds are portable when the `.torrent` file
+is on the shared root.
+
+### `stop-client`
+
+```bash
+superseedr stop-client
+```
+
+Request graceful shutdown of the running client.
+
+Behavior:
+
+- standalone mode: targets the local running client
+- shared mode: targets the current leader through the shared inbox
+
+### `journal`
+
+```bash
+superseedr journal
+```
+
+Show the event journal.
+
+Behavior:
+
+- text mode: human-readable entries
+- `--json`: structured JSON envelope
+- shared mode: merged view of shared command events and host-local runtime events
+
+### `set-shared-config`
+
+```bash
+superseedr set-shared-config <PATH>
+```
+
+Persist the shared mount root for launcher and protocol-handler starts.
+
+Accepted forms:
+
+- the shared mount root
+- an explicit `.../superseedr-config` path
+
+Superseedr normalizes both to the shared mount root.
+
+### `clear-shared-config`
+
+```bash
+superseedr clear-shared-config
+```
+
+Remove the persisted shared-config launcher setting.
+
+### `show-shared-config`
+
+```bash
+superseedr show-shared-config
+```
+
+Show whether shared mode is enabled, the effective shared selection, and the
+source of that selection.
+
+Shared-config precedence is:
+
+1. `SUPERSEEDR_SHARED_CONFIG_DIR`
+2. persisted launcher shared-config sidecar
+3. normal standalone mode
+
+### `set-host-id`
+
+```bash
+superseedr set-host-id <HOST_ID>
+```
+
+Persist an explicit host identity for shared mode.
+
+This is optional. If you do not set one, Superseedr derives a host identity
+automatically.
+
+### `clear-host-id`
+
+```bash
+superseedr clear-host-id
+```
+
+Remove the persisted shared host identity.
+
+### `show-host-id`
+
+```bash
+superseedr show-host-id
+```
+
+Show the effective host identity and its source.
+
+Host-id precedence is:
+
+1. `SUPERSEEDR_SHARED_HOST_ID`
+2. persisted launcher host-id sidecar
+3. hostname fallback
+
+### `to-shared`
+
+```bash
+superseedr to-shared <PATH>
+```
+
+Convert the current standalone config into layered shared config at the given
+shared root.
+
+### `to-standalone`
+
+```bash
+superseedr to-standalone
+```
+
+Convert the active shared config back into local standalone config.
+
+### `torrents`
+
+```bash
+superseedr torrents
+```
+
+List configured torrents.
+
+### `info`
+
+```bash
+superseedr info <INFO_HASH_HEX_OR_PATH>
+```
+
+Show a single torrent by info hash or unique file path.
+
+### `status`
+
+```bash
+superseedr status [--follow | --stop | --interval <SECONDS>]
+```
+
+Read status, stream status updates, or adjust standalone runtime status dumping.
+
+Behavior:
+
+- plain `status`: prints one current snapshot
+- `--follow`: continuously prints new status snapshots
+- `--interval <SECONDS>`: changes standalone runtime dump interval
+- `--stop`: stops standalone runtime status dumping
+
+Shared-mode rules:
+
+- shared CLI status follows the current leader snapshot
+- `status --follow` works in shared mode
+- non-stream start/stop controls are not supported in shared mode because shared leaders always keep cluster status snapshots enabled
+- if no shared leader is running, `status` falls back to offline shared state
+
+### `pause`
+
+```bash
+superseedr pause <INFO_HASH_HEX_OR_PATH>...
+```
+
+Pause one or more torrents.
+
+### `resume`
+
+```bash
+superseedr resume <INFO_HASH_HEX_OR_PATH>...
+```
+
+Resume one or more torrents.
+
+### `remove`
+
+```bash
+superseedr remove <INFO_HASH_HEX_OR_PATH>...
+```
+
+Remove one or more torrents from desired state without deleting payload data.
+
+### `purge`
+
+```bash
+superseedr purge <INFO_HASH_HEX_OR_PATH>...
+```
+
+Remove one or more torrents and delete payload data when the file layout can be
+resolved safely.
+
+### `files`
+
+```bash
+superseedr files <INFO_HASH_HEX_OR_PATH>
+```
+
+List files for a torrent, including relative and resolved full paths when
+available.
+
+### `priority`
+
+```bash
+superseedr priority <INFO_HASH_HEX_OR_PATH> (--file-index <N> | --file-path <PATH>) <normal|high|skip>
+```
+
+Set priority for one file within a torrent.
+
+Target the file by:
+
+- `--file-index`
+- `--file-path`
+
+## Online And Offline Behavior
+
+### Standalone Online
+
+With a running standalone client, control commands queue to the local runtime.
+
+Examples:
+
+- `pause`
+- `resume`
+- `remove`
+- `priority`
+- `stop-client`
+
+### Standalone Offline
+
+When no standalone runtime is running, supported commands operate from persisted
+local state.
+
+Offline-capable read commands:
+
+- `status`
+- `journal`
+- `torrents`
+- `info`
+- `files`
+
+Offline-capable mutation commands:
+
+- `pause`
+- `resume`
+- `remove`
+- `priority`
+- `purge` when the file layout can be resolved safely
+
+### Shared Online
+
+With a running shared leader:
+
+- shared read commands follow cluster state
+- mutating commands queue through the shared inbox for the leader
+
+Examples:
+
+- follower-issued `pause` is queued and applied by the leader
+- shared `status` reads the leader snapshot
+
+### Shared Offline
+
+When shared mode is enabled but no leader is running:
+
+- shared `status` falls back to offline shared state
+- offline-capable shared mutations write shared config directly instead of queueing
+
+Offline-capable shared mutations:
+
+- `pause`
+- `resume`
+- `remove`
+- `priority`
+- `purge` when the file layout can be resolved safely
+
+## Shared Mode Notes
+
+### Cross-Host `.torrent` Adds
+
+In shared mode, a `.torrent` path is only portable across hosts if the `.torrent`
+file lives on the shared root.
+
+Good:
+
+```bash
+superseedr add "/shared/root/shared-fixtures/example.torrent"
+```
+
+Not portable across hosts:
+
+```bash
+superseedr add "/home/me/local-only/example.torrent"
+```
+
+Magnet links are naturally portable across hosts.
+
+### Shared Status Behavior
+
+Shared leaders always keep cluster status snapshots enabled.
+
+That means:
+
+- `status --follow` is supported in shared mode
+- `status --interval ...` is not supported in shared mode
+- `status --stop` is not supported in shared mode
+
+### Shared Root Requirements
+
+Shared runtime startup requires:
+
+- an existing shared root
+- a writable shared root
+- write access to the host-specific shared runtime area
+
+If the shared root is missing or not writable, startup fails with an explicit
+shared-root accessibility error.
+
+See [`docs/shared-config.md`](shared-config.md) for the full shared-mode and
+cluster guide.
+
+## JSON Output
+
+With `--json`, successful commands return a common envelope:
+
+```json
+{
+  "ok": true,
+  "command": "status",
+  "data": {}
+}
+```
+
+Errors return:
+
+```json
+{
+  "ok": false,
+  "command": "status",
+  "error": "..."
+}
+```
+
