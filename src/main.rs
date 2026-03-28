@@ -910,31 +910,11 @@ fn process_shared_status_request(
                 last_modified_at = status_file_modified_at()?;
             }
         }
-        ControlRequest::StatusFollowStart { .. } => {
-            let status_path = status_file_path()?;
-            print_success(
-                output_mode,
-                "status",
-                &format!(
-                    "Cluster mode status follows the current leader snapshot.\nStatus file: {}",
-                    status_path.display()
-                ),
-                json!({
-                    "message": "Cluster mode status follows the current leader snapshot.",
-                    "status_file": status_path,
-                }),
-            );
-            Ok(())
-        }
-        ControlRequest::StatusFollowStop => {
-            print_success(
-                output_mode,
-                "status",
-                "Cluster mode status streaming follows the current leader snapshot.",
-                json!({ "message": "Cluster mode status streaming follows the current leader snapshot." }),
-            );
-            Ok(())
-        }
+        ControlRequest::StatusFollowStart { .. } | ControlRequest::StatusFollowStop => Err(
+            io::Error::other(
+                "Shared mode leader status snapshots are always enabled every 5 seconds; start/stop is not supported in shared mode",
+            ),
+        ),
         _ => unreachable!("status request handler received non-status control request"),
     }
 }
@@ -1726,5 +1706,37 @@ mod tests {
             json!("C:\\sample\\sidecar.toml")
         );
         assert_eq!(optional_path_json(None), Value::Null);
+    }
+
+    #[test]
+    fn shared_status_follow_start_returns_error_for_non_stream_requests() {
+        let error = process_shared_status_request(
+            &Settings::default(),
+            &ControlRequest::StatusFollowStart { interval_secs: 5 },
+            false,
+            true,
+            OutputMode::Text,
+        )
+        .expect_err("shared status follow start should error");
+
+        assert!(error.to_string().contains(
+            "Shared mode leader status snapshots are always enabled every 5 seconds"
+        ));
+    }
+
+    #[test]
+    fn shared_status_follow_stop_returns_error() {
+        let error = process_shared_status_request(
+            &Settings::default(),
+            &ControlRequest::StatusFollowStop,
+            false,
+            true,
+            OutputMode::Text,
+        )
+        .expect_err("shared status follow stop should error");
+
+        assert!(error.to_string().contains(
+            "Shared mode leader status snapshots are always enabled every 5 seconds"
+        ));
     }
 }
