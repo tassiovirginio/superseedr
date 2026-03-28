@@ -13,6 +13,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 use crate::app::FilePriority;
@@ -475,28 +476,11 @@ enum ConfigBackend {
     Shared(SharedConfigBackend),
 }
 
-#[derive(Clone, Debug)]
-struct SharedConfigState {
-    paths: SharedConfigPaths,
-    layered: LayeredConfig,
-    resolved_settings: Settings,
-    settings_fingerprint: Option<String>,
-    catalog_fingerprint: Option<String>,
-    metadata_fingerprint: Option<String>,
-    host_fingerprint: Option<String>,
-}
-
-static SHARED_CONFIG_STATE: OnceLock<Mutex<Option<SharedConfigState>>> = OnceLock::new();
-
 #[cfg(test)]
 static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
 
 #[cfg(test)]
 static SHARED_ENV_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn shared_config_state() -> &'static Mutex<Option<SharedConfigState>> {
-    SHARED_CONFIG_STATE.get_or_init(|| Mutex::new(None))
-}
 
 #[cfg(test)]
 fn app_paths_override() -> &'static Mutex<Option<(PathBuf, PathBuf)>> {
@@ -1284,6 +1268,7 @@ where
     toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+#[cfg(test)]
 fn fingerprint_for_path(path: &Path) -> io::Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -1293,6 +1278,7 @@ fn fingerprint_for_path(path: &Path) -> io::Result<Option<String>> {
     Ok(Some(hex::encode(Sha1::digest(bytes))))
 }
 
+#[cfg(test)]
 fn ensure_fingerprint_matches(
     path: &Path,
     expected: &Option<String>,
@@ -1403,11 +1389,7 @@ fn bootstrap_shared_host_config(paths: &SharedConfigPaths) -> io::Result<HostCon
     Ok(host)
 }
 
-fn clear_shared_config_state() {
-    if let Ok(mut guard) = shared_config_state().lock() {
-        *guard = None;
-    }
-}
+fn clear_shared_config_state() {}
 
 #[cfg(test)]
 pub(crate) fn clear_shared_config_state_for_tests() {
@@ -1466,6 +1448,36 @@ fn runtime_lock_is_held(lock_path: Option<&Path>) -> bool {
         Ok(()) => false,
         Err(_) => true,
     }
+}
+
+fn load_current_shared_layered(
+    paths: &SharedConfigPaths,
+    bootstrap_missing_host: bool,
+) -> io::Result<(LayeredConfig, TorrentMetadataConfig)> {
+    let settings: SharedSettingsConfig = read_toml_or_default(&paths.settings_path)?;
+    let catalog: CatalogConfig = read_toml_or_default(&paths.catalog_path)?;
+    let metadata: TorrentMetadataConfig = read_toml_or_default(&paths.metadata_path)?;
+    let host = if paths.host_path.exists() {
+        read_toml_or_default(&paths.host_path)?
+    } else if bootstrap_missing_host {
+        tracing_event!(
+            Level::INFO,
+            "Bootstrapping missing shared host config at {:?}",
+            paths.host_path
+        );
+        bootstrap_shared_host_config(paths)?
+    } else {
+        return Err(client_never_started_error());
+    };
+
+    Ok((
+        LayeredConfig {
+            settings,
+            catalog,
+            host,
+        },
+        metadata,
+    ))
 }
 
 impl NormalConfigBackend {
@@ -1552,49 +1564,12 @@ impl NormalConfigBackend {
 impl SharedConfigBackend {
     fn load_settings(&self) -> io::Result<Settings> {
         validate_shared_runtime_root(&self.paths)?;
-        let settings_config: SharedSettingsConfig =
-            read_toml_or_default(&self.paths.settings_path)?;
-        let catalog: CatalogConfig = read_toml_or_default(&self.paths.catalog_path)?;
-        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
-        let host = if self.paths.host_path.exists() {
-            read_toml_or_default(&self.paths.host_path)?
-        } else {
-            tracing_event!(
-                Level::INFO,
-                "Bootstrapping missing shared host config at {:?}",
-                self.paths.host_path
-            );
-            bootstrap_shared_host_config(&self.paths)?
-        };
-
-        let layered = LayeredConfig {
-            settings: settings_config,
-            catalog,
-            host,
-        };
+        let (layered, metadata) = load_current_shared_layered(&self.paths, true)?;
         let mut resolved_settings =
             layered.resolve_shared_settings(&self.paths.mount_dir, &self.paths.root_dir)?;
         apply_metadata_to_settings(&mut resolved_settings, &metadata);
         let resolved_settings = apply_env_overrides(&resolved_settings)?;
         validate_shared_runtime_settings(&resolved_settings, &self.paths.mount_dir)?;
-        let settings_fingerprint = fingerprint_for_path(&self.paths.settings_path)?;
-        let catalog_fingerprint = fingerprint_for_path(&self.paths.catalog_path)?;
-        let metadata_fingerprint = fingerprint_for_path(&self.paths.metadata_path)?;
-        let host_fingerprint = fingerprint_for_path(&self.paths.host_path)?;
-
-        let mut guard = shared_config_state()
-            .lock()
-            .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
-        *guard = Some(SharedConfigState {
-            paths: self.paths.clone(),
-            layered,
-            resolved_settings: resolved_settings.clone(),
-            settings_fingerprint,
-            catalog_fingerprint,
-            metadata_fingerprint,
-            host_fingerprint,
-        });
-
         Ok(resolved_settings)
     }
 
@@ -1604,135 +1579,66 @@ impl SharedConfigBackend {
             return Err(client_never_started_error());
         }
 
-        let settings_config: SharedSettingsConfig =
-            read_toml_or_default(&self.paths.settings_path)?;
-        let catalog: CatalogConfig = read_toml_or_default(&self.paths.catalog_path)?;
-        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
-        let host = if self.paths.host_path.exists() {
-            read_toml_or_default(&self.paths.host_path)?
-        } else {
-            tracing_event!(
-                Level::INFO,
-                "Bootstrapping missing shared host config at {:?} for CLI load",
-                self.paths.host_path
-            );
-            bootstrap_shared_host_config(&self.paths)?
-        };
-
-        let layered = LayeredConfig {
-            settings: settings_config,
-            catalog,
-            host,
-        };
+        let (layered, metadata) = load_current_shared_layered(&self.paths, true)?;
         let mut resolved_settings =
             layered.resolve_shared_settings(&self.paths.mount_dir, &self.paths.root_dir)?;
         apply_metadata_to_settings(&mut resolved_settings, &metadata);
         let resolved_settings = apply_env_overrides(&resolved_settings)?;
         validate_shared_runtime_settings(&resolved_settings, &self.paths.mount_dir)?;
-        let settings_fingerprint = fingerprint_for_path(&self.paths.settings_path)?;
-        let catalog_fingerprint = fingerprint_for_path(&self.paths.catalog_path)?;
-        let metadata_fingerprint = fingerprint_for_path(&self.paths.metadata_path)?;
-        let host_fingerprint = fingerprint_for_path(&self.paths.host_path)?;
-
-        let mut guard = shared_config_state()
-            .lock()
-            .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
-        *guard = Some(SharedConfigState {
-            paths: self.paths.clone(),
-            layered,
-            resolved_settings: resolved_settings.clone(),
-            settings_fingerprint,
-            catalog_fingerprint,
-            metadata_fingerprint,
-            host_fingerprint,
-        });
-
         Ok(resolved_settings)
     }
 
     fn save_settings(&self, settings: &Settings) -> io::Result<()> {
         validate_shared_runtime_settings(settings, &self.paths.mount_dir)?;
-
-        let mut guard = shared_config_state()
-            .lock()
-            .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| io::Error::other("Shared config mode was not loaded before save"))?;
-
-        ensure_fingerprint_matches(
-            &state.paths.settings_path,
-            &state.settings_fingerprint,
-            "Shared settings",
-        )?;
-        ensure_fingerprint_matches(
-            &state.paths.catalog_path,
-            &state.catalog_fingerprint,
-            "Shared catalog",
-        )?;
-        ensure_fingerprint_matches(
-            &state.paths.metadata_path,
-            &state.metadata_fingerprint,
-            "Shared torrent metadata",
-        )?;
-        ensure_fingerprint_matches(
-            &state.paths.host_path,
-            &state.host_fingerprint,
-            "Shared host config",
-        )?;
+        // Shared writes currently rely on the shared leader lock to preserve a
+        // single-writer model. If future features introduce concurrent shared
+        // writers, this reload-on-save path will need explicit conflict
+        // detection or merge handling before writing.
+        let (current_layered, existing_metadata) = load_current_shared_layered(&self.paths, true)?;
 
         let next_layered = LayeredConfig::from_shared_settings(
             settings,
-            &state.paths.mount_dir,
-            &state.paths.root_dir,
-            state
-                .layered
+            &self.paths.mount_dir,
+            &self.paths.root_dir,
+            current_layered
                 .host
                 .client_id
                 .as_ref()
-                .map(|_| state.layered.settings.client_id.as_str()),
+                .map(|_| current_layered.settings.client_id.as_str()),
         )?;
 
-        let shared_settings_changed =
-            next_layered.settings != state.layered.settings || state.settings_fingerprint.is_none();
+        let shared_settings_changed = next_layered.settings != current_layered.settings;
         if shared_settings_changed {
-            state.settings_fingerprint = write_toml_atomically_with_fingerprint(
+            let _ = write_toml_atomically_with_fingerprint(
                 &self.paths.settings_path,
                 &next_layered.settings,
             )?;
         }
 
-        let shared_catalog_changed =
-            next_layered.catalog != state.layered.catalog || state.catalog_fingerprint.is_none();
+        let shared_catalog_changed = next_layered.catalog != current_layered.catalog;
         if shared_catalog_changed {
-            state.catalog_fingerprint = write_toml_atomically_with_fingerprint(
+            let _ = write_toml_atomically_with_fingerprint(
                 &self.paths.catalog_path,
                 &next_layered.catalog,
             )?;
         }
 
-        let existing_metadata: TorrentMetadataConfig =
-            read_toml_or_default(&self.paths.metadata_path)?;
         let next_metadata =
             sync_torrent_metadata_with_settings(existing_metadata.clone(), settings);
-        let shared_metadata_changed =
-            next_metadata != existing_metadata || state.metadata_fingerprint.is_none();
+        let shared_metadata_changed = next_metadata != existing_metadata;
         if shared_metadata_changed {
-            state.metadata_fingerprint =
+            let _ =
                 write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
         }
 
-        if next_layered.host != state.layered.host || state.host_fingerprint.is_none() {
-            state.host_fingerprint =
+        if next_layered.host != current_layered.host {
+            let _ =
                 write_toml_atomically_with_fingerprint(&self.paths.host_path, &next_layered.host)?;
         }
 
         if shared_settings_changed || shared_catalog_changed || shared_metadata_changed {
             write_shared_cluster_revision_marker(&self.paths.root_dir)?;
         }
-
-        state.layered = next_layered;
-        state.resolved_settings = settings.clone();
         Ok(())
     }
 }
@@ -1801,23 +1707,13 @@ impl ConfigBackend {
                 Ok(())
             }
             ConfigBackend::Shared(backend) => {
-                let mut guard = shared_config_state()
-                    .lock()
-                    .map_err(|_| io::Error::other("Shared config state lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    io::Error::other("Shared config mode was not loaded before metadata update")
-                })?;
-
-                ensure_fingerprint_matches(
-                    &state.paths.metadata_path,
-                    &state.metadata_fingerprint,
-                    "Shared torrent metadata",
-                )?;
-
+                // This shared metadata update is safe under today's lock-based
+                // single-writer model. If concurrent shared writers are added
+                // later, restore conflict detection here before writing.
                 let mut metadata: TorrentMetadataConfig =
                     read_toml_or_default(&backend.paths.metadata_path)?;
                 upsert_torrent_metadata_entry(&mut metadata, entry);
-                state.metadata_fingerprint = write_toml_atomically_with_fingerprint(
+                let _ = write_toml_atomically_with_fingerprint(
                     &backend.paths.metadata_path,
                     &metadata,
                 )?;

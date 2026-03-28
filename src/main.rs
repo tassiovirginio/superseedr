@@ -1812,4 +1812,47 @@ mod tests {
         }
         clear_shared_config_state_for_tests();
     }
+
+    #[test]
+    fn shared_cli_acquires_shared_lock_when_no_leader_is_running() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path().join("shared-root");
+        std::fs::create_dir_all(&shared_root).expect("create shared root");
+        let previous_shared_dir = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let previous_host_id = std::env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", &shared_root);
+        std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", "host-a");
+        clear_shared_config_state_for_tests();
+        let shared_lock = shared_lock_path().expect("shared lock path");
+        let shared_lock_parent = shared_lock.parent().expect("shared lock parent");
+        std::fs::create_dir_all(shared_lock_parent).expect("create shared config root");
+
+        let first = try_acquire_app_lock().expect("acquire shared cli lock");
+        assert!(
+            first.is_some(),
+            "first shared cli lock attempt should succeed"
+        );
+
+        let second = try_acquire_app_lock().expect("second shared cli lock attempt");
+        assert!(
+            second.is_none(),
+            "second shared cli lock attempt should observe an existing holder"
+        );
+
+        drop(first);
+
+        if let Some(value) = previous_shared_dir {
+            std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = previous_host_id {
+            std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
 }
