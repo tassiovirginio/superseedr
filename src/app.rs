@@ -2008,18 +2008,53 @@ impl App {
         }
     }
 
-    fn archive_processed_ingest(&self, source: IngestSource, path: &Path) {
-        if !self.should_archive_processed_ingest(source, path) {
+    fn update_pending_ingest_source_path(&mut self, path: &Path, final_path: PathBuf) {
+        let correlation_id = self
+            .app_state
+            .pending_ingest_by_path
+            .get_mut(path)
+            .map(|record| {
+                record.source_path = final_path.clone();
+                record.correlation_id.clone()
+            });
+
+        let Some(correlation_id) = correlation_id else {
             return;
+        };
+
+        for entry in self.app_state.event_journal_state.entries.iter_mut().rev() {
+            if entry.category != EventCategory::Ingest {
+                continue;
+            }
+            if entry.correlation_id.as_deref() != Some(correlation_id.as_str()) {
+                continue;
+            }
+            entry.source_path = Some(final_path.clone());
+            if entry.event_type == EventType::IngestQueued {
+                break;
+            }
+        }
+    }
+
+    fn archive_processed_ingest(&mut self, source: IngestSource, path: &Path) -> Option<PathBuf> {
+        if !self.should_archive_processed_ingest(source, path) {
+            return None;
         }
 
-        if let Err(error) = archive_watch_file(path, source.processed_archive_extension()) {
-            tracing_event!(
-                Level::WARN,
-                "Failed to archive processed ingest file {:?}: {}",
-                path,
-                error
-            );
+        match archive_watch_file(path, source.processed_archive_extension()) {
+            Ok(destination) => {
+                self.update_pending_ingest_source_path(path, destination.clone());
+                Some(destination)
+            }
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to archive processed ingest file {:?}: {}",
+                    path,
+                    error
+                );
+                None
+            }
         }
     }
 
@@ -2029,13 +2064,15 @@ impl App {
             .map_err(|_| "Failed to parse torrent file for preview.".to_string())?;
 
         let final_path = if self.is_host_watch_path(&path) || self.is_shared_inbox_path(&path) {
-            let mut new_path = path.clone();
-            new_path.set_extension("torrent.added");
-            if let Err(error) = fs::rename(&path, &new_path) {
-                tracing::error!("Failed to rename watched file: {}", error);
-                path.clone()
-            } else {
-                new_path
+            match archive_watch_file(&path, "torrent.added") {
+                Ok(final_path) => {
+                    self.update_pending_ingest_source_path(&path, final_path.clone());
+                    final_path
+                }
+                Err(error) => {
+                    tracing::error!("Failed to archive watched file for manual add: {}", error);
+                    path.clone()
+                }
             }
         } else {
             path.clone()
@@ -6020,9 +6057,11 @@ mod tests {
         SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState, TorrentMetrics,
         TorrentSortColumn, UiState,
     };
-    use crate::config::{clear_shared_config_state_for_tests, TorrentSettings};
-    use crate::errors::StorageError;
+    use crate::config::{
+        clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
+    };
     use crate::control_service::control_event_details;
+    use crate::errors::StorageError;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::persistence::event_journal::{
@@ -6674,6 +6713,131 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn manual_torrent_browser_moves_standalone_watch_file_to_processed_and_updates_journal() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        let watch_dir = data_dir.join("watch_files");
+        let processed_dir = data_dir.join("processed_files");
+        std::fs::create_dir_all(&watch_dir).expect("create watch dir");
+        set_app_paths_override_for_tests(Some((config_dir, data_dir.clone())));
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("integration_tests")
+            .join("torrents")
+            .join("v1")
+            .join("single_4k.bin.torrent");
+        let watched_path = watch_dir.join("manual-input.torrent");
+        std::fs::copy(&fixture, &watched_path).expect("copy fixture");
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        app.record_watch_path_discovered(&watched_path);
+        app.open_manual_browser_for_torrent_file(watched_path.clone())
+            .expect("open manual browser");
+
+        let final_path = processed_dir.join("manual-input.torrent");
+        assert_eq!(app.app_state.pending_torrent_path, Some(final_path.clone()));
+        assert!(final_path.exists());
+        assert!(!watched_path.exists());
+        assert_eq!(
+            app.app_state
+                .event_journal_state
+                .entries
+                .iter()
+                .find(|entry| entry.event_type == EventType::IngestQueued)
+                .and_then(|entry| entry.source_path.clone()),
+            Some(final_path)
+        );
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn manual_torrent_browser_moves_shared_inbox_file_to_shared_processed_and_updates_journal(
+    ) {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+        std::fs::create_dir_all(effective_root.join("inbox")).expect("create shared inbox");
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("integration_tests")
+            .join("torrents")
+            .join("v1")
+            .join("single_4k.bin.torrent");
+        let watched_path = effective_root.join("inbox").join("manual-input.torrent");
+        std::fs::copy(&fixture, &watched_path).expect("copy fixture");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let mut app = App::new(settings, AppRuntimeMode::SharedLeader)
+            .await
+            .expect("build shared app");
+
+        assert!(app.record_ingest_queued(
+            watched_path.clone(),
+            IngestOrigin::WatchFolder,
+            IngestKind::TorrentFile,
+            crate::config::shared_inbox_path(),
+        ));
+        app.open_manual_browser_for_torrent_file(watched_path.clone())
+            .expect("open manual browser");
+
+        let final_path = effective_root
+            .join("processed")
+            .join("manual-input.torrent");
+        assert_eq!(app.app_state.pending_torrent_path, Some(final_path.clone()));
+        assert!(final_path.exists());
+        assert!(!watched_path.exists());
+        assert_eq!(
+            app.app_state
+                .event_journal_state
+                .entries
+                .iter()
+                .find(|entry| entry.event_type == EventType::IngestQueued)
+                .and_then(|entry| entry.source_path.clone()),
+            Some(final_path)
+        );
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
     }
 
     #[tokio::test]

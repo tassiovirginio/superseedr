@@ -12,6 +12,8 @@ use tracing::{event as tracing_event, Level};
 const EVENT_JOURNAL_FILE_NAME: &str = "event_journal.toml";
 const SHARED_EVENT_JOURNAL_FILE_NAME: &str = "shared_event_journal.toml";
 pub const EVENT_JOURNAL_CAP: usize = 5_000;
+pub const EVENT_JOURNAL_HEALTH_CAP: usize = 1_500;
+pub const EVENT_JOURNAL_OPERATOR_CAP: usize = EVENT_JOURNAL_CAP - EVENT_JOURNAL_HEALTH_CAP;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -229,10 +231,38 @@ pub fn event_journal_json() -> io::Result<String> {
 }
 
 pub fn enforce_event_journal_retention(state: &mut EventJournalState) {
-    if state.entries.len() > EVENT_JOURNAL_CAP {
-        let overflow = state.entries.len() - EVENT_JOURNAL_CAP;
-        state.entries.drain(0..overflow);
-    }
+    let mut retained = state
+        .entries
+        .iter()
+        .rev()
+        .scan((0usize, 0usize), |(operator_count, health_count), entry| {
+            let keep = match entry.category {
+                EventCategory::DataHealth => {
+                    if *health_count < EVENT_JOURNAL_HEALTH_CAP {
+                        *health_count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                EventCategory::Ingest
+                | EventCategory::Control
+                | EventCategory::TorrentLifecycle => {
+                    if *operator_count < EVENT_JOURNAL_OPERATOR_CAP {
+                        *operator_count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            Some((keep, entry.clone()))
+        })
+        .filter_map(|(keep, entry)| keep.then_some(entry))
+        .collect::<Vec<_>>();
+
+    retained.reverse();
+    state.entries = retained;
 }
 
 pub fn append_event_journal_entry(state: &mut EventJournalState, mut entry: EventJournalEntry) {
@@ -347,20 +377,40 @@ mod tests {
     #[test]
     fn retention_prunes_oldest_entries() {
         let mut state = EventJournalState {
-            next_id: (EVENT_JOURNAL_CAP + 2) as u64,
-            entries: (0..EVENT_JOURNAL_CAP + 1)
+            next_id: (EVENT_JOURNAL_CAP + 3) as u64,
+            entries: (0..(EVENT_JOURNAL_OPERATOR_CAP + 2))
                 .map(|idx| EventJournalEntry {
                     id: idx as u64,
                     ts_iso: format!("2026-03-15T12:00:{idx:02}Z"),
+                    category: EventCategory::Control,
                     ..Default::default()
                 })
+                .chain(
+                    (0..(EVENT_JOURNAL_HEALTH_CAP + 2)).map(|idx| EventJournalEntry {
+                        id: (EVENT_JOURNAL_OPERATOR_CAP + 2 + idx) as u64,
+                        ts_iso: format!("2026-03-15T13:00:{idx:02}Z"),
+                        category: EventCategory::DataHealth,
+                        ..Default::default()
+                    }),
+                )
                 .collect(),
         };
 
         enforce_event_journal_retention(&mut state);
 
         assert_eq!(state.entries.len(), EVENT_JOURNAL_CAP);
-        assert_eq!(state.entries.first().map(|entry| entry.id), Some(1));
+        let retained_controls = state
+            .entries
+            .iter()
+            .filter(|entry| entry.category == EventCategory::Control)
+            .count();
+        let retained_health = state
+            .entries
+            .iter()
+            .filter(|entry| entry.category == EventCategory::DataHealth)
+            .count();
+        assert_eq!(retained_controls, EVENT_JOURNAL_OPERATOR_CAP);
+        assert_eq!(retained_health, EVENT_JOURNAL_HEALTH_CAP);
     }
 
     #[test]

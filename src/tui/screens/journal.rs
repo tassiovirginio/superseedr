@@ -122,6 +122,36 @@ fn source_label(entry: &EventJournalEntry) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn live_completion_percent(entry: &EventJournalEntry, app_state: &AppState) -> Option<f64> {
+    if let Some(info_hash_hex) = entry.info_hash_hex.as_deref() {
+        if let Some(display) = app_state
+            .torrents
+            .iter()
+            .find(|(info_hash, _)| hex::encode(info_hash.as_slice()) == info_hash_hex)
+            .map(|(_, display)| display)
+        {
+            return Some(crate::app::torrent_completion_percent(
+                &display.latest_state,
+            ));
+        }
+    }
+
+    entry.torrent_name.as_ref().and_then(|torrent_name| {
+        app_state
+            .torrents
+            .values()
+            .filter(|display| display.latest_state.torrent_name == *torrent_name)
+            .map(|display| crate::app::torrent_completion_percent(&display.latest_state))
+            .max_by(|left, right| left.total_cmp(right))
+    })
+}
+
+fn progress_label(entry: &EventJournalEntry, app_state: &AppState) -> String {
+    live_completion_percent(entry, app_state)
+        .map(|pct| format!("{pct:.0}%"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn pretty_timestamp(ts_iso: &str) -> String {
     DateTime::parse_from_rfc3339(ts_iso)
         .map(|dt| {
@@ -226,6 +256,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             Row::new(vec![
                 Cell::from(pretty_timestamp(&entry.ts_iso)),
                 Cell::from(event_type_label(entry)),
+                Cell::from(progress_label(entry, app_state)),
                 Cell::from(
                     entry
                         .torrent_name
@@ -242,12 +273,13 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         [
             Constraint::Length(17),
             Constraint::Length(10),
-            Constraint::Percentage(47),
-            Constraint::Percentage(26),
+            Constraint::Length(8),
+            Constraint::Percentage(41),
+            Constraint::Percentage(24),
         ],
     )
     .header(
-        Row::new(vec!["Time", "Event", "Torrent", "Source"]).style(
+        Row::new(vec!["Time", "Event", "Done", "Torrent", "Source"]).style(
             ctx.apply(
                 Style::default()
                     .fg(ctx.theme.semantic.subtext0)
@@ -297,6 +329,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{TorrentDisplayState, TorrentMetrics};
     use crate::persistence::event_journal::{EventCategory, EventJournalState};
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use std::path::Path;
@@ -382,5 +415,28 @@ mod tests {
     fn pretty_timestamp_formats_rfc3339_values() {
         let label = pretty_timestamp("2026-03-15T14:26:28Z");
         assert!(label.contains("Mar"));
+    }
+
+    #[test]
+    fn progress_label_uses_live_torrent_metrics_when_info_hash_matches() {
+        let mut app_state = base_state();
+        let info_hash = vec![0x11; 20];
+        app_state.event_journal_state.entries[0].info_hash_hex = Some(hex::encode(&info_hash));
+        app_state.torrents.insert(
+            info_hash,
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    number_of_pieces_total: 10,
+                    number_of_pieces_completed: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            progress_label(&app_state.event_journal_state.entries[0], &app_state),
+            "40%"
+        );
     }
 }
