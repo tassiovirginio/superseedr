@@ -1719,9 +1719,9 @@ mod tests {
         )
         .expect_err("shared status follow start should error");
 
-        assert!(error.to_string().contains(
-            "Shared mode leader status snapshots are always enabled every 5 seconds"
-        ));
+        assert!(error
+            .to_string()
+            .contains("Shared mode leader status snapshots are always enabled every 5 seconds"));
     }
 
     #[test]
@@ -1735,8 +1735,8 @@ mod tests {
         )
         .expect_err("shared status follow stop should error");
 
-        assert!(error.to_string().contains(
-            "Shared mode leader status snapshots are always enabled every 5 seconds"
-        ));
+        assert!(error
+            .to_string()
+            .contains("Shared mode leader status snapshots are always enabled every 5 seconds"));
     }
 }
