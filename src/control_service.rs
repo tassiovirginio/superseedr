@@ -20,15 +20,29 @@ use std::path::PathBuf;
 type TorrentFileList = Vec<(Vec<String>, u64)>;
 type TorrentMetadataByInfoHash = HashMap<String, TorrentMetadataEntry>;
 
-fn load_torrent_metadata_snapshot() -> Option<TorrentMetadataByInfoHash> {
-    let metadata = load_torrent_metadata().ok()?;
-    Some(
-        metadata
-            .torrents
-            .into_iter()
-            .map(|entry| (entry.info_hash_hex.clone(), entry))
-            .collect(),
-    )
+fn load_torrent_metadata_snapshot() -> Result<TorrentMetadataByInfoHash, String> {
+    let metadata = match load_torrent_metadata() {
+        Ok(metadata) => metadata,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error
+                    .to_string()
+                    .contains("Could not resolve application config directory") =>
+        {
+            return Ok(HashMap::new());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to load persisted torrent metadata: {}",
+                error
+            ));
+        }
+    };
+    Ok(metadata
+        .torrents
+        .into_iter()
+        .map(|entry| (entry.info_hash_hex.clone(), entry))
+        .collect())
 }
 
 pub fn find_torrent_settings_index_by_info_hash(
@@ -114,9 +128,9 @@ pub fn control_event_details(request: &ControlRequest, origin: ControlOrigin) ->
 pub fn load_torrent_file_list_for_settings(
     torrent_settings: &TorrentSettings,
 ) -> Result<Vec<(Vec<String>, u64)>, String> {
-    let metadata_by_info_hash = load_torrent_metadata_snapshot();
+    let metadata_by_info_hash = load_torrent_metadata_snapshot()?;
     if let Some(metadata_files) =
-        load_torrent_file_list_from_metadata(torrent_settings, metadata_by_info_hash.as_ref())?
+        load_torrent_file_list_from_metadata(torrent_settings, &metadata_by_info_hash)?
     {
         return Ok(metadata_files);
     }
@@ -145,14 +159,13 @@ pub fn load_torrent_file_list_for_settings(
 
 fn load_torrent_file_list_from_metadata(
     torrent_settings: &TorrentSettings,
-    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
+    metadata_by_info_hash: &TorrentMetadataByInfoHash,
 ) -> Result<Option<TorrentFileList>, String> {
     let Some(info_hash) = info_hash_from_torrent_source(&torrent_settings.torrent_or_magnet) else {
         return Ok(None);
     };
     let info_hash_hex = hex::encode(info_hash);
-    let Some(entry) = metadata_by_info_hash.and_then(|metadata| metadata.get(&info_hash_hex))
-    else {
+    let Some(entry) = metadata_by_info_hash.get(&info_hash_hex) else {
         return Ok(None);
     };
     if entry.files.is_empty() {
@@ -234,18 +247,18 @@ fn torrent_name_for_manifest(
 
 fn torrent_metadata_entry_for_settings(
     torrent_settings: &TorrentSettings,
-    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
+    metadata_by_info_hash: &TorrentMetadataByInfoHash,
 ) -> Result<Option<TorrentMetadataEntry>, String> {
     let Some(info_hash) = info_hash_from_torrent_source(&torrent_settings.torrent_or_magnet) else {
         return Ok(None);
     };
     let info_hash_hex = hex::encode(info_hash);
-    Ok(metadata_by_info_hash.and_then(|metadata| metadata.get(&info_hash_hex).cloned()))
+    Ok(metadata_by_info_hash.get(&info_hash_hex).cloned())
 }
 
 fn manifest_entries_for_torrent_settings(
     torrent_settings: &TorrentSettings,
-    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
+    metadata_by_info_hash: &TorrentMetadataByInfoHash,
 ) -> Result<(String, bool, Vec<TorrentFileListEntry>), String> {
     if let Some(entry) =
         torrent_metadata_entry_for_settings(torrent_settings, metadata_by_info_hash)?
@@ -365,7 +378,7 @@ fn full_file_paths_for_torrent(
     settings: &Settings,
     info_hash_hex: &str,
     torrent_settings: &TorrentSettings,
-    metadata_by_info_hash: Option<&TorrentMetadataByInfoHash>,
+    metadata_by_info_hash: &TorrentMetadataByInfoHash,
 ) -> Result<Vec<PathBuf>, String> {
     let (torrent_name, is_multi_file, files) =
         manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash)?;
@@ -397,15 +410,15 @@ pub fn list_torrent_files(
     settings: &Settings,
     info_hash_hex: &str,
 ) -> Result<Vec<TorrentFileListEntry>, String> {
-    let metadata_by_info_hash = load_torrent_metadata_snapshot();
+    let metadata_by_info_hash = load_torrent_metadata_snapshot()?;
     let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
     let (_, _, mut files) =
-        manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash.as_ref())?;
+        manifest_entries_for_torrent_settings(torrent_settings, &metadata_by_info_hash)?;
     if let Ok(paths) = full_file_paths_for_torrent(
         settings,
         info_hash_hex,
         torrent_settings,
-        metadata_by_info_hash.as_ref(),
+        &metadata_by_info_hash,
     ) {
         for (entry, path) in files.iter_mut().zip(paths) {
             entry.full_path = Some(path);
@@ -426,19 +439,16 @@ pub fn resolve_target_info_hash(
 
     let normalized_target = normalize_match_path(Path::new(target));
     let mut matches = Vec::new();
-    let metadata_by_info_hash = load_torrent_metadata_snapshot();
+    let metadata_by_info_hash = load_torrent_metadata_snapshot()?;
 
     for torrent in &settings.torrents {
         let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
             continue;
         };
         let info_hash_hex = hex::encode(info_hash);
-        let Ok(paths) = full_file_paths_for_torrent(
-            settings,
-            &info_hash_hex,
-            torrent,
-            metadata_by_info_hash.as_ref(),
-        ) else {
+        let Ok(paths) =
+            full_file_paths_for_torrent(settings, &info_hash_hex, torrent, &metadata_by_info_hash)
+        else {
             continue;
         };
         if paths
@@ -474,10 +484,10 @@ pub fn build_offline_purge_plan(
     settings: &Settings,
     info_hash_hex: &str,
 ) -> Result<OfflinePurgePlan, String> {
-    let metadata_by_info_hash = load_torrent_metadata_snapshot();
+    let metadata_by_info_hash = load_torrent_metadata_snapshot()?;
     let (_, torrent_settings, _) = torrent_settings_by_info_hash_hex(settings, info_hash_hex)?;
     let (torrent_name, is_multi_file, files) =
-        manifest_entries_for_torrent_settings(torrent_settings, metadata_by_info_hash.as_ref())?;
+        manifest_entries_for_torrent_settings(torrent_settings, &metadata_by_info_hash)?;
     if files.is_empty() {
         return Err(format!(
             "Torrent '{}' does not have persisted file paths available for offline purge",
@@ -818,9 +828,10 @@ mod tests {
         find_torrent_settings_index_by_info_hash, list_torrent_files, plan_control_request,
         resolve_purge_target_info_hash, resolve_target_info_hash, ControlExecutionPlan,
     };
-    use crate::config::{Settings, TorrentSettings};
+    use crate::config::{set_app_paths_override_for_tests, Settings, TorrentSettings};
     use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
     use std::fs;
+    use std::path::PathBuf;
 
     fn write_sample_torrent_file() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1080,5 +1091,40 @@ mod tests {
             }
             other => panic!("unexpected plan: {:?}", other),
         }
+    }
+
+    #[test]
+    fn files_and_path_resolution_surface_metadata_corruption() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        set_app_paths_override_for_tests(Some((config_dir.clone(), data_dir)));
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("torrent_metadata.toml"),
+            "not = [valid toml",
+        )
+        .expect("write invalid metadata");
+
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Queue".to_string(),
+                download_path: Some(PathBuf::from("/downloads")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let files_error = list_torrent_files(&settings, "1111111111111111111111111111111111111111")
+            .expect_err("invalid metadata should surface");
+        assert!(files_error.contains("Failed to load persisted torrent metadata"));
+
+        let resolve_error = resolve_target_info_hash(&settings, "/downloads/item.bin", "info")
+            .expect_err("invalid metadata should surface");
+        assert!(resolve_error.contains("Failed to load persisted torrent metadata"));
+
+        set_app_paths_override_for_tests(None);
     }
 }

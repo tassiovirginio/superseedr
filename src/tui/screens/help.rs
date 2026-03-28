@@ -9,6 +9,7 @@ use crate::config::{
 use crate::theme::ThemeContext;
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::journal::journal_help_rows;
 use crate::tui::view::calculate_player_stats;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::{prelude::*, widgets::*};
@@ -635,32 +636,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                 ]),
             ],
         ),
-        AppMode::Journal => (
-            " Help / Journal ",
-            vec![
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Esc / q",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Close the event journal"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Tab / Shift+Tab",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Cycle between ALL, QUEUE, COMMANDS, and HEALTH"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "â†‘ / â†“ / k / j",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Move selection through journal entries"),
-                ]),
-            ],
-        ),
+        AppMode::Journal => (" Help / Journal ", journal_help_rows(ctx)),
         AppMode::Config => (
             " Help / Config ",
             vec![

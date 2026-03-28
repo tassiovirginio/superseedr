@@ -3,6 +3,7 @@
 
 use crate::app::{AppMode, AppState, JournalFilter};
 use crate::persistence::event_journal::{EventCategory, EventJournalEntry, EventType};
+use crate::theme::ThemeContext;
 use crate::tui::screen_context::ScreenContext;
 use chrono::{DateTime, Local};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
@@ -11,6 +12,13 @@ use ratatui::prelude::{
 };
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use std::path::{Component, Path};
+
+const JOURNAL_CLOSE_KEYS_LABEL: &str = "Esc / q";
+const JOURNAL_FILTER_KEYS_LABEL: &str = "Tab / Shift+Tab";
+const JOURNAL_MOVE_KEYS_LABEL: &str = "↑ / ↓ / k / j";
+const JOURNAL_CLOSE_DESCRIPTION: &str = "Close the event journal";
+const JOURNAL_FILTER_DESCRIPTION: &str = "Cycle between ALL, QUEUE, COMMANDS, and HEALTH";
+const JOURNAL_MOVE_DESCRIPTION: &str = "Move selection through journal entries";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalAction {
@@ -183,6 +191,36 @@ fn compact_path_label(path: &Path, depth: usize) -> String {
     format!(".../{}", components[components.len() - depth..].join("/"))
 }
 
+pub fn journal_footer_hint() -> &'static str {
+    "[Tab] Filter  [Shift+Tab] Back  [j/k] Move  [q] Close"
+}
+
+pub fn journal_help_rows(ctx: &ThemeContext) -> Vec<Row<'static>> {
+    vec![
+        Row::new(vec![
+            Cell::from(Span::styled(
+                JOURNAL_CLOSE_KEYS_LABEL,
+                ctx.apply(Style::default().fg(ctx.state_error())),
+            )),
+            Cell::from(JOURNAL_CLOSE_DESCRIPTION),
+        ]),
+        Row::new(vec![
+            Cell::from(Span::styled(
+                JOURNAL_FILTER_KEYS_LABEL,
+                ctx.apply(Style::default().fg(ctx.state_selected())),
+            )),
+            Cell::from(JOURNAL_FILTER_DESCRIPTION),
+        ]),
+        Row::new(vec![
+            Cell::from(Span::styled(
+                JOURNAL_MOVE_KEYS_LABEL,
+                ctx.apply(Style::default().fg(ctx.state_info())),
+            )),
+            Cell::from(JOURNAL_MOVE_DESCRIPTION),
+        ]),
+    ]
+}
+
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.app.state;
     let ctx = screen.theme;
@@ -320,7 +358,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         rows[3],
     );
 
-    let footer_hint = Paragraph::new("[Tab] Filter  [Shift+Tab] Back  [j/k] Move  [q] Close")
+    let footer_hint = Paragraph::new(journal_footer_hint())
         .alignment(Alignment::Center)
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
     f.render_widget(footer_hint, layout[1]);
