@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{AppMode, AppState, JournalFilter};
-use crate::persistence::event_journal::{EventCategory, EventJournalEntry, EventType};
+use crate::persistence::event_journal::{
+    EventCategory, EventDetails, EventJournalEntry, EventType,
+};
 use crate::theme::ThemeContext;
+use crate::tui::formatters::sanitize_text;
 use crate::tui::screen_context::ScreenContext;
 use chrono::{DateTime, Local};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
@@ -116,7 +119,18 @@ fn event_type_label(entry: &EventJournalEntry) -> &'static str {
     }
 }
 
-fn source_label(entry: &EventJournalEntry) -> String {
+fn command_action_label(entry: &EventJournalEntry) -> String {
+    match &entry.details {
+        EventDetails::Control { action, .. } => sanitize_text(action),
+        _ => event_type_label(entry).to_string(),
+    }
+}
+
+fn source_label(entry: &EventJournalEntry, anonymize: bool) -> String {
+    if anonymize {
+        return "/path/to/source".to_string();
+    }
+
     entry
         .source_watch_folder
         .as_ref()
@@ -127,6 +141,18 @@ fn source_label(entry: &EventJournalEntry) -> String {
                 .as_ref()
                 .map(|path| compact_path_label(path, 2))
         })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn torrent_label(entry: &EventJournalEntry, anonymize: bool) -> String {
+    if anonymize {
+        return "Torrent".to_string();
+    }
+
+    entry
+        .torrent_name
+        .as_ref()
+        .map(|name| sanitize_text(name))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -160,6 +186,33 @@ fn progress_label(entry: &EventJournalEntry, app_state: &AppState) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn live_torrent_source(entry: &EventJournalEntry, app_state: &AppState) -> Option<String> {
+    if let Some(info_hash_hex) = entry.info_hash_hex.as_deref() {
+        if let Some(display) = app_state
+            .torrents
+            .iter()
+            .find(|(info_hash, _)| hex::encode(info_hash.as_slice()) == info_hash_hex)
+            .map(|(_, display)| display)
+        {
+            let source = display.latest_state.torrent_or_magnet.trim();
+            if !source.is_empty() {
+                return Some(source.to_string());
+            }
+        }
+    }
+
+    entry.torrent_name.as_ref().and_then(|torrent_name| {
+        app_state
+            .torrents
+            .values()
+            .find(|display| display.latest_state.torrent_name == *torrent_name)
+            .and_then(|display| {
+                let source = display.latest_state.torrent_or_magnet.trim();
+                (!source.is_empty()).then(|| source.to_string())
+            })
+    })
+}
+
 fn pretty_timestamp(ts_iso: &str) -> String {
     DateTime::parse_from_rfc3339(ts_iso)
         .map(|dt| {
@@ -181,14 +234,73 @@ fn compact_path_label(path: &Path, depth: usize) -> String {
         .collect::<Vec<_>>();
 
     if components.is_empty() {
-        return path.display().to_string();
+        return sanitize_text(&path.display().to_string());
     }
 
     if components.len() <= depth {
-        return components.join("/");
+        return sanitize_text(&components.join("/"));
     }
 
-    format!(".../{}", components[components.len() - depth..].join("/"))
+    sanitize_text(&format!(
+        ".../{}",
+        components[components.len() - depth..].join("/")
+    ))
+}
+
+fn detail_text(entry: Option<&EventJournalEntry>, anonymize: bool) -> String {
+    let Some(entry) = entry else {
+        return "No journal entries yet.".to_string();
+    };
+
+    let mut text = entry
+        .message
+        .clone()
+        .unwrap_or_else(|| "No journal entries yet.".to_string());
+
+    if anonymize {
+        if let Some(torrent_name) = &entry.torrent_name {
+            text = text.replace(torrent_name, "Torrent");
+        }
+        if let Some(source_path) = &entry.source_path {
+            text = text.replace(&source_path.display().to_string(), "/path/to/source");
+        }
+        if let Some(source_watch_folder) = &entry.source_watch_folder {
+            text = text.replace(
+                &source_watch_folder.display().to_string(),
+                "/path/to/source",
+            );
+        }
+    }
+
+    sanitize_text(&text)
+}
+
+fn selected_detail_text(app_state: &AppState, entry: Option<&EventJournalEntry>) -> String {
+    let Some(entry) = entry else {
+        return "No journal entries yet.".to_string();
+    };
+
+    let source_text = live_torrent_source(entry, app_state).or_else(|| {
+        entry
+            .source_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| {
+                entry
+                    .source_watch_folder
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+    });
+
+    if let Some(source_text) = source_text {
+        if app_state.anonymize_torrent_names {
+            return "/path/to/source".to_string();
+        }
+        return sanitize_text(&source_text);
+    }
+
+    detail_text(Some(entry), app_state.anonymize_torrent_names)
 }
 
 pub fn journal_footer_hint() -> &'static str {
@@ -219,6 +331,86 @@ pub fn journal_help_rows(ctx: &ThemeContext) -> Vec<Row<'static>> {
             Cell::from(JOURNAL_MOVE_DESCRIPTION),
         ]),
     ]
+}
+
+#[derive(Clone, Copy)]
+enum JournalColumn {
+    Time,
+    Event,
+    Done,
+    Torrent,
+    Source,
+}
+
+fn columns_for_filter(filter: JournalFilter) -> Vec<JournalColumn> {
+    match filter {
+        JournalFilter::All => vec![
+            JournalColumn::Time,
+            JournalColumn::Event,
+            JournalColumn::Done,
+            JournalColumn::Torrent,
+            JournalColumn::Source,
+        ],
+        JournalFilter::Queue => vec![
+            JournalColumn::Time,
+            JournalColumn::Event,
+            JournalColumn::Done,
+            JournalColumn::Torrent,
+            JournalColumn::Source,
+        ],
+        JournalFilter::Commands => vec![JournalColumn::Time, JournalColumn::Event],
+        JournalFilter::Health => vec![
+            JournalColumn::Time,
+            JournalColumn::Event,
+            JournalColumn::Torrent,
+        ],
+    }
+}
+
+fn column_header(column: JournalColumn) -> &'static str {
+    match column {
+        JournalColumn::Time => "Time",
+        JournalColumn::Event => "Event",
+        JournalColumn::Done => "Done",
+        JournalColumn::Torrent => "Torrent",
+        JournalColumn::Source => "Source",
+    }
+}
+
+fn column_constraint(column: JournalColumn, filter: JournalFilter) -> Constraint {
+    match (filter, column) {
+        (_, JournalColumn::Time) => Constraint::Length(17),
+        (JournalFilter::Commands, JournalColumn::Event) => Constraint::Min(10),
+        (JournalFilter::Health, JournalColumn::Event) => Constraint::Length(10),
+        (_, JournalColumn::Event) => Constraint::Length(10),
+        (_, JournalColumn::Done) => Constraint::Length(8),
+        (JournalFilter::Health, JournalColumn::Torrent) => Constraint::Min(10),
+        (_, JournalColumn::Torrent) => Constraint::Percentage(41),
+        (_, JournalColumn::Source) => Constraint::Percentage(24),
+    }
+}
+
+fn column_cell(
+    column: JournalColumn,
+    entry: &EventJournalEntry,
+    app_state: &AppState,
+) -> Cell<'static> {
+    match column {
+        JournalColumn::Time => Cell::from(pretty_timestamp(&entry.ts_iso)),
+        JournalColumn::Event => {
+            let label = if matches!(app_state.ui.journal.filter, JournalFilter::Commands) {
+                command_action_label(entry)
+            } else {
+                event_type_label(entry).to_string()
+            };
+            Cell::from(label)
+        }
+        JournalColumn::Done => Cell::from(progress_label(entry, app_state)),
+        JournalColumn::Torrent => {
+            Cell::from(torrent_label(entry, app_state.anonymize_torrent_names))
+        }
+        JournalColumn::Source => Cell::from(source_label(entry, app_state.anonymize_torrent_names)),
+    }
 }
 
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
@@ -291,52 +483,47 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let body_rows = entries
         .iter()
         .map(|entry| {
-            Row::new(vec![
-                Cell::from(pretty_timestamp(&entry.ts_iso)),
-                Cell::from(event_type_label(entry)),
-                Cell::from(progress_label(entry, app_state)),
-                Cell::from(
-                    entry
-                        .torrent_name
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                Cell::from(source_label(entry)),
-            ])
+            Row::new(
+                columns_for_filter(app_state.ui.journal.filter)
+                    .into_iter()
+                    .map(|column| column_cell(column, entry, app_state))
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect::<Vec<_>>();
 
-    let table = Table::new(
-        body_rows,
-        [
-            Constraint::Length(17),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Percentage(41),
-            Constraint::Percentage(24),
-        ],
-    )
-    .header(
-        Row::new(vec!["Time", "Event", "Done", "Torrent", "Source"]).style(
+    let columns = columns_for_filter(app_state.ui.journal.filter);
+    let constraints = columns
+        .iter()
+        .map(|column| column_constraint(*column, app_state.ui.journal.filter))
+        .collect::<Vec<_>>();
+    let header_cells = columns
+        .iter()
+        .map(|column| column_header(*column))
+        .collect::<Vec<_>>();
+
+    let table = Table::new(body_rows, constraints)
+        .header(
+            Row::new(header_cells).style(
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.theme.semantic.subtext0)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+        )
+        .row_highlight_style(
             ctx.apply(
                 Style::default()
-                    .fg(ctx.theme.semantic.subtext0)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(ctx.theme.semantic.text)
+                    .bg(ctx.theme.semantic.surface0),
             ),
-        ),
-    )
-    .row_highlight_style(
-        ctx.apply(
-            Style::default()
-                .fg(ctx.theme.semantic.text)
-                .bg(ctx.theme.semantic.surface0),
-        ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))),
-    );
+        )
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))),
+        );
 
     let mut table_state = TableState::default();
     if !entries.is_empty() {
@@ -346,10 +533,10 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
     f.render_stateful_widget(table, rows[2], &mut table_state);
 
-    let details_text = entries
-        .get(app_state.ui.journal.selected_index)
-        .and_then(|entry| entry.message.clone())
-        .unwrap_or_else(|| "No journal entries yet.".to_string());
+    let details_text = selected_detail_text(
+        app_state,
+        entries.get(app_state.ui.journal.selected_index).copied(),
+    );
     f.render_widget(
         Paragraph::new(details_text)
             .wrap(Wrap { trim: true })
@@ -476,5 +663,81 @@ mod tests {
             progress_label(&app_state.event_journal_state.entries[0], &app_state),
             "40%"
         );
+    }
+
+    #[test]
+    fn anonymized_journal_hides_torrent_names_and_paths() {
+        let entry = EventJournalEntry {
+            torrent_name: Some("Sample Alpha".to_string()),
+            source_path: Some(Path::new("/alpha/beta/watch_files/sample.torrent").to_path_buf()),
+            message: Some(
+                "Added Sample Alpha from /alpha/beta/watch_files/sample.torrent".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(torrent_label(&entry, true), "Torrent");
+        assert_eq!(source_label(&entry, true), "/path/to/source");
+
+        let details = detail_text(Some(&entry), true);
+        assert!(!details.contains("Sample Alpha"));
+        assert!(!details.contains("/alpha/beta/watch_files/sample.torrent"));
+        assert!(details.contains("Torrent"));
+        assert!(details.contains("/path/to/source"));
+    }
+
+    #[test]
+    fn selected_detail_text_prefers_live_torrent_source() {
+        let mut app_state = base_state();
+        let info_hash = vec![0x22; 20];
+        app_state.event_journal_state.entries[0].info_hash_hex = Some(hex::encode(&info_hash));
+        app_state.torrents.insert(
+            info_hash,
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    torrent_name: "Sample Alpha".to_string(),
+                    torrent_or_magnet:
+                        "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let details =
+            selected_detail_text(&app_state, Some(&app_state.event_journal_state.entries[0]));
+        assert!(details.starts_with("magnet:?xt=urn:btih:2222222222222222222222222222222222222222"));
+    }
+
+    #[test]
+    fn command_filter_uses_action_label_and_reduced_columns() {
+        let entry = EventJournalEntry {
+            details: EventDetails::Control {
+                origin: crate::persistence::event_journal::ControlOrigin::CliOnline,
+                action: "pause".to_string(),
+                target_info_hash_hex: None,
+                file_index: None,
+                file_path: None,
+                priority: None,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(command_action_label(&entry), "pause");
+        assert_eq!(columns_for_filter(JournalFilter::Commands).len(), 2);
+        assert_eq!(
+            column_header(columns_for_filter(JournalFilter::Commands)[1]),
+            "Event"
+        );
+        assert_eq!(command_action_label(&entry), "pause");
+    }
+
+    #[test]
+    fn health_filter_hides_source_column() {
+        let columns = columns_for_filter(JournalFilter::Health);
+        assert_eq!(columns.len(), 3);
+        assert!(columns
+            .iter()
+            .all(|column| !matches!(column, JournalColumn::Source)));
     }
 }
