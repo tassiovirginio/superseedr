@@ -10,43 +10,44 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
-      # Volume for Gluetun's internal data
       - gluetun-data:/gluetun
-      # Shared volume to write the port file
       - forwarded-port:/tmp/gluetun
     env_file:
       - .gluetun.env
     environment:
-      # If CLIENT_PORT is set in .env, this passes it to Gluetun.
-      # If CLIENT_PORT is NOT set, this will be empty, which is
-      # correct for users with dynamic port forwarding.
-      - FIREWALL_VPN_INPUT_PORTS=${CLIENT_PORT}     
+      - FIREWALL_VPN_INPUT_PORTS=${CLIENT_PORT}
     restart: unless-stopped
 
   superseedr:
-    extends:
-      file: docker-compose.common.yml
-      service: superseedr
-    # This attaches superseedr to gluetun's network
+    build:
+      context: .
+      args:
+        - PRIVATE_BUILD=${PRIVATE_BUILD:-false}
+    image: ${IMAGE_NAME:-jagatranvo/superseedr:latest}
+    tty: true
+    stdin_open: true
+    init: true
+    entrypoint: ["superseedr"]
+    command: []
     network_mode: "service:gluetun"
     depends_on: [gluetun]
     volumes:
-      # --- App Volumes (from common.yml) ---
-      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
-      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
+      - ${HOST_SUPERSEEDR_ROOT_PATH:-superseedr-root}:/seedbox
       - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
-      
-      # Add any addtional paths here
-      # /host/path:/container/path
-
-      # --- Shared Port Volume ---
-      # This is where superseedr reads the port file
+      - ${HOST_WINDOWS_WATCH_PATH:-superseedr-windows-watch}:/windows-watch
       - forwarded-port:/port-data
+    environment:
+      - SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER=/seedbox
+      - SUPERSEEDR_CLIENT_PORT=${CLIENT_PORT:-6881}
+      - SUPERSEEDR_SHARED_CONFIG_DIR=${SUPERSEEDR_SHARED_CONFIG_DIR:-}
+      - SUPERSEEDR_HOST_ID=${SUPERSEEDR_HOST_ID:-}
+      - SUPERSEEDR_WATCH_PATH_1=${SUPERSEEDR_WATCH_PATH_1:-/windows-watch}
+    stop_grace_period: 0s
 
-# Define all the volumes used
 volumes:
-  superseedr-data:
-  superseedr-config:
+  superseedr-root:
   superseedr-share:
+  superseedr-windows-watch:
   gluetun-data:
   forwarded-port:
+

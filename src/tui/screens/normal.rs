@@ -15,6 +15,7 @@ use crate::app::{
 };
 use crate::config::Settings;
 use crate::config::SortDirection;
+use crate::integrations::control::ControlRequest;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
@@ -347,6 +348,7 @@ pub enum UiAction {
     OpenDeleteConfirm { with_files: bool },
     OpenConfig,
     OpenRss,
+    OpenJournal,
     DataRateSlower,
     DataRateFaster,
     ThemePrev,
@@ -364,6 +366,7 @@ pub enum UiEffect {
     OpenAddTorrentFileBrowser,
     OpenConfigScreen,
     OpenRssScreen,
+    OpenJournalScreen,
     BroadcastManagerDataRate(u64),
     ApplyThemePrev,
     ApplyThemeNext,
@@ -474,6 +477,10 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
         UiAction::OpenConfig => ReduceResult {
             redraw: true,
             effects: vec![UiEffect::OpenConfigScreen],
+        },
+        UiAction::OpenJournal => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::OpenJournalScreen],
         },
         UiAction::DataRateSlower => {
             app_state.data_rate = app_state.data_rate.next_slower();
@@ -628,6 +635,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
         KeyCode::Char('r') => Some(UiAction::OpenRss),
+        KeyCode::Char('J') => Some(UiAction::OpenJournal),
         KeyCode::Char('m') => Some(UiAction::OpenHelp),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
         KeyCode::Char(']') | KeyCode::Char('}') => Some(UiAction::DataRateFaster),
@@ -641,8 +649,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         | KeyCode::Char('j')
         | KeyCode::Left
         | KeyCode::Char('h')
-        | KeyCode::Right
-        | KeyCode::Char('l') => Some(UiAction::Navigate(key.code)),
+        | KeyCode::Right => Some(UiAction::Navigate(key.code)),
         _ => None,
     }
 }
@@ -882,6 +889,19 @@ pub fn draw_footer(
     ctx: &ThemeContext,
 ) {
     let show_branding = footer_chunk.width >= 80;
+    let cluster_status_width = app_state
+        .cluster_role_label
+        .as_deref()
+        .map(|label| format!(" | Cluster: {}", label).len() as u16)
+        .unwrap_or(0)
+        .saturating_add(
+            app_state
+                .cluster_runtime_label
+                .as_deref()
+                .map(|label| format!(" | {}", label).len() as u16)
+                .unwrap_or(0),
+        );
+    let status_width = 21u16.saturating_add(cluster_status_width);
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
@@ -899,10 +919,13 @@ pub fn draw_footer(
                 Constraint::Length(symmetric_left),
             )
         } else {
-            (Constraint::Length(left_target), Constraint::Length(21))
+            (
+                Constraint::Length(left_target),
+                Constraint::Length(status_width),
+            )
         }
     } else {
-        (Constraint::Length(0), Constraint::Length(21))
+        (Constraint::Length(0), Constraint::Length(status_width))
     };
 
     let footer_layout = ratatui::layout::Layout::default()
@@ -1239,14 +1262,30 @@ pub fn draw_footer(
         "Closed"
     };
 
-    let footer_status = Line::from(vec![
+    let mut footer_status_spans = vec![
         Span::raw("Port: "),
         Span::styled(settings.client_port.to_string(), port_style),
         Span::raw(" ["),
         Span::styled(port_text, port_style),
         Span::raw("]"),
-    ])
-    .alignment(Alignment::Right);
+    ];
+    if let Some(cluster_role) = app_state.cluster_role_label.as_deref() {
+        let cluster_style = if cluster_role == "Leader" {
+            ctx.apply(Style::default().fg(ctx.state_success()).bold())
+        } else {
+            ctx.apply(Style::default().fg(ctx.state_warning()).bold())
+        };
+        footer_status_spans.push(Span::raw(" | Cluster: "));
+        footer_status_spans.push(Span::styled(cluster_role.to_string(), cluster_style));
+    }
+    if let Some(runtime_label) = app_state.cluster_runtime_label.as_deref() {
+        footer_status_spans.push(Span::raw(" | "));
+        footer_status_spans.push(Span::styled(
+            runtime_label.to_string(),
+            ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
+        ));
+    }
+    let footer_status = Line::from(footer_status_spans).alignment(Alignment::Right);
 
     let status_paragraph = Paragraph::new(footer_status)
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
@@ -4370,18 +4409,18 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         PastedContent::Magnet(magnet_link) => {
             let download_path = app.client_configs.default_download_folder.clone();
 
-            app.add_magnet_torrent(
-                "Fetching name...".to_string(),
-                magnet_link.to_string(),
-                download_path.clone(),
-                false,
-                TorrentControlState::Running,
-                HashMap::new(),
-                None,
-            )
-            .await;
-
-            if download_path.is_none() {
+            if let Some(download_path) = download_path {
+                let request = app.prepare_add_magnet_request(
+                    magnet_link.to_string(),
+                    Some(download_path),
+                    None,
+                    HashMap::new(),
+                );
+                let _ = app
+                    .app_command_tx
+                    .send(AppCommand::SubmitControlRequest(request))
+                    .await;
+            } else {
                 app.app_state.pending_torrent_link = magnet_link.to_string();
                 let initial_path = app.get_initial_destination_path();
                 let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
@@ -4403,15 +4442,22 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         }
         PastedContent::TorrentFile(path) => {
             if let Some(download_path) = app.client_configs.default_download_folder.clone() {
-                app.add_torrent_from_file(
+                match app.prepare_add_torrent_file_request(
                     path.to_path_buf(),
                     Some(download_path),
-                    false,
-                    TorrentControlState::Running,
-                    HashMap::new(),
                     None,
-                )
-                .await;
+                    HashMap::new(),
+                ) {
+                    Ok(request) => {
+                        let _ = app
+                            .app_command_tx
+                            .send(AppCommand::SubmitControlRequest(request))
+                            .await;
+                    }
+                    Err(error) => {
+                        app.app_state.system_error = Some(error);
+                    }
+                }
             } else {
                 let _ = app
                     .app_command_tx
@@ -4509,6 +4555,13 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             }
         }
         UiEffect::ApplyThemePrev => {
+            if app.is_current_shared_follower() {
+                app.app_state.system_error = Some(
+                    "Shared theme changes are leader-only while this node is a follower."
+                        .to_string(),
+                );
+                return;
+            }
             let themes = crate::theme::ThemeName::sorted_for_ui();
             let current_idx = themes
                 .iter()
@@ -4526,6 +4579,13 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
         }
         UiEffect::ApplyThemeNext => {
+            if app.is_current_shared_follower() {
+                app.app_state.system_error = Some(
+                    "Shared theme changes are leader-only while this node is a follower."
+                        .to_string(),
+                );
+                return;
+            }
             let themes = crate::theme::ThemeName::sorted_for_ui();
             let current_idx = themes
                 .iter()
@@ -4539,28 +4599,18 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
         }
         UiEffect::SendPause(info_hash) => {
-            if let Some(torrent_manager_command_tx) =
-                app.torrent_manager_command_txs.get(&info_hash)
-            {
-                let torrent_manager_command_tx_clone = torrent_manager_command_tx.clone();
-                tokio::spawn(async move {
-                    let _ = torrent_manager_command_tx_clone
-                        .send(crate::torrent_manager::ManagerCommand::Pause)
-                        .await;
-                });
-            }
+            let _ = app
+                .app_command_tx
+                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
         }
         UiEffect::SendResume(info_hash) => {
-            if let Some(torrent_manager_command_tx) =
-                app.torrent_manager_command_txs.get(&info_hash)
-            {
-                let torrent_manager_command_tx_clone = torrent_manager_command_tx.clone();
-                tokio::spawn(async move {
-                    let _ = torrent_manager_command_tx_clone
-                        .send(crate::torrent_manager::ManagerCommand::Resume)
-                        .await;
-                });
-            }
+            let _ = app
+                .app_command_tx
+                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
         }
         UiEffect::OpenHelpScreen => {
             app.app_state.mode = AppMode::Help;
@@ -4568,6 +4618,10 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         UiEffect::OpenRssScreen => {
             app.app_state.ui.rss.active_screen = RssScreen::Unified;
             app.app_state.mode = AppMode::Rss;
+        }
+        UiEffect::OpenJournalScreen => {
+            app.app_state.ui.journal.selected_index = 0;
+            app.app_state.mode = AppMode::Journal;
         }
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;
@@ -5064,6 +5118,16 @@ mod tests {
     }
 
     #[test]
+    fn reducer_open_journal_emits_open_journal_effect() {
+        let mut app_state = AppState::default();
+
+        let result = reduce_ui_action(&mut app_state, UiAction::OpenJournal);
+
+        assert!(result.redraw);
+        assert_eq!(result.effects, vec![UiEffect::OpenJournalScreen]);
+    }
+
+    #[test]
     fn reducer_data_rate_actions_update_rate_and_emit_effect() {
         let mut app_state = AppState {
             data_rate: DataRate::Rate1s,
@@ -5481,7 +5545,11 @@ mod tests {
 
     #[tokio::test]
     async fn apply_open_rss_screen_sets_rss_mode_and_unified_screen() {
-        let mut app = App::new(crate::config::Settings::default())
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
             .await
             .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
@@ -5493,6 +5561,24 @@ mod tests {
             app.app_state.ui.rss.active_screen,
             RssScreen::Unified
         ));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn apply_open_journal_screen_sets_journal_mode() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.ui.journal.selected_index = 9;
+
+        execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
+
+        assert!(matches!(app.app_state.mode, AppMode::Journal));
+        assert_eq!(app.app_state.ui.journal.selected_index, 0);
         let _ = app.shutdown_tx.send(());
     }
 }

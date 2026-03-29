@@ -2,13 +2,95 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{AppMode, AppState};
-use crate::config::get_app_paths;
+use crate::config::{
+    is_shared_config_mode, local_settings_path, resolve_host_watch_path, runtime_log_dir,
+    shared_inbox_path, shared_settings_path, Settings,
+};
 use crate::theme::ThemeContext;
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::journal::journal_help_rows;
 use crate::tui::view::calculate_player_stats;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::{prelude::*, widgets::*};
+
+fn display_path_or_disabled(path: Option<std::path::PathBuf>) -> String {
+    path.map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Disabled".to_string())
+}
+
+fn build_help_footer_entries(settings: &Settings) -> Vec<(&'static str, String)> {
+    let log_path_str = runtime_log_dir()
+        .map(|path| path.join("app.log"))
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown location".to_string());
+
+    if is_shared_config_mode() {
+        vec![
+            (
+                "Settings",
+                shared_settings_path()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown location".to_string()),
+            ),
+            ("Log File", log_path_str),
+            (
+                "Host Watch",
+                display_path_or_disabled(resolve_host_watch_path(settings)),
+            ),
+            (
+                "Shared Inbox",
+                shared_inbox_path()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown location".to_string()),
+            ),
+        ]
+    } else {
+        let settings_path_str = local_settings_path()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unknown location".to_string());
+        let watch_path_str = crate::config::get_watch_path()
+            .map(|(system_watch, _)| system_watch.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Disabled".to_string());
+        vec![
+            ("Settings", settings_path_str),
+            ("Log File", log_path_str),
+            ("Watch Dir", watch_path_str),
+        ]
+    }
+}
+
+fn draw_help_footer(
+    f: &mut Frame,
+    area: Rect,
+    entries: &[(&'static str, String)],
+    ctx: &ThemeContext,
+) {
+    let footer_block =
+        Block::default().border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
+    let footer_inner_area = footer_block.inner(area);
+    f.render_widget(footer_block, area);
+    let footer_lines = entries
+        .iter()
+        .map(|(label, value)| {
+            let reserved = label.len().saturating_add(2);
+            let available_width = (footer_inner_area.width as usize).saturating_sub(reserved);
+            Line::from(vec![
+                Span::styled(
+                    format!("{}: ", label),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                ),
+                Span::styled(
+                    truncate_with_ellipsis(value, available_width),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let footer_paragraph =
+        Paragraph::new(footer_lines).style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
+    f.render_widget(footer_paragraph, footer_inner_area);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HelpAction {
@@ -69,32 +151,10 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
 
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.ui;
+    let settings = screen.settings;
     let ctx = screen.theme;
-
-    let (settings_path_str, log_path_str) = if let Some((config_dir, data_dir)) = get_app_paths() {
-        (
-            config_dir
-                .join("settings.toml")
-                .to_string_lossy()
-                .to_string(),
-            data_dir
-                .join("logs")
-                .join("app.log")
-                .to_string_lossy()
-                .to_string(),
-        )
-    } else {
-        (
-            "Unknown location".to_string(),
-            "Unknown location".to_string(),
-        )
-    };
-
-    let watch_path_str = if let Some((system_watch, _)) = crate::config::get_watch_path() {
-        system_watch.to_string_lossy().to_string()
-    } else {
-        "Disabled".to_string()
-    };
+    let footer_entries = build_help_footer_entries(settings);
+    let footer_height = footer_entries.len() as u16;
 
     let area = centered_rect(60, 100, f.area());
     f.render_widget(Clear, area);
@@ -108,7 +168,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         let chunks = Layout::vertical([
             Constraint::Length(final_warning_height),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(footer_height),
         ])
         .split(area);
 
@@ -122,94 +182,12 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             .style(ctx.apply(Style::default().fg(ctx.state_warning())));
         f.render_widget(warning_paragraph, chunks[0]);
         draw_help_table(f, app_state, chunks[1], ctx);
-
-        let footer_block = Block::default()
-            .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
-        let footer_inner_area = footer_block.inner(chunks[2]);
-        f.render_widget(footer_block, chunks[2]);
-        let footer_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Settings: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(
-                        &settings_path_str,
-                        footer_inner_area.width as usize - 10,
-                    ),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Log File: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(&log_path_str, footer_inner_area.width as usize - 10),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Watch Dir: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(&watch_path_str, footer_inner_area.width as usize - 11),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-        ];
-        let footer_paragraph = Paragraph::new(footer_lines)
-            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
-        f.render_widget(footer_paragraph, footer_inner_area);
+        draw_help_footer(f, chunks[2], &footer_entries, ctx);
     } else {
-        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).split(area);
+        let chunks =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).split(area);
         draw_help_table(f, app_state, chunks[0], ctx);
-        let footer_block = Block::default()
-            .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
-        let footer_inner_area = footer_block.inner(chunks[1]);
-        f.render_widget(footer_block, chunks[1]);
-        let footer_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Settings: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(
-                        &settings_path_str,
-                        footer_inner_area.width as usize - 10,
-                    ),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Log File: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(&log_path_str, footer_inner_area.width as usize - 10),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Watch Dir: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(&watch_path_str, footer_inner_area.width as usize - 11),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ]),
-        ];
-        let footer_paragraph = Paragraph::new(footer_lines)
-            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
-        f.render_widget(footer_paragraph, footer_inner_area);
+        draw_help_footer(f, chunks[1], &footer_entries, ctx);
     }
 }
 
@@ -227,7 +205,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
     // Text styling
     let level_text = format!("Level {} ({:.0}%)", lvl, progress * 100.0);
 
-    let (title, rows) = match mode {
+    let (title, mut rows) = match mode {
         AppMode::Normal | AppMode::Welcome | AppMode::Help => (
             " Manual / Help ",
             vec![
@@ -276,6 +254,13 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                         ctx.apply(Style::default().fg(ctx.accent_sapphire())),
                     )),
                     Cell::from("Open RSS screen"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "J",
+                        ctx.apply(Style::default().fg(ctx.state_info())),
+                    )),
+                    Cell::from("Open event journal"),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
@@ -651,6 +636,7 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                 ]),
             ],
         ),
+        AppMode::Journal => (" Help / Journal ", journal_help_rows(ctx)),
         AppMode::Config => (
             " Help / Config ",
             vec![
@@ -704,6 +690,31 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
             )])],
         ),
     };
+
+    if is_shared_config_mode() && matches!(mode, AppMode::Normal | AppMode::Welcome | AppMode::Help)
+    {
+        rows.extend([
+            Row::new(vec![Cell::from(Span::styled(
+                "Cluster Mode",
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ))]),
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    "Leader",
+                    ctx.apply(Style::default().fg(ctx.state_success())),
+                )),
+                Cell::from("Downloads, seeds, and publishes cluster progress"),
+            ]),
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    "Follower",
+                    ctx.apply(Style::default().fg(ctx.state_info())),
+                )),
+                Cell::from("Reads leader progress and may seed complete shared data"),
+            ]),
+            Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+        ]);
+    }
 
     let help_table = Table::new(rows, [Constraint::Length(20), Constraint::Min(30)]).block(
         Block::default()

@@ -101,12 +101,11 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let level_filled_len = (level_progress * LEVEL_GAUGE_WIDTH as f64).round() as usize;
     let level_empty_len = LEVEL_GAUGE_WIDTH.saturating_sub(level_filled_len);
     let level_gauge = format!(
-        "[{}{}] L{} ({:.0}%)",
+        "[{}{}]",
         "=".repeat(level_filled_len),
         "-".repeat(level_empty_len),
-        level,
-        level_progress * 100.0
     );
+    let level_percent = format!("{:.0}%", level_progress * 100.0);
 
     let area = centered_rect(40, 60, f.area());
     f.render_widget(Clear, area);
@@ -192,12 +191,18 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "Level: ",
+                format!("Level {}", level),
                 ctx.apply(Style::default().fg(ctx.state_selected())),
             ),
+            Span::raw("  "),
             Span::styled(
                 level_gauge,
                 ctx.apply(Style::default().fg(ctx.state_success())),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                level_percent,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
             ),
         ]),
     ];

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fs;
-use std::io::{ErrorKind, Stdout};
+use std::fs::File;
+use std::io::{self, ErrorKind, Stdout};
+use std::path::{Path, PathBuf};
 
 use std::collections::VecDeque;
 
@@ -14,14 +16,25 @@ use strum_macros::EnumIter;
 
 use crate::torrent_manager::DiskIoOperation;
 
-use crate::config::{get_app_paths, save_settings};
 use crate::config::{
-    FeedSyncError, PeerSortColumn, RssFilterMode, RssHistoryEntry, Settings, SortDirection,
-    TorrentSettings, TorrentSortColumn,
+    classify_shared_mode_settings_change, resolve_host_watch_path, runtime_watch_paths,
+    save_settings, shared_host_id, shared_inbox_path, shared_root_path, upsert_torrent_metadata,
+    FeedSyncError, PeerSortColumn, RssFilterMode, RssHistoryEntry, Settings, SettingsChangeScope,
+    SortDirection, TorrentMetadataEntry, TorrentMetadataFileEntry, TorrentSettings,
+    TorrentSortColumn,
+};
+use crate::control_service::{
+    control_event_details, online_control_success_message, plan_control_request,
+    ControlExecutionPlan,
 };
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
+};
+use crate::persistence::event_journal::{
+    append_event_journal_entry, load_event_journal_state, save_event_journal_state, ControlOrigin,
+    EventCategory, EventDetails, EventJournalEntry, EventJournalState, EventScope, EventType,
+    IngestKind, IngestOrigin,
 };
 use crate::persistence::network_history::{
     load_network_history_state, save_network_history_state, NetworkHistoryPersistedState,
@@ -39,7 +52,7 @@ use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeViewState;
 use crate::tui::view::draw;
 
-use crate::config::get_watch_path;
+use crate::config::resolve_command_watch_path;
 use crate::storage::build_fs_tree;
 
 use crate::resource_manager::ResourceType;
@@ -51,26 +64,32 @@ use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningCon
 
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
 use crate::integrations::status::AppOutputState;
-use crate::integrations::{rss_ingest, rss_service, status, watcher};
+use crate::integrations::{
+    control::{write_control_request, ControlFilePriorityOverride, ControlRequest},
+    rss_ingest, rss_service, status, watcher,
+};
 use crate::integrity_scheduler::{
     IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::torrent_file::parser::from_bytes;
+use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
 use crate::torrent_manager::TorrentFileProbeStatus;
 use crate::torrent_manager::TorrentManager;
 use crate::torrent_manager::TorrentParameters;
+use crate::watch_inbox::{archive_watch_file, relay_watch_file_to_shared_inbox};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncReadExt;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -81,7 +100,6 @@ type AsyncDht = ();
 
 use sha1::Digest;
 use sha2::Sha256;
-use std::path::PathBuf;
 
 use notify::{Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -91,8 +109,6 @@ use ratatui::prelude::Rect;
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use sysinfo::System;
-
-use data_encoding::BASE32;
 
 use tracing::{event as tracing_event, Level};
 
@@ -115,6 +131,9 @@ const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
 pub const RSS_MAX_TORRENT_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
+const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
+const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
+
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
@@ -446,6 +465,12 @@ pub enum AppCommand {
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
+    ReloadClusterState(PathBuf),
+    SubmitControlRequest(ControlRequest),
+    ControlRequest {
+        path: PathBuf,
+        request: ControlRequest,
+    },
     ClientShutdown(PathBuf),
     PortFileChanged(PathBuf),
     FetchFileTree {
@@ -467,7 +492,10 @@ pub enum AppCommand {
         feed_url: String,
         error: Option<FeedSyncError>,
     },
-    RssDownloadSelected(RssHistoryEntry),
+    RssDownloadSelected {
+        entry: RssHistoryEntry,
+        command_path: Option<PathBuf>,
+    },
     RssDownloadPreview(RssPreviewItem),
     NetworkHistoryLoaded(NetworkHistoryPersistedState),
     ActivityHistoryLoaded(Box<ActivityHistoryPersistedState>),
@@ -481,6 +509,86 @@ pub enum AppCommand {
     },
     UpdateConfig(Settings),
     UpdateVersionAvailable(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppRuntimeMode {
+    Normal,
+    SharedLeader,
+    SharedFollower,
+}
+
+impl AppRuntimeMode {
+    pub fn is_shared(self) -> bool {
+        matches!(self, Self::SharedLeader | Self::SharedFollower)
+    }
+
+    pub fn is_shared_follower(self) -> bool {
+        matches!(self, Self::SharedFollower)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppClusterRole {
+    Leader,
+    Follower,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClusterCapabilities {
+    can_write_shared_state: bool,
+    can_queue_shared_commands: bool,
+    can_edit_host_local_config: bool,
+    can_persist_local_runtime_state: bool,
+    can_consume_shared_inbox: bool,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestSource {
+    TorrentFile,
+    TorrentPathFile,
+    MagnetFile,
+}
+
+impl IngestSource {
+    fn relay_archive_extension(self) -> &'static str {
+        match self {
+            Self::TorrentFile => "torrent.forwarded",
+            Self::TorrentPathFile => "path.forwarded",
+            Self::MagnetFile => "magnet.forwarded",
+        }
+    }
+
+    fn processed_archive_extension(self) -> &'static str {
+        match self {
+            Self::TorrentFile => "torrent.added",
+            Self::TorrentPathFile => "path.added",
+            Self::MagnetFile => "magnet.added",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResolvedAddPayload {
+    TorrentFile { source_path: PathBuf },
+    MagnetLink { magnet_link: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AddIngressAction {
+    RelayRawWatchFile,
+    QueueControlRequest(ControlRequest),
+    ApplyDirectly {
+        payload: ResolvedAddPayload,
+        download_path: PathBuf,
+    },
+    OpenManualBrowser {
+        payload: ResolvedAddPayload,
+    },
+    Fail {
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, EnumIter)]
@@ -499,6 +607,7 @@ pub enum AppMode {
     #[default]
     Normal,
     Help,
+    Journal,
     PowerSaving,
     DeleteConfirm,
     Config,
@@ -507,6 +616,71 @@ pub enum AppMode {
 }
 
 type AvailabilityTransitionLog = (String, bool, usize, Option<std::path::PathBuf>, Vec<String>);
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingIngestRecord {
+    correlation_id: String,
+    origin: IngestOrigin,
+    ingest_kind: IngestKind,
+    source_watch_folder: Option<PathBuf>,
+    source_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingControlRecord {
+    correlation_id: String,
+    request: ControlRequest,
+    origin: ControlOrigin,
+    source_watch_folder: Option<PathBuf>,
+    source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandIngestResult {
+    Added {
+        info_hash: Option<Vec<u8>>,
+        torrent_name: Option<String>,
+    },
+    Duplicate {
+        info_hash: Option<Vec<u8>>,
+        torrent_name: Option<String>,
+    },
+    Invalid {
+        info_hash: Option<Vec<u8>>,
+        torrent_name: Option<String>,
+        message: String,
+    },
+    Failed {
+        info_hash: Option<Vec<u8>>,
+        torrent_name: Option<String>,
+        message: String,
+    },
+}
+
+#[cfg(test)]
+fn move_file_with_fallback_impl<F>(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    rename_op: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+{
+    crate::watch_inbox::move_file_with_fallback_impl(source, destination, rename_op)
+}
+
+fn ingest_kind_from_path(path: &std::path::Path) -> Option<IngestKind> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("torrent") => Some(IngestKind::TorrentFile),
+        Some("magnet") => Some(IngestKind::MagnetFile),
+        Some("path") => Some(IngestKind::PathFile),
+        _ => None,
+    }
+}
+
+fn event_correlation_id_for_path(path: &std::path::Path) -> String {
+    hex::encode(sha1::Sha1::digest(path.to_string_lossy().as_bytes()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RssScreen {
@@ -550,6 +724,7 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TorrentMetrics {
     pub torrent_control_state: TorrentControlState,
+    pub delete_files: bool,
     pub info_hash: Vec<u8>,
     pub torrent_or_magnet: String,
     pub torrent_name: String,
@@ -593,6 +768,7 @@ impl Default for TorrentMetrics {
     fn default() -> Self {
         Self {
             torrent_control_state: TorrentControlState::default(),
+            delete_files: false,
             info_hash: Vec::new(),
             torrent_or_magnet: String::new(),
             torrent_name: String::new(),
@@ -672,6 +848,7 @@ pub struct UiState {
     pub config: ConfigUiState,
     pub delete_confirm: DeleteConfirmUiState,
     pub file_browser: FileBrowserUiState,
+    pub journal: JournalUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
     pub rss: RssUiState,
@@ -698,6 +875,51 @@ pub struct FileBrowserUiState {
     pub browser_mode: FileBrowserMode,
     pub is_searching: bool,
     pub search_query: String,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalFilter {
+    #[default]
+    All,
+    Queue,
+    Commands,
+    Health,
+}
+
+impl JournalFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Queue,
+            Self::Queue => Self::Commands,
+            Self::Commands => Self::Health,
+            Self::Health => Self::All,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Health,
+            Self::Queue => Self::All,
+            Self::Commands => Self::Queue,
+            Self::Health => Self::Commands,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Queue => "QUEUE",
+            Self::Commands => "COMMANDS",
+            Self::Health => "HEALTH",
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct JournalUiState {
+    pub filter: JournalFilter,
+    pub selected_index: usize,
+    pub status_message: Option<String>,
 }
 
 #[derive(Default)]
@@ -845,6 +1067,7 @@ pub struct AppState {
     pub activity_history_restore_pending: bool,
     pub next_activity_history_persist_request_id: u64,
     pub pending_activity_history_persist_request_id: Option<u64>,
+    pub event_journal_state: EventJournalState,
 
     pub last_tuning_score: u64,
     pub current_tuning_score: u64,
@@ -861,16 +1084,25 @@ pub struct AppState {
     pub disk_health_state_level: u8,
 
     pub recently_processed_files: HashMap<PathBuf, Instant>,
+    pub pending_ingest_by_path: HashMap<PathBuf, PendingIngestRecord>,
+    pub pending_control_by_path: HashMap<PathBuf, PendingControlRecord>,
+    pub pending_watch_commands: VecDeque<AppCommand>,
+    pub cluster_role_label: Option<String>,
+    pub cluster_runtime_label: Option<String>,
 }
 
 pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
+    pub runtime_mode: AppRuntimeMode,
+    pub shared_mode_enabled: bool,
+    pub current_cluster_role: Option<AppClusterRole>,
+    pub watched_paths: Vec<PathBuf>,
     pub base_system_warning: Option<String>,
     #[cfg(feature = "dht")]
     pub dht_bootstrap_warning: Option<String>,
 
-    pub listener: tokio::net::TcpListener,
+    pub listener: Option<tokio::net::TcpListener>,
 
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(TcpStream, Vec<u8>)>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
@@ -892,12 +1124,23 @@ pub struct App {
     pub shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
+    pub rss_sync_rx: Option<mpsc::Receiver<()>>,
+    pub rss_downloaded_entry_rx: Option<mpsc::Receiver<RssHistoryEntry>>,
+    pub rss_settings_rx: Option<watch::Receiver<Settings>>,
+    pub rss_service_task: Option<tokio::task::JoinHandle<()>>,
     pub tui_task: Option<tokio::task::JoinHandle<()>>,
     pub notify_rx: mpsc::Receiver<Result<Event, NotifyError>>,
     pub watcher: RecommendedWatcher,
     pub tuning_controller: TuningController,
     pub next_tuning_at: time::Instant,
     pub integrity_scheduler: IntegrityScheduler,
+    pub event_journal_host_id: Option<String>,
+    pub status_dump_interval_override_secs: Option<u64>,
+    pub next_status_dump_at: Option<time::Instant>,
+    pub status_dump_generation: Arc<AtomicU64>,
+    pub app_lock_handle: Option<File>,
+    pub leader_status_snapshot: Option<AppOutputState>,
+    pub startup_completion_suppressed_hashes: HashSet<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -918,12 +1161,141 @@ pub struct PersistPayload {
     pub rss_state: RssPersistedState,
     pub network_history: Option<NetworkHistoryPersistRequest>,
     pub activity_history: Option<ActivityHistoryPersistRequest>,
+    pub event_journal_state: EventJournalState,
 }
+
+fn initial_cluster_role_for_runtime_mode(runtime_mode: AppRuntimeMode) -> Option<AppClusterRole> {
+    match runtime_mode {
+        AppRuntimeMode::Normal => None,
+        AppRuntimeMode::SharedLeader => Some(AppClusterRole::Leader),
+        AppRuntimeMode::SharedFollower => Some(AppClusterRole::Follower),
+    }
+}
+
+fn spawn_persistence_writer(
+    app_command_tx: mpsc::Sender<AppCommand>,
+) -> (
+    watch::Sender<Option<PersistPayload>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (persistence_tx, mut persistence_rx) = watch::channel::<Option<PersistPayload>>(None);
+    let persistence_app_command_tx = app_command_tx.clone();
+    let persistence_task = tokio::spawn(async move {
+        while persistence_rx.changed().await.is_ok() {
+            let Some(payload) = persistence_rx.borrow().clone() else {
+                continue;
+            };
+            let network_history_request_id = payload
+                .network_history
+                .as_ref()
+                .map(|request| request.request_id);
+            let activity_history_request_id = payload
+                .activity_history
+                .as_ref()
+                .map(|request| request.request_id);
+            let write_result = tokio::task::spawn_blocking(move || {
+                save_settings(&payload.settings)
+                    .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
+                save_rss_state(&payload.rss_state)
+                    .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
+                if let Some(network_history) = payload.network_history {
+                    save_network_history_state(&network_history.state)
+                        .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
+                }
+                if let Some(activity_history) = payload.activity_history {
+                    save_activity_history_state(&activity_history.state).map_err(|e| {
+                        format!("Failed to auto-save activity history state: {}", e)
+                    })?;
+                }
+                save_event_journal_state(&payload.event_journal_state)
+                    .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
+                Ok::<(), String>(())
+            })
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {
+                    tracing_event!(Level::DEBUG, "Persistence payload auto-saved successfully.");
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: true,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: true,
+                            })
+                            .await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing_event!(Level::ERROR, "{}", e);
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
+                    if let Some(request_id) = network_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::NetworkHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                    if let Some(request_id) = activity_history_request_id {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::ActivityHistoryPersisted {
+                                request_id,
+                                success: false,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    });
+
+    (persistence_tx, persistence_task)
+}
+
 impl App {
-    pub async fn new(client_configs: Settings) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener =
+    #[cfg(test)]
+    pub async fn new(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_lock(client_configs, runtime_mode, None).await
+    }
+
+    pub async fn new_with_lock(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+        app_lock_handle: Option<File>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = Some(
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", client_configs.client_port))
-                .await?;
+                .await?,
+        );
 
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(1000);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
@@ -933,104 +1305,17 @@ impl App {
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (persistence_tx, mut persistence_rx) = watch::channel::<Option<PersistPayload>>(None);
-        let persistence_app_command_tx = app_command_tx.clone();
-        let persistence_task = tokio::spawn(async move {
-            while persistence_rx.changed().await.is_ok() {
-                let Some(payload) = persistence_rx.borrow().clone() else {
-                    continue;
-                };
-                let network_history_request_id = payload
-                    .network_history
-                    .as_ref()
-                    .map(|request| request.request_id);
-                let activity_history_request_id = payload
-                    .activity_history
-                    .as_ref()
-                    .map(|request| request.request_id);
-                let write_result = tokio::task::spawn_blocking(move || {
-                    save_settings(&payload.settings)
-                        .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
-                    save_rss_state(&payload.rss_state)
-                        .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
-                    if let Some(network_history) = payload.network_history {
-                        save_network_history_state(&network_history.state).map_err(|e| {
-                            format!("Failed to auto-save network history state: {}", e)
-                        })?;
-                    }
-                    if let Some(activity_history) = payload.activity_history {
-                        save_activity_history_state(&activity_history.state).map_err(|e| {
-                            format!("Failed to auto-save activity history state: {}", e)
-                        })?;
-                    }
-                    Ok::<(), String>(())
-                })
-                .await;
-
-                match write_result {
-                    Ok(Ok(())) => {
-                        tracing_event!(
-                            Level::DEBUG,
-                            "Persistence payload auto-saved successfully."
-                        );
-                        if let Some(request_id) = network_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::NetworkHistoryPersisted {
-                                    request_id,
-                                    success: true,
-                                })
-                                .await;
-                        }
-                        if let Some(request_id) = activity_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::ActivityHistoryPersisted {
-                                    request_id,
-                                    success: true,
-                                })
-                                .await;
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing_event!(Level::ERROR, "{}", e);
-                        if let Some(request_id) = network_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::NetworkHistoryPersisted {
-                                    request_id,
-                                    success: false,
-                                })
-                                .await;
-                        }
-                        if let Some(request_id) = activity_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::ActivityHistoryPersisted {
-                                    request_id,
-                                    success: false,
-                                })
-                                .await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
-                        if let Some(request_id) = network_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::NetworkHistoryPersisted {
-                                    request_id,
-                                    success: false,
-                                })
-                                .await;
-                        }
-                        if let Some(request_id) = activity_history_request_id {
-                            let _ = persistence_app_command_tx
-                                .send(AppCommand::ActivityHistoryPersisted {
-                                    request_id,
-                                    success: false,
-                                })
-                                .await;
-                        }
-                    }
-                }
-            }
-        });
+        let shared_mode_enabled = runtime_mode.is_shared();
+        let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
+        let (persistence_tx, persistence_task) = if shared_mode_enabled
+            && matches!(current_cluster_role, Some(AppClusterRole::Follower))
+        {
+            (None, None)
+        } else {
+            let (persistence_tx, persistence_task) =
+                spawn_persistence_writer(app_command_tx.clone());
+            (Some(persistence_tx), Some(persistence_task))
+        };
 
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
         tracing_event!(
@@ -1101,7 +1386,9 @@ impl App {
         let ul_limit = client_configs.global_upload_limit_bps as f64;
         let global_dl_bucket = Arc::new(TokenBucket::new(dl_limit, dl_limit));
         let global_ul_bucket = Arc::new(TokenBucket::new(ul_limit, ul_limit));
+        let _ = crate::config::ensure_watch_directories(&client_configs);
         let persisted_rss_state = load_rss_state();
+        let persisted_event_journal_state = load_event_journal_state();
 
         let tuning_controller = TuningController::new_adaptive(limits.clone());
         let tuning_state = tuning_controller.state().clone();
@@ -1129,6 +1416,7 @@ impl App {
                 next_sync_at: None,
                 feed_errors: persisted_rss_state.feed_errors,
             },
+            event_journal_state: persisted_event_journal_state,
             lifetime_downloaded_from_config: client_configs.lifetime_downloaded,
             lifetime_uploaded_from_config: client_configs.lifetime_uploaded,
             minute_disk_backoff_history_ms: VecDeque::with_capacity(24 * 60),
@@ -1142,14 +1430,24 @@ impl App {
             ..Default::default()
         };
 
+        let watched_paths = runtime_watch_paths(
+            &client_configs,
+            shared_mode_enabled,
+            matches!(current_cluster_role, Some(AppClusterRole::Leader)) || !shared_mode_enabled,
+        );
+
         let (notify_tx, notify_rx) = mpsc::channel::<Result<Event, NotifyError>>(100);
-        let watcher = watcher::create_watcher(&client_configs, notify_tx)?;
+        let watcher = watcher::create_watcher(&watched_paths, true, notify_tx)?;
         let initial_tuning_deadline =
             time::Instant::now() + Duration::from_secs(tuning_controller.cadence_secs());
 
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
+            runtime_mode,
+            shared_mode_enabled,
+            current_cluster_role,
+            watched_paths,
             base_system_warning: system_warning,
             #[cfg(feature = "dht")]
             dht_bootstrap_warning,
@@ -1171,60 +1469,35 @@ impl App {
             tui_event_tx,
             tui_event_rx,
             shutdown_tx,
-            persistence_tx: Some(persistence_tx),
-            persistence_task: Some(persistence_task),
+            persistence_tx,
+            persistence_task,
+            rss_sync_rx: Some(rss_sync_rx),
+            rss_downloaded_entry_rx: Some(rss_downloaded_entry_rx),
+            rss_settings_rx: Some(rss_settings_rx),
+            rss_service_task: None,
             tui_task: None,
             watcher,
             notify_rx,
             tuning_controller,
             next_tuning_at: initial_tuning_deadline,
             integrity_scheduler: IntegrityScheduler::new(Instant::now()),
+            event_journal_host_id: shared_host_id(),
+            status_dump_interval_override_secs: None,
+            next_status_dump_at: None,
+            status_dump_generation: Arc::new(AtomicU64::new(0)),
+            app_lock_handle,
+            leader_status_snapshot: None,
+            startup_completion_suppressed_hashes: HashSet::new(),
         };
+        app.sync_cluster_role_label();
         app.refresh_system_warning();
 
-        let _rss_service_task = rss_service::spawn_rss_service(
-            app.client_configs.clone(),
-            app.app_state.rss_runtime.history.clone(),
-            app.app_command_tx.clone(),
-            rss_sync_rx,
-            rss_downloaded_entry_rx,
-            rss_settings_rx,
-            app.shutdown_tx.clone(),
-        );
+        app.ensure_leader_services_running();
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
         torrents_to_load.sort_by_key(|t| !t.validation_status);
         for torrent_config in torrents_to_load {
-            if !should_load_persisted_torrent(&torrent_config) {
-                tracing_event!(
-                    Level::WARN,
-                    torrent = %torrent_config.torrent_or_magnet,
-                    "Skipping persisted torrent left in transient Deleting state during startup"
-                );
-                continue;
-            }
-            if torrent_config.torrent_or_magnet.starts_with("magnet:") {
-                app.add_magnet_torrent(
-                    torrent_config.name.clone(),
-                    torrent_config.torrent_or_magnet.clone(),
-                    torrent_config.download_path.clone(),
-                    torrent_config.validation_status,
-                    torrent_config.torrent_control_state,
-                    torrent_config.file_priorities,
-                    torrent_config.container_name,
-                )
-                .await;
-            } else {
-                app.add_torrent_from_file(
-                    PathBuf::from(&torrent_config.torrent_or_magnet),
-                    torrent_config.download_path.clone(),
-                    torrent_config.validation_status,
-                    torrent_config.torrent_control_state,
-                    torrent_config.file_priorities.clone(),
-                    torrent_config.container_name,
-                )
-                .await;
-            }
+            app.load_runtime_torrent_from_settings(torrent_config).await;
         }
 
         if app.app_state.torrents.is_empty() && app.app_state.lifetime_downloaded_from_config == 0 {
@@ -1236,8 +1509,894 @@ impl App {
         });
         app.app_state.is_seeding = !is_leeching;
         app.refresh_rss_derived();
+        app.refresh_follower_read_model();
 
         Ok(app)
+    }
+
+    fn cluster_role_label_for_state(&self) -> Option<&'static str> {
+        if !self.is_shared_mode_enabled() {
+            return None;
+        }
+
+        if self.is_current_shared_leader() {
+            Some("Leader")
+        } else if self.is_current_shared_follower() {
+            Some("Follower")
+        } else {
+            Some("Unknown")
+        }
+    }
+
+    fn sync_cluster_role_label(&mut self) {
+        self.app_state.cluster_role_label = self.cluster_role_label_for_state().map(str::to_string);
+        self.app_state.cluster_runtime_label = if self.is_current_shared_follower() {
+            Some("Reader".to_string())
+        } else {
+            None
+        };
+    }
+
+    fn should_suppress_follower_runtime_for_torrent(&self, torrent: &TorrentSettings) -> bool {
+        self.is_current_shared_follower() && !torrent.validation_status
+    }
+
+    fn display_state_from_torrent_settings(
+        &self,
+        torrent: &TorrentSettings,
+    ) -> Option<TorrentDisplayState> {
+        let info_hash = info_hash_from_torrent_source(&torrent.torrent_or_magnet)?;
+        Some(TorrentDisplayState {
+            latest_state: TorrentMetrics {
+                torrent_control_state: torrent.torrent_control_state.clone(),
+                delete_files: torrent.delete_files,
+                info_hash,
+                torrent_or_magnet: torrent.torrent_or_magnet.clone(),
+                torrent_name: torrent.name.clone(),
+                download_path: torrent
+                    .download_path
+                    .clone()
+                    .or_else(|| self.client_configs.default_download_folder.clone()),
+                container_name: torrent.container_name.clone(),
+                file_priorities: torrent.file_priorities.clone(),
+                is_complete: torrent.validation_status,
+                activity_message: "Reader mode waiting for leader status".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn ensure_display_only_torrent_from_settings(&mut self, torrent: &TorrentSettings) {
+        let Some(display_state) = self.display_state_from_torrent_settings(torrent) else {
+            return;
+        };
+        let info_hash = display_state.latest_state.info_hash.clone();
+        if !self.app_state.torrents.contains_key(&info_hash) {
+            self.app_state
+                .torrents
+                .insert(info_hash.clone(), display_state);
+            self.app_state.torrent_list_order.push(info_hash);
+            self.refresh_rss_derived();
+        }
+    }
+
+    fn apply_leader_snapshot_to_display(&mut self, snapshot: &AppOutputState) {
+        let configured_torrents = self.client_configs.torrents.clone();
+        for torrent in &configured_torrents {
+            let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
+                continue;
+            };
+
+            if !self.app_state.torrents.contains_key(&info_hash) {
+                self.ensure_display_only_torrent_from_settings(torrent);
+            }
+
+            let has_live_runtime = self.has_live_runtime_for_torrent(&info_hash);
+            let Some(runtime) = self.app_state.torrents.get_mut(&info_hash) else {
+                continue;
+            };
+            let Some(leader_metrics) = snapshot.torrents.get(&info_hash) else {
+                if !has_live_runtime {
+                    runtime.latest_state.activity_message =
+                        "Leader runtime unavailable".to_string();
+                    runtime.latest_state.download_speed_bps = 0;
+                    runtime.latest_state.upload_speed_bps = 0;
+                    runtime.latest_state.bytes_downloaded_this_tick = 0;
+                    runtime.latest_state.bytes_uploaded_this_tick = 0;
+                }
+                continue;
+            };
+
+            let keep_local_seed_runtime = has_live_runtime && runtime.latest_state.is_complete;
+            if !keep_local_seed_runtime {
+                runtime.latest_state = leader_metrics.clone();
+            }
+        }
+
+        self.sort_and_filter_torrent_list();
+        self.app_state.ui.needs_redraw = true;
+    }
+
+    fn refresh_follower_read_model(&mut self) {
+        if !self.is_current_shared_follower() {
+            return;
+        }
+
+        for torrent in self.client_configs.torrents.clone() {
+            if self.should_suppress_follower_runtime_for_torrent(&torrent) {
+                self.ensure_display_only_torrent_from_settings(&torrent);
+            }
+        }
+
+        match status::read_cluster_output_state() {
+            Ok(snapshot) => {
+                self.leader_status_snapshot = Some(snapshot.clone());
+                self.apply_leader_snapshot_to_display(&snapshot);
+            }
+            Err(error) => {
+                tracing_event!(
+                    Level::DEBUG,
+                    "Follower could not read leader status snapshot yet: {}",
+                    error
+                );
+                self.leader_status_snapshot = None;
+            }
+        }
+    }
+
+    async fn start_missing_runtime_torrents_for_current_role(&mut self) {
+        for torrent in self.client_configs.torrents.clone() {
+            let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
+                continue;
+            };
+            if self.has_live_runtime_for_torrent(&info_hash) {
+                continue;
+            }
+            if self.should_suppress_follower_runtime_for_torrent(&torrent) {
+                self.ensure_display_only_torrent_from_settings(&torrent);
+                continue;
+            }
+            self.load_runtime_torrent_from_settings(torrent).await;
+        }
+    }
+
+    pub fn is_shared_mode_enabled(&self) -> bool {
+        self.shared_mode_enabled
+    }
+
+    pub fn is_current_shared_leader(&self) -> bool {
+        matches!(self.current_cluster_role, Some(AppClusterRole::Leader))
+    }
+
+    pub fn is_current_shared_follower(&self) -> bool {
+        self.is_shared_mode_enabled()
+            && matches!(self.current_cluster_role, Some(AppClusterRole::Follower))
+    }
+
+    fn cluster_capabilities(&self) -> ClusterCapabilities {
+        let is_shared_follower = self.is_current_shared_follower();
+        ClusterCapabilities {
+            can_write_shared_state: !is_shared_follower,
+            can_queue_shared_commands: self.is_shared_mode_enabled(),
+            can_edit_host_local_config: !self.is_shared_mode_enabled() || is_shared_follower,
+            can_persist_local_runtime_state: !is_shared_follower,
+            can_consume_shared_inbox: !self.is_shared_mode_enabled()
+                || self.is_current_shared_leader(),
+        }
+    }
+
+    fn can_run_leader_services(&self) -> bool {
+        self.cluster_capabilities().can_consume_shared_inbox
+    }
+
+    fn can_write_shared_state(&self) -> bool {
+        self.cluster_capabilities().can_write_shared_state
+    }
+
+    fn ensure_leader_services_running(&mut self) {
+        if !self.can_run_leader_services() {
+            return;
+        }
+
+        if self.persistence_tx.is_none() {
+            let (tx, task) = spawn_persistence_writer(self.app_command_tx.clone());
+            self.persistence_tx = Some(tx);
+            self.persistence_task = Some(task);
+        }
+
+        if self.rss_service_task.is_none() {
+            let Some(sync_now_rx) = self.rss_sync_rx.take() else {
+                return;
+            };
+            let Some(downloaded_entry_rx) = self.rss_downloaded_entry_rx.take() else {
+                return;
+            };
+            let Some(settings_rx) = self.rss_settings_rx.take() else {
+                return;
+            };
+            self.rss_service_task = Some(rss_service::spawn_rss_service(
+                self.client_configs.clone(),
+                self.app_state.rss_runtime.history.clone(),
+                self.app_command_tx.clone(),
+                sync_now_rx,
+                downloaded_entry_rx,
+                settings_rx,
+                self.shutdown_tx.clone(),
+            ));
+        }
+    }
+
+    fn current_shared_lock_path() -> io::Result<PathBuf> {
+        shared_root_path()
+            .map(|root| root.join("superseedr.lock"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Shared lock path unavailable"))
+    }
+
+    fn try_acquire_shared_runtime_lock() -> io::Result<Option<File>> {
+        let lock_path = Self::current_shared_lock_path()?;
+        let file = File::create(lock_path)?;
+        if file.try_lock().is_ok() {
+            Ok(Some(file))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn watch_path_if_needed(&mut self, path: PathBuf) -> io::Result<()> {
+        if self.watched_paths.iter().any(|existing| existing == &path) {
+            return Ok(());
+        }
+
+        self.watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .map_err(io::Error::other)?;
+        self.watched_paths.push(path);
+        Ok(())
+    }
+
+    fn desired_watch_paths_for_settings(&self, settings: &Settings) -> Vec<PathBuf> {
+        runtime_watch_paths(
+            settings,
+            self.shared_mode_enabled,
+            self.cluster_capabilities().can_consume_shared_inbox,
+        )
+    }
+
+    fn reconcile_watched_paths(&mut self, settings: &Settings) {
+        let desired_paths = self.desired_watch_paths_for_settings(settings);
+        let existing_paths = self.watched_paths.clone();
+
+        for existing in existing_paths {
+            if desired_paths.iter().any(|desired| desired == &existing) {
+                continue;
+            }
+
+            if let Err(error) = self.watcher.unwatch(&existing) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to stop watching path {:?}: {}",
+                    existing,
+                    error
+                );
+            }
+            self.watched_paths.retain(|path| path != &existing);
+        }
+
+        for desired in desired_paths {
+            if let Err(error) = self.watch_path_if_needed(desired) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to watch updated path after config change: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    fn control_priority_overrides(
+        file_priorities: &HashMap<usize, FilePriority>,
+    ) -> Vec<ControlFilePriorityOverride> {
+        let mut overrides: Vec<_> = file_priorities
+            .iter()
+            .map(|(file_index, priority)| ControlFilePriorityOverride {
+                file_index: *file_index,
+                priority: *priority,
+            })
+            .collect();
+        overrides.sort_by_key(|entry| entry.file_index);
+        overrides
+    }
+
+    fn shared_add_staging_dir() -> Result<PathBuf, String> {
+        shared_root_path()
+            .map(|root| root.join("staged-adds"))
+            .ok_or_else(|| "Shared add staging directory is unavailable".to_string())
+    }
+
+    fn is_shared_staged_add_path(path: &Path) -> bool {
+        Self::shared_add_staging_dir()
+            .map(|dir| path.starts_with(&dir))
+            .unwrap_or(false)
+    }
+
+    fn cleanup_staged_add_file(path: &Path) {
+        if !Self::is_shared_staged_add_path(path) {
+            return;
+        }
+
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != ErrorKind::NotFound {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to remove staged add file {:?}: {}",
+                    path,
+                    error
+                );
+            }
+        }
+    }
+
+    pub(crate) fn prepare_add_torrent_file_request(
+        &self,
+        source_path: PathBuf,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: HashMap<usize, FilePriority>,
+    ) -> Result<ControlRequest, String> {
+        let request_source_path = if self.is_current_shared_follower() {
+            let staging_dir = Self::shared_add_staging_dir()?;
+            fs::create_dir_all(&staging_dir)
+                .map_err(|error| format!("Failed to create shared staging directory: {}", error))?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let hash = hex::encode(sha1::Sha1::digest(
+                format!(
+                    "{}:{}:{}",
+                    source_path.display(),
+                    std::process::id(),
+                    now_ms
+                )
+                .as_bytes(),
+            ));
+            let staged_path =
+                staging_dir.join(format!("staged-{}-{}.torrent", now_ms, &hash[..12]));
+            fs::copy(&source_path, &staged_path).map_err(|error| {
+                format!(
+                    "Failed to stage torrent file {:?} for leader processing: {}",
+                    source_path, error
+                )
+            })?;
+            staged_path
+        } else {
+            source_path
+        };
+
+        Ok(ControlRequest::AddTorrentFile {
+            source_path: request_source_path,
+            download_path,
+            container_name,
+            file_priorities: Self::control_priority_overrides(&file_priorities),
+        })
+    }
+
+    pub(crate) fn prepare_add_magnet_request(
+        &self,
+        magnet_link: String,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: HashMap<usize, FilePriority>,
+    ) -> ControlRequest {
+        ControlRequest::AddMagnet {
+            magnet_link,
+            download_path,
+            container_name,
+            file_priorities: Self::control_priority_overrides(&file_priorities),
+        }
+    }
+
+    fn resolve_add_payload(
+        &self,
+        source: IngestSource,
+        path: &Path,
+    ) -> Result<ResolvedAddPayload, String> {
+        match source {
+            IngestSource::TorrentFile => Ok(ResolvedAddPayload::TorrentFile {
+                source_path: path.to_path_buf(),
+            }),
+            IngestSource::TorrentPathFile => {
+                let payload = fs::read_to_string(path).map_err(|error| {
+                    format!(
+                        "Failed to read torrent path from file {:?}: {}",
+                        path, error
+                    )
+                })?;
+                let source_path =
+                    crate::config::resolve_shared_cli_torrent_path(Path::new(payload.trim()))
+                        .map_err(|error| {
+                            format!(
+                                "Failed to resolve shared torrent path from file {:?}: {}",
+                                path, error
+                            )
+                        })?;
+                Ok(ResolvedAddPayload::TorrentFile { source_path })
+            }
+            IngestSource::MagnetFile => {
+                let payload = fs::read_to_string(path)
+                    .map_err(|error| format!("Failed to read magnet file {:?}: {}", path, error))?;
+                Ok(ResolvedAddPayload::MagnetLink {
+                    magnet_link: payload.trim().to_string(),
+                })
+            }
+        }
+    }
+
+    fn control_request_for_add_payload(
+        &self,
+        payload: &ResolvedAddPayload,
+        download_path: Option<PathBuf>,
+    ) -> Result<ControlRequest, String> {
+        match payload {
+            ResolvedAddPayload::TorrentFile { source_path } => self
+                .prepare_add_torrent_file_request(
+                    source_path.clone(),
+                    download_path,
+                    None,
+                    HashMap::new(),
+                ),
+            ResolvedAddPayload::MagnetLink { magnet_link } => Ok(self.prepare_add_magnet_request(
+                magnet_link.clone(),
+                download_path,
+                None,
+                HashMap::new(),
+            )),
+        }
+    }
+
+    fn resolve_add_ingress_action(&self, source: IngestSource, path: &Path) -> AddIngressAction {
+        let is_host_watch_path = self.is_host_watch_path(path);
+        let is_shared_inbox_path = self.is_shared_inbox_path(path);
+
+        if self.is_current_shared_follower()
+            && is_host_watch_path
+            && !matches!(source, IngestSource::TorrentPathFile)
+        {
+            return AddIngressAction::RelayRawWatchFile;
+        }
+
+        let payload = match self.resolve_add_payload(source, path) {
+            Ok(payload) => payload,
+            Err(message) => return AddIngressAction::Fail { message },
+        };
+
+        if self.is_current_shared_follower()
+            && !is_shared_inbox_path
+            && self.client_configs.default_download_folder.is_some()
+        {
+            return match self.control_request_for_add_payload(
+                &payload,
+                self.client_configs.default_download_folder.clone(),
+            ) {
+                Ok(request) => AddIngressAction::QueueControlRequest(request),
+                Err(message) => AddIngressAction::Fail { message },
+            };
+        }
+
+        if self.is_current_shared_follower()
+            && is_host_watch_path
+            && matches!(source, IngestSource::TorrentPathFile)
+        {
+            return AddIngressAction::Fail {
+                message: "Follower .path ingest requires a default download folder so the referenced torrent can be staged for leader processing.".to_string(),
+            };
+        }
+
+        if let Some(download_path) = self.client_configs.default_download_folder.clone() {
+            AddIngressAction::ApplyDirectly {
+                payload,
+                download_path,
+            }
+        } else {
+            AddIngressAction::OpenManualBrowser { payload }
+        }
+    }
+
+    fn should_archive_processed_ingest(&self, source: IngestSource, path: &Path) -> bool {
+        match source {
+            IngestSource::TorrentFile => {
+                self.is_host_watch_path(path) || self.is_shared_inbox_path(path)
+            }
+            IngestSource::TorrentPathFile | IngestSource::MagnetFile => true,
+        }
+    }
+
+    fn update_pending_ingest_source_path(&mut self, path: &Path, final_path: PathBuf) {
+        let correlation_id = self
+            .app_state
+            .pending_ingest_by_path
+            .get_mut(path)
+            .map(|record| {
+                record.source_path = final_path.clone();
+                record.correlation_id.clone()
+            });
+
+        let Some(correlation_id) = correlation_id else {
+            return;
+        };
+
+        for entry in self.app_state.event_journal_state.entries.iter_mut().rev() {
+            if entry.category != EventCategory::Ingest {
+                continue;
+            }
+            if entry.correlation_id.as_deref() != Some(correlation_id.as_str()) {
+                continue;
+            }
+            entry.source_path = Some(final_path.clone());
+            if entry.event_type == EventType::IngestQueued {
+                break;
+            }
+        }
+    }
+
+    fn archive_processed_ingest(&mut self, source: IngestSource, path: &Path) -> Option<PathBuf> {
+        if !self.should_archive_processed_ingest(source, path) {
+            return None;
+        }
+
+        match archive_watch_file(path, source.processed_archive_extension()) {
+            Ok(destination) => {
+                self.update_pending_ingest_source_path(path, destination.clone());
+                Some(destination)
+            }
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to archive processed ingest file {:?}: {}",
+                    path,
+                    error
+                );
+                None
+            }
+        }
+    }
+
+    fn open_manual_browser_for_torrent_file(&mut self, path: PathBuf) -> Result<(), String> {
+        let buffer = fs::read(&path).map_err(|_| "Failed to read torrent file.".to_string())?;
+        let torrent = from_bytes(&buffer)
+            .map_err(|_| "Failed to parse torrent file for preview.".to_string())?;
+
+        let final_path = if self.is_host_watch_path(&path) || self.is_shared_inbox_path(&path) {
+            match archive_watch_file(&path, "torrent.added") {
+                Ok(final_path) => {
+                    self.update_pending_ingest_source_path(&path, final_path.clone());
+                    final_path
+                }
+                Err(error) => {
+                    tracing::error!("Failed to archive watched file for manual add: {}", error);
+                    path.clone()
+                }
+            }
+        } else {
+            path.clone()
+        };
+
+        let info_hash = if torrent.info.meta_version == Some(2) {
+            let mut hasher = Sha256::new();
+            hasher.update(&torrent.info_dict_bencode);
+            hasher.finalize()[0..20].to_vec()
+        } else {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(&torrent.info_dict_bencode);
+            hasher.finalize().to_vec()
+        };
+
+        let info_hash_hex = hex::encode(&info_hash);
+        let default_container_name = format!("{} [{}]", torrent.info.name, info_hash_hex);
+        let file_list = torrent.file_list();
+        let should_enclose = file_list.len() > 1;
+        let preview_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_list
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (parts, size))| {
+                (
+                    parts,
+                    TorrentPreviewPayload {
+                        file_index: Some(idx),
+                        size,
+                        priority: FilePriority::Normal,
+                    },
+                )
+            })
+            .collect();
+
+        let preview_tree = RawNode::from_path_list(None, preview_payloads);
+        let mut preview_state = TreeViewState::new();
+        for node in &preview_tree {
+            node.expand_all(&mut preview_state);
+        }
+
+        self.app_state.pending_torrent_path = Some(final_path);
+        let initial_path = self.get_initial_destination_path();
+
+        let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+            path: initial_path,
+            browser_mode: FileBrowserMode::DownloadLocSelection {
+                torrent_files: vec![],
+                container_name: default_container_name.clone(),
+                use_container: should_enclose,
+                is_editing_name: false,
+                preview_tree,
+                preview_state,
+                focused_pane: BrowserPane::FileSystem,
+                cursor_pos: 0,
+                original_name_backup: default_container_name,
+            },
+            highlight_path: None,
+        });
+        Ok(())
+    }
+
+    fn open_manual_browser_for_payload(
+        &mut self,
+        source: IngestSource,
+        payload: ResolvedAddPayload,
+    ) -> Result<(), String> {
+        match payload {
+            ResolvedAddPayload::TorrentFile { source_path } => {
+                if matches!(source, IngestSource::TorrentFile) {
+                    self.open_manual_browser_for_torrent_file(source_path)
+                } else {
+                    self.app_state.pending_torrent_path = Some(source_path);
+                    let initial_path = self.get_initial_destination_path();
+                    let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                        path: initial_path,
+                        browser_mode: FileBrowserMode::DownloadLocSelection {
+                            torrent_files: vec![],
+                            container_name: "New Torrent".to_string(),
+                            use_container: true,
+                            is_editing_name: false,
+                            preview_tree: Vec::new(),
+                            preview_state: TreeViewState::default(),
+                            focused_pane: BrowserPane::FileSystem,
+                            cursor_pos: 0,
+                            original_name_backup: "New Torrent".to_string(),
+                        },
+                        highlight_path: None,
+                    });
+                    Ok(())
+                }
+            }
+            ResolvedAddPayload::MagnetLink { magnet_link } => {
+                self.app_state.pending_torrent_link = magnet_link;
+                let initial_path = self.get_initial_destination_path();
+                let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                    path: initial_path,
+                    browser_mode: FileBrowserMode::DownloadLocSelection {
+                        torrent_files: vec![],
+                        container_name: "Magnet Download".to_string(),
+                        use_container: true,
+                        is_editing_name: false,
+                        preview_tree: Vec::new(),
+                        preview_state: TreeViewState::default(),
+                        focused_pane: BrowserPane::FileSystem,
+                        cursor_pos: 0,
+                        original_name_backup: "Magnet Download".to_string(),
+                    },
+                    highlight_path: None,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    async fn execute_add_ingress_action(
+        &mut self,
+        source: IngestSource,
+        path: PathBuf,
+        action: AddIngressAction,
+    ) {
+        match action {
+            AddIngressAction::RelayRawWatchFile => {
+                self.app_state.pending_ingest_by_path.remove(&path);
+                self.relay_local_watch_file(&path, source.relay_archive_extension());
+                self.save_state_to_disk();
+            }
+            AddIngressAction::QueueControlRequest(request) => {
+                let origin = self.control_origin_for_ingest_path(&path);
+                if self.is_host_watch_path(&path) {
+                    self.app_state.pending_ingest_by_path.remove(&path);
+                }
+                match self.dispatch_cluster_control_request(request, origin).await {
+                    Ok(_message) => {
+                        self.archive_processed_ingest(source, &path);
+                    }
+                    Err(error) => {
+                        self.app_state.system_error = Some(error);
+                        self.app_state.ui.needs_redraw = true;
+                    }
+                }
+            }
+            AddIngressAction::ApplyDirectly {
+                payload,
+                download_path,
+            } => {
+                let ingest_result = match payload {
+                    ResolvedAddPayload::TorrentFile { source_path } => {
+                        self.add_torrent_from_file(
+                            source_path,
+                            Some(download_path),
+                            false,
+                            TorrentControlState::Running,
+                            HashMap::new(),
+                            None,
+                        )
+                        .await
+                    }
+                    ResolvedAddPayload::MagnetLink { magnet_link } => {
+                        self.add_magnet_torrent(
+                            "Fetching name...".to_string(),
+                            magnet_link,
+                            Some(download_path),
+                            false,
+                            TorrentControlState::Running,
+                            HashMap::new(),
+                            None,
+                        )
+                        .await
+                    }
+                };
+                if let CommandIngestResult::Added {
+                    info_hash: Some(info_hash),
+                    ..
+                } = &ingest_result
+                {
+                    tracing_event!(
+                        Level::INFO,
+                        info_hash = %hex::encode(info_hash),
+                        torrent_count = self.app_state.torrents.len(),
+                        present_in_runtime = self.app_state.torrents.contains_key(info_hash),
+                        "Direct ingest added torrent to runtime before persistence"
+                    );
+                }
+                self.record_ingest_result(&path, &ingest_result);
+                self.save_state_to_disk();
+                self.archive_processed_ingest(source, &path);
+            }
+            AddIngressAction::OpenManualBrowser { payload } => {
+                if let Err(message) = self.open_manual_browser_for_payload(source, payload) {
+                    self.app_state.system_error = Some(message.clone());
+                    self.record_ingest_result(
+                        &path,
+                        &CommandIngestResult::Failed {
+                            info_hash: None,
+                            torrent_name: None,
+                            message,
+                        },
+                    );
+                    self.save_state_to_disk();
+                }
+                if !matches!(source, IngestSource::TorrentFile) {
+                    self.archive_processed_ingest(source, &path);
+                }
+            }
+            AddIngressAction::Fail { message } => {
+                tracing_event!(Level::ERROR, "{}", message);
+                self.app_state.system_error = Some(message.clone());
+                self.record_ingest_result(
+                    &path,
+                    &CommandIngestResult::Failed {
+                        info_hash: None,
+                        torrent_name: None,
+                        message,
+                    },
+                );
+                self.save_state_to_disk();
+                self.archive_processed_ingest(source, &path);
+            }
+        }
+    }
+
+    fn queue_control_request_for_leader(
+        &mut self,
+        request: ControlRequest,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
+        if !self.cluster_capabilities().can_queue_shared_commands {
+            return Err("Shared command queue is unavailable in this mode".to_string());
+        }
+        let watch_path = resolve_command_watch_path(&self.client_configs)
+            .ok_or_else(|| "Could not resolve the shared command inbox".to_string())?;
+        let queued_path = write_control_request(&request, &watch_path)
+            .map_err(|error| format!("Failed to queue shared control request: {}", error))?;
+        self.record_control_queued(queued_path, request.clone(), origin);
+        self.save_state_to_disk();
+        Ok(format!(
+            "Queued for leader processing. {}",
+            online_control_success_message(&request)
+        ))
+    }
+
+    pub async fn dispatch_cluster_control_request(
+        &mut self,
+        request: ControlRequest,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
+        if self.is_current_shared_follower() {
+            self.queue_control_request_for_leader(request, origin)
+        } else {
+            self.apply_control_request(&request).await
+        }
+    }
+
+    fn map_add_result_to_control_response(result: CommandIngestResult) -> Result<String, String> {
+        match result {
+            CommandIngestResult::Added { torrent_name, .. } => Ok(format!(
+                "Added torrent '{}'",
+                torrent_name.unwrap_or_else(|| "unknown".to_string())
+            )),
+            CommandIngestResult::Duplicate { torrent_name, .. } => Ok(format!(
+                "Torrent '{}' was already present",
+                torrent_name.unwrap_or_else(|| "unknown".to_string())
+            )),
+            CommandIngestResult::Invalid { message, .. }
+            | CommandIngestResult::Failed { message, .. } => Err(message),
+        }
+    }
+
+    async fn maybe_promote_to_shared_leader(&mut self) {
+        if !self.is_current_shared_follower() {
+            return;
+        }
+
+        let Ok(Some(lock_handle)) = Self::try_acquire_shared_runtime_lock() else {
+            return;
+        };
+
+        tracing_event!(
+            Level::INFO,
+            "Acquired shared lock; promoting node to cluster leader."
+        );
+        self.app_lock_handle = Some(lock_handle);
+        self.current_cluster_role = Some(AppClusterRole::Leader);
+        self.runtime_mode = AppRuntimeMode::SharedLeader;
+        self.leader_status_snapshot = None;
+        self.sync_cluster_role_label();
+
+        if let Some(shared_inbox) = shared_inbox_path() {
+            if let Err(error) = self.watch_path_if_needed(shared_inbox) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to watch shared inbox after promotion: {}",
+                    error
+                );
+            }
+        }
+
+        self.ensure_leader_services_running();
+
+        match crate::config::load_settings() {
+            Ok(new_settings) => {
+                if new_settings != self.client_configs {
+                    self.apply_settings_update(new_settings, false).await;
+                }
+                self.start_missing_runtime_torrents_for_current_role().await;
+            }
+            Err(error) => {
+                tracing_event!(
+                    Level::ERROR,
+                    "Failed to reload shared config after promotion: {}",
+                    error
+                );
+                self.app_state.system_error = Some(format!(
+                    "Failed to reload shared config after promotion: {}",
+                    error
+                ));
+            }
+        }
+
+        self.process_pending_commands().await;
     }
 
     pub async fn run(
@@ -1261,22 +2420,26 @@ impl App {
         let mut dht_bootstrap_retry_interval = time::interval(Duration::from_secs(60));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
+        let mut watch_folder_rescan_interval =
+            time::interval(Duration::from_secs(WATCH_FOLDER_RESCAN_INTERVAL_SECS));
+        let mut shared_role_retry_interval =
+            time::interval(Duration::from_secs(SHARED_ROLE_RETRY_INTERVAL_SECS));
         let mut integrity_scheduler_interval = time::interval(INTEGRITY_SCHEDULER_TICK_INTERVAL);
         self.reschedule_tuning_deadline();
         dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         network_history_persist_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        watch_folder_rescan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        shared_role_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         integrity_scheduler_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        let output_status_interval = self.client_configs.output_status_interval;
-        let mut status_dump_timer = tokio::time::interval(std::time::Duration::from_secs(
-            output_status_interval.max(1),
-        ));
 
         self.save_state_to_disk();
         self.dump_status_to_file();
+        self.reschedule_status_dump_deadline();
 
         let mut next_draw_time = Instant::now();
         while !self.app_state.should_quit {
+            self.flush_pending_watch_commands();
+
             let current_target_framerate = match self.app_state.mode {
                 AppMode::Welcome => Duration::from_millis(16), // Force 60 FPS for animation
                 AppMode::PowerSaving => Duration::from_secs(1), // Force 1 FPS for Zen mode
@@ -1284,12 +2447,18 @@ impl App {
             };
             let next_tuning_at = self.next_tuning_at;
             let next_paste_flush_at = self.app_state.ui.normal_paste_burst.next_deadline();
+            let next_status_dump_at = self.next_status_dump_at;
 
             tokio::select! {
                 _ = signal::ctrl_c() => {
                     self.app_state.should_quit = true;
                 }
-                Ok(Ok((stream, _addr))) = tokio::time::timeout(Duration::from_secs(2), self.listener.accept()) => {
+                Ok(Ok((stream, _addr))) = async {
+                    match &self.listener {
+                        Some(listener) => tokio::time::timeout(Duration::from_secs(2), listener.accept()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     self.handle_incoming_peer(stream).await;
 
                 }
@@ -1310,6 +2479,14 @@ impl App {
 
                 Some(result) = self.notify_rx.recv() => {
                     self.handle_file_event(result).await;
+                }
+
+                _ = watch_folder_rescan_interval.tick() => {
+                    self.process_pending_commands().await;
+                }
+                _ = shared_role_retry_interval.tick() => {
+                    self.maybe_promote_to_shared_leader().await;
+                    self.refresh_follower_read_model();
                 }
 
                 _ = async {
@@ -1334,8 +2511,14 @@ impl App {
                     self.reschedule_tuning_deadline();
                 }
 
-                _ = status_dump_timer.tick(), if output_status_interval > 0 => {
-                    self.dump_status_to_file();
+                _ = async {
+                    if let Some(deadline) = next_status_dump_at {
+                        time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    self.trigger_status_dump_now();
                 }
                 _ = network_history_persist_interval.tick() => {
                     if should_persist_network_history_on_interval(&self.app_state) {
@@ -1674,277 +2857,296 @@ impl App {
         crate::tui::screens::rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
     }
 
+    fn remove_torrent_runtime(&mut self, info_hash: &[u8]) {
+        self.app_state.torrents.remove(info_hash);
+        self.startup_completion_suppressed_hashes.remove(info_hash);
+        self.torrent_manager_command_txs.remove(info_hash);
+        self.torrent_manager_incoming_peer_txs.remove(info_hash);
+        self.torrent_metric_watch_rxs.remove(info_hash);
+        self.integrity_scheduler.remove_torrent(info_hash);
+        self.app_state
+            .torrent_list_order
+            .retain(|candidate| candidate.as_slice() != info_hash);
+        clamp_selected_indices_in_state(&mut self.app_state);
+        self.refresh_rss_derived();
+        self.dispatch_integrity_probe_batches();
+    }
+
+    async fn load_runtime_torrent_from_settings(&mut self, torrent_config: TorrentSettings) {
+        if !should_load_persisted_torrent(&torrent_config) {
+            tracing_event!(
+                Level::WARN,
+                torrent = %torrent_config.torrent_or_magnet,
+                "Skipping persisted torrent left in transient Deleting state during startup or convergence"
+            );
+            return;
+        }
+
+        tracing_event!(
+            Level::INFO,
+            torrent = %torrent_config.torrent_or_magnet,
+            torrent_name = %torrent_config.name,
+            validation_status = torrent_config.validation_status,
+            "Restoring persisted torrent into runtime"
+        );
+        if torrent_config.validation_status {
+            if let Some(info_hash) =
+                info_hash_from_torrent_source(&torrent_config.torrent_or_magnet)
+            {
+                self.startup_completion_suppressed_hashes.insert(info_hash);
+            }
+        }
+
+        if self.should_suppress_follower_runtime_for_torrent(&torrent_config) {
+            self.ensure_display_only_torrent_from_settings(&torrent_config);
+            return;
+        }
+
+        if torrent_config.torrent_or_magnet.starts_with("magnet:") {
+            self.add_magnet_torrent(
+                torrent_config.name.clone(),
+                torrent_config.torrent_or_magnet.clone(),
+                torrent_config.download_path.clone(),
+                torrent_config.validation_status,
+                torrent_config.torrent_control_state,
+                torrent_config.file_priorities,
+                torrent_config.container_name,
+            )
+            .await;
+        } else {
+            self.add_torrent_from_file(
+                PathBuf::from(&torrent_config.torrent_or_magnet),
+                torrent_config.download_path.clone(),
+                torrent_config.validation_status,
+                torrent_config.torrent_control_state,
+                torrent_config.file_priorities.clone(),
+                torrent_config.container_name,
+            )
+            .await;
+        }
+    }
+
+    async fn sync_runtime_torrents_from_settings(
+        &mut self,
+        old_settings: &Settings,
+        new_settings: &Settings,
+    ) {
+        let old_by_hash: HashMap<Vec<u8>, &TorrentSettings> = old_settings
+            .torrents
+            .iter()
+            .filter_map(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                    .map(|hash| (hash, torrent))
+            })
+            .collect();
+        let new_by_hash: HashMap<Vec<u8>, &TorrentSettings> = new_settings
+            .torrents
+            .iter()
+            .filter_map(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                    .map(|hash| (hash, torrent))
+            })
+            .collect();
+        let added_torrents: Vec<TorrentSettings> = new_by_hash
+            .iter()
+            .filter(|(info_hash, _)| !old_by_hash.contains_key(*info_hash))
+            .map(|(_, torrent)| (*torrent).clone())
+            .collect();
+        let default_download_changed =
+            old_settings.default_download_folder != new_settings.default_download_folder;
+
+        for (info_hash, torrent) in &new_by_hash {
+            if let Some(runtime) = self.app_state.torrents.get_mut(info_hash) {
+                runtime.latest_state.torrent_name = torrent.name.clone();
+                runtime.latest_state.download_path = torrent
+                    .download_path
+                    .clone()
+                    .or_else(|| new_settings.default_download_folder.clone());
+                runtime.latest_state.container_name = torrent.container_name.clone();
+                runtime.latest_state.file_priorities = torrent.file_priorities.clone();
+                runtime.latest_state.torrent_control_state = torrent.torrent_control_state.clone();
+                runtime.latest_state.delete_files = torrent.delete_files;
+            }
+
+            if self.should_suppress_follower_runtime_for_torrent(torrent) {
+                if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
+                    let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                }
+                self.ensure_display_only_torrent_from_settings(torrent);
+                continue;
+            }
+
+            let Some(previous) = old_by_hash.get(info_hash) else {
+                continue;
+            };
+
+            if previous.torrent_control_state != torrent.torrent_control_state {
+                if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
+                    let command = match torrent.torrent_control_state {
+                        TorrentControlState::Paused => Some(ManagerCommand::Pause),
+                        TorrentControlState::Running => Some(ManagerCommand::Resume),
+                        TorrentControlState::Deleting => {
+                            if torrent.delete_files {
+                                Some(ManagerCommand::DeleteFile)
+                            } else {
+                                Some(ManagerCommand::Shutdown)
+                            }
+                        }
+                    };
+                    if let Some(command) = command {
+                        let _ = manager_tx.try_send(command);
+                    }
+                }
+            }
+
+            if default_download_changed
+                || previous.download_path != torrent.download_path
+                || previous.container_name != torrent.container_name
+                || previous.file_priorities != torrent.file_priorities
+            {
+                if let Some(torrent_data_path) = torrent
+                    .download_path
+                    .clone()
+                    .or_else(|| new_settings.default_download_folder.clone())
+                {
+                    if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
+                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
+                            torrent_data_path,
+                            file_priorities: torrent.file_priorities.clone(),
+                            container_name: torrent.container_name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for info_hash in old_by_hash.keys() {
+            if new_by_hash.contains_key(info_hash) {
+                continue;
+            }
+
+            if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
+                let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                if let Some(runtime) = self.app_state.torrents.get_mut(info_hash) {
+                    runtime.latest_state.torrent_control_state = TorrentControlState::Deleting;
+                    runtime.latest_state.delete_files = false;
+                }
+            } else {
+                self.remove_torrent_runtime(info_hash);
+            }
+        }
+
+        for torrent in added_torrents {
+            self.load_runtime_torrent_from_settings(torrent).await;
+        }
+
+        if self.is_current_shared_follower() {
+            self.refresh_follower_read_model();
+        }
+    }
+
+    async fn apply_settings_update(&mut self, new_settings: Settings, persist: bool) {
+        let old_settings = self.client_configs.clone();
+        self.client_configs = new_settings.clone();
+        let _ = self.rss_settings_tx.send(self.client_configs.clone());
+        let rss_changed = rss_settings_changed(&old_settings, &new_settings);
+        self.sync_runtime_torrents_from_settings(&old_settings, &new_settings)
+            .await;
+
+        if let Err(error) = crate::config::ensure_watch_directories(&self.client_configs) {
+            tracing::warn!(
+                "Failed to ensure configured watch directories exist after config update: {}",
+                error
+            );
+        }
+        self.reconcile_watched_paths(&new_settings);
+
+        if new_settings.ui_theme != old_settings.ui_theme {
+            self.app_state.theme = Theme::builtin(new_settings.ui_theme);
+        }
+
+        if new_settings.client_port != old_settings.client_port {
+            tracing::info!(
+                "Config update: Port changed to {}",
+                new_settings.client_port
+            );
+            self.rebind_listener(new_settings.client_port).await;
+        }
+
+        if new_settings.global_download_limit_bps != old_settings.global_download_limit_bps {
+            self.global_dl_bucket
+                .set_rate(new_settings.global_download_limit_bps as f64);
+        }
+        if new_settings.global_upload_limit_bps != old_settings.global_upload_limit_bps {
+            self.global_ul_bucket
+                .set_rate(new_settings.global_upload_limit_bps as f64);
+        }
+
+        if self.status_dump_interval_override_secs.is_none() {
+            self.reschedule_status_dump_deadline();
+        }
+
+        if rss_changed {
+            prune_rss_feed_errors(
+                &mut self.app_state.rss_runtime.feed_errors,
+                &self.client_configs,
+            );
+            self.refresh_rss_derived();
+            let _ = self.rss_sync_tx.try_send(());
+        }
+
+        if persist {
+            self.save_state_to_disk();
+        }
+
+        self.app_state.system_error = None;
+        self.app_state.ui.needs_redraw = true;
+    }
+
     async fn handle_app_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::AddTorrentFromFile(path) => {
-                // Determine if the file is coming from a watch folder (User or System)
-                let parent_dir = path.parent();
-                let is_user_watch = self
-                    .client_configs
-                    .watch_folder
-                    .as_ref()
-                    .is_some_and(|p| parent_dir == Some(p));
-
-                let system_watch_info = get_watch_path();
-                let is_system_watch = system_watch_info
-                    .as_ref()
-                    .is_some_and(|(p, _)| parent_dir == Some(p));
-
-                if let Some(download_path) = &self.client_configs.default_download_folder {
-                    // --- CASE A: Automatic Adding (Default Path Exists) ---
-                    self.add_torrent_from_file(
-                        path.to_path_buf(),
-                        Some(download_path.to_path_buf()),
-                        false,
-                        TorrentControlState::Running,
-                        HashMap::new(),
-                        None,
-                    )
+                let action = self.resolve_add_ingress_action(IngestSource::TorrentFile, &path);
+                self.execute_add_ingress_action(IngestSource::TorrentFile, path, action)
                     .await;
-
-                    self.save_state_to_disk();
-
-                    // Cleanup: Move to processed or rename to .added
-                    if is_user_watch || is_system_watch {
-                        let move_successful = if let Some((_, processed_path)) = system_watch_info {
-                            (|| {
-                                fs::create_dir_all(&processed_path).ok()?;
-                                let file_name = path.file_name()?;
-                                let new_path = processed_path.join(file_name);
-                                fs::rename(&path, &new_path).ok()?;
-                                Some(())
-                            })()
-                            .is_some()
-                        } else {
-                            false
-                        };
-
-                        if !move_successful {
-                            let mut new_path = path.clone();
-                            new_path.set_extension("torrent.added");
-                            let _ = fs::rename(&path, &new_path);
-                        }
-                    }
-                } else {
-                    // --- CASE B: Manual Adding (Prompt for Location) ---
-                    if let Ok(buffer) = fs::read(&path) {
-                        if let Ok(torrent) = from_bytes(&buffer) {
-                            // 1. Rename the file immediately if it's in a watch folder
-                            // This prevents the watcher from re-triggering while the UI is open.
-                            let final_path = if is_user_watch || is_system_watch {
-                                let mut new_path = path.clone();
-                                new_path.set_extension("torrent.added");
-                                if let Err(e) = fs::rename(&path, &new_path) {
-                                    tracing::error!("Failed to rename watched file: {}", e);
-                                    path.clone()
-                                } else {
-                                    new_path
-                                }
-                            } else {
-                                path.clone()
-                            };
-
-                            // 2. Parse metadata for the UI Preview
-                            let info_hash = if torrent.info.meta_version == Some(2) {
-                                let mut hasher = Sha256::new();
-                                hasher.update(&torrent.info_dict_bencode);
-                                hasher.finalize()[0..20].to_vec()
-                            } else {
-                                let mut hasher = sha1::Sha1::new();
-                                hasher.update(&torrent.info_dict_bencode);
-                                hasher.finalize().to_vec()
-                            };
-
-                            let info_hash_hex = hex::encode(&info_hash);
-                            let default_container_name =
-                                format!("{} [{}]", torrent.info.name, info_hash_hex);
-                            let file_list = torrent.file_list();
-                            let should_enclose = file_list.len() > 1;
-
-                            // 3. Build Preview Tree
-                            let preview_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> =
-                                file_list
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(idx, (parts, size))| {
-                                        (
-                                            parts,
-                                            TorrentPreviewPayload {
-                                                file_index: Some(idx),
-                                                size,
-                                                priority: FilePriority::Normal,
-                                            },
-                                        )
-                                    })
-                                    .collect();
-
-                            let preview_tree = RawNode::from_path_list(None, preview_payloads);
-                            let mut preview_state = TreeViewState::new();
-                            for node in &preview_tree {
-                                node.expand_all(&mut preview_state);
-                            }
-
-                            // 4. Update state and switch to File Browser
-                            self.app_state.pending_torrent_path = Some(final_path);
-                            let initial_path = self.get_initial_destination_path();
-
-                            let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
-                                path: initial_path,
-                                browser_mode: FileBrowserMode::DownloadLocSelection {
-                                    torrent_files: vec![],
-                                    container_name: default_container_name.clone(),
-                                    use_container: should_enclose,
-                                    is_editing_name: false,
-                                    preview_tree,
-                                    preview_state,
-                                    focused_pane: BrowserPane::FileSystem,
-                                    cursor_pos: 0,
-                                    original_name_backup: default_container_name,
-                                },
-                                highlight_path: None,
-                            });
-                        } else {
-                            self.app_state.system_error =
-                                Some("Failed to parse torrent file for preview.".to_string());
-                        }
-                    } else {
-                        self.app_state.system_error =
-                            Some("Failed to read torrent file.".to_string());
-                    }
-                }
             }
             AppCommand::AddTorrentFromPathFile(path) => {
-                if let Some((_, processed_path)) = get_watch_path() {
-                    match fs::read_to_string(&path) {
-                        Ok(torrent_file_path_str) => {
-                            let torrent_file_path = PathBuf::from(torrent_file_path_str.trim());
-                            if let Some(download_path) =
-                                self.client_configs.default_download_folder.clone()
-                            {
-                                self.add_torrent_from_file(
-                                    torrent_file_path,
-                                    Some(download_path),
-                                    false,
-                                    TorrentControlState::Running,
-                                    HashMap::new(),
-                                    None,
-                                )
-                                .await;
-                                self.save_state_to_disk();
-                            } else {
-                                self.app_state.pending_torrent_path = Some(torrent_file_path);
-                                let initial_path = self.get_initial_destination_path();
-
-                                let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
-                                    path: initial_path,
-                                    browser_mode: FileBrowserMode::DownloadLocSelection {
-                                        torrent_files: vec![],
-                                        container_name: "New Torrent".to_string(),
-                                        use_container: true,
-                                        is_editing_name: false,
-                                        preview_tree: Vec::new(),
-                                        preview_state: TreeViewState::default(),
-                                        focused_pane: BrowserPane::FileSystem,
-                                        cursor_pos: 0,
-                                        original_name_backup: "New Torrent".to_string(),
-                                    },
-                                    highlight_path: None,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            tracing_event!(
-                                Level::ERROR,
-                                "Failed to read torrent path from file {:?}: {}",
-                                &path,
-                                e
-                            );
-                        }
-                    }
-
-                    if let Some(file_name) = path.file_name() {
-                        let new_path = processed_path.join(file_name);
-                        if let Err(e) = fs::rename(&path, &new_path) {
-                            tracing_event!(
-                                Level::WARN,
-                                "Failed to move processed path file {:?}: {}",
-                                &path,
-                                e
-                            );
-                        }
-                    }
-                }
+                let action = self.resolve_add_ingress_action(IngestSource::TorrentPathFile, &path);
+                self.execute_add_ingress_action(IngestSource::TorrentPathFile, path, action)
+                    .await;
             }
             AppCommand::AddMagnetFromFile(path) => {
-                if let Some((_, processed_path)) = get_watch_path() {
-                    match fs::read_to_string(&path) {
-                        Ok(magnet_link) => {
-                            if let Some(download_path) =
-                                self.client_configs.default_download_folder.clone()
-                            {
-                                self.add_magnet_torrent(
-                                    "Fetching name...".to_string(),
-                                    magnet_link.trim().to_string(),
-                                    Some(download_path),
-                                    false,
-                                    TorrentControlState::Running,
-                                    HashMap::new(),
-                                    None,
-                                )
-                                .await;
-                                self.save_state_to_disk();
-                            } else {
-                                self.app_state.pending_torrent_link = magnet_link;
-                                let initial_path = self.get_initial_destination_path();
+                let action = self.resolve_add_ingress_action(IngestSource::MagnetFile, &path);
+                self.execute_add_ingress_action(IngestSource::MagnetFile, path, action)
+                    .await;
+            }
+            AppCommand::SubmitControlRequest(request) => {
+                if let Err(error) = self
+                    .dispatch_cluster_control_request(request, ControlOrigin::CliOnline)
+                    .await
+                {
+                    self.app_state.system_error = Some(error);
+                    self.app_state.ui.needs_redraw = true;
+                }
+            }
+            AppCommand::ControlRequest { path, request } => {
+                if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
+                    self.app_state.pending_control_by_path.remove(&path);
+                    self.relay_local_watch_file(&path, "control.forwarded");
+                    self.save_state_to_disk();
+                    return;
+                }
 
-                                let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
-                                    path: initial_path,
-                                    browser_mode: FileBrowserMode::DownloadLocSelection {
-                                        torrent_files: vec![],
-                                        container_name: "Magnet Download".to_string(), // Default name for magnets
-                                        use_container: true,
-                                        is_editing_name: false,
-                                        preview_tree: Vec::new(), // Magnets start with empty metadata
-                                        preview_state: TreeViewState::default(),
-                                        focused_pane: BrowserPane::FileSystem,
-                                        cursor_pos: 0,
-                                        original_name_backup: "Magnet Download".to_string(),
-                                    },
-                                    highlight_path: None,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            tracing_event!(
-                                Level::ERROR,
-                                "Failed to read magnet file {:?}: {}",
-                                &path,
-                                e
-                            );
-                        }
-                    }
+                let result = self.apply_control_request(&request).await;
+                self.record_control_result(&path, &request, result);
+                self.save_state_to_disk();
 
-                    if let Err(e) = fs::create_dir_all(&processed_path) {
-                        tracing_event!(
-                            Level::ERROR,
-                            "Could not create processed files directory: {}",
-                            e
-                        );
-                    } else if let Some(file_name) = path.file_name() {
-                        let new_path = processed_path.join(file_name);
-                        if let Err(e) = fs::rename(&path, &new_path) {
-                            tracing_event!(
-                                Level::ERROR,
-                                "Failed to move processed magnet file {:?}: {}",
-                                &path,
-                                e
-                            );
-                        }
-                    }
-                } else {
+                if let Err(error) = archive_watch_file(&path, "control.done") {
                     tracing_event!(
-                        Level::ERROR,
-                        "Could not get system watch paths for magnet processing."
+                        Level::WARN,
+                        "Failed to archive processed control file {:?}: {}",
+                        &path,
+                        error
                     );
                 }
             }
@@ -2117,7 +3319,18 @@ impl App {
                 self.save_state_to_disk();
                 self.app_state.ui.needs_redraw = true;
             }
-            AppCommand::RssDownloadSelected(entry) => {
+            AppCommand::RssDownloadSelected {
+                entry,
+                command_path,
+            } => {
+                if let Some(command_path) = command_path {
+                    let ingest_kind = ingest_kind_from_path(&command_path).unwrap_or_default();
+                    let origin = match entry.added_via {
+                        crate::config::RssAddedVia::Auto => IngestOrigin::RssAuto,
+                        crate::config::RssAddedVia::Manual => IngestOrigin::RssManual,
+                    };
+                    self.record_rss_queued(command_path, origin, ingest_kind);
+                }
                 let existing_idx = self
                     .app_state
                     .rss_runtime
@@ -2166,67 +3379,52 @@ impl App {
                 apply_activity_history_persist_result(&mut self.app_state, request_id, success);
             }
             AppCommand::UpdateConfig(new_settings) => {
-                let old_settings = self.client_configs.clone();
-                self.client_configs = new_settings.clone();
-                let _ = self.rss_settings_tx.send(self.client_configs.clone());
-                let rss_changed = rss_settings_changed(&old_settings, &new_settings);
-
-                if new_settings.ui_theme != old_settings.ui_theme {
-                    self.app_state.theme = Theme::builtin(new_settings.ui_theme);
-                }
-
-                // 1. Handle Port Change (Re-bind Listener)
-                if new_settings.client_port != old_settings.client_port {
-                    tracing::info!(
-                        "Config update: Port changed to {}",
-                        new_settings.client_port
-                    );
-                    // Reuse your existing port logic or extract it to a helper
-                    self.rebind_listener(new_settings.client_port).await;
-                }
-
-                // 2. Handle Bandwidth Limit Changes (Update Buckets)
-                if new_settings.global_download_limit_bps != old_settings.global_download_limit_bps
-                {
-                    self.global_dl_bucket
-                        .set_rate(new_settings.global_download_limit_bps as f64);
-                }
-                if new_settings.global_upload_limit_bps != old_settings.global_upload_limit_bps {
-                    self.global_ul_bucket
-                        .set_rate(new_settings.global_upload_limit_bps as f64);
-                }
-
-                if new_settings.watch_folder != old_settings.watch_folder {
-                    if let Some(old_path) = old_settings.watch_folder {
-                        if let Err(e) = self.watcher.unwatch(&old_path) {
-                            tracing::info!("Failed to unwatch old folder {:?}: {}", old_path, e);
+                let capabilities = self.cluster_capabilities();
+                if capabilities.can_edit_host_local_config && self.is_current_shared_follower() {
+                    match classify_shared_mode_settings_change(&self.client_configs, &new_settings)
+                    {
+                        SettingsChangeScope::NoChange => {}
+                        SettingsChangeScope::HostOnly => {
+                            match crate::config::save_settings(&new_settings) {
+                                Ok(()) => self.apply_settings_update(new_settings, false).await,
+                                Err(error) => {
+                                    self.app_state.system_error = Some(format!(
+                                        "Failed to save follower host-local settings: {}",
+                                        error
+                                    ));
+                                    self.app_state.ui.needs_redraw = true;
+                                }
+                            }
+                        }
+                        SettingsChangeScope::SharedOrMixed => {
+                            self.app_state.system_error = Some(
+                                "Shared configuration and RSS edits are leader-only while this node is a follower. Only host-local client ID, port, and watch-folder changes are allowed."
+                                    .to_string(),
+                            );
+                            self.app_state.ui.needs_redraw = true;
                         }
                     }
-
-                    if let Some(new_path) = &self.client_configs.watch_folder {
-                        if let Err(e) = self.watcher.watch(new_path, RecursiveMode::NonRecursive) {
-                            tracing::error!("Failed to watch new folder: {}", e);
-                        }
-                    }
+                } else {
+                    self.apply_settings_update(new_settings, true).await;
                 }
-
-                // Refresh RSS preview immediately when feed/filter config changes.
-                if rss_changed {
-                    prune_rss_feed_errors(
-                        &mut self.app_state.rss_runtime.feed_errors,
-                        &self.client_configs,
-                    );
-                    self.refresh_rss_derived();
-                    let _ = self.rss_sync_tx.try_send(());
-                }
-
-                // 3. Persist to Disk
-                self.save_state_to_disk();
-
-                // 4. Force Redraw
-                self.app_state.ui.needs_redraw = true;
             }
-
+            AppCommand::ReloadClusterState(_path) => match crate::config::load_settings() {
+                Ok(new_settings) => {
+                    if self.is_current_shared_leader() {
+                        return;
+                    }
+                    if new_settings != self.client_configs {
+                        self.apply_settings_update(new_settings, false).await;
+                    }
+                }
+                Err(error) => {
+                    tracing_event!(
+                        Level::ERROR,
+                        "Failed to reload shared cluster state: {}",
+                        error
+                    );
+                }
+            },
             AppCommand::UpdateVersionAvailable(latest_version) => {
                 self.app_state.update_available = Some(latest_version);
             }
@@ -2243,25 +3441,26 @@ impl App {
                 if let Err(e) = result {
                     tracing_event!(Level::ERROR, "Deletion failed for torrent: {}", e);
                 }
+                let should_remove_from_settings = self.can_write_shared_state()
+                    && self
+                        .client_configs
+                        .torrents
+                        .iter()
+                        .find(|torrent| {
+                            info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                                == Some(info_hash.as_slice())
+                        })
+                        .is_some_and(|torrent| {
+                            torrent.torrent_control_state == TorrentControlState::Deleting
+                                && torrent.delete_files
+                        });
 
-                self.client_configs.torrents.retain(|t| {
-                    let t_info_hash = if t.torrent_or_magnet.starts_with("magnet:") {
-                        Magnet::new(&t.torrent_or_magnet)
-                            .ok()
-                            .and_then(|m| m.hash().map(|s| s.to_string()))
-                            .and_then(|hash_str| decode_info_hash(&hash_str).ok())
-                    } else {
-                        PathBuf::from(&t.torrent_or_magnet)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| hex::decode(s).ok())
-                    };
-
-                    match t_info_hash {
-                        Some(t_hash) => t_hash != info_hash,
-                        None => true,
-                    }
-                });
+                if should_remove_from_settings {
+                    self.client_configs.torrents.retain(|torrent| {
+                        info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                            != Some(info_hash.as_slice())
+                    });
+                }
 
                 self.app_state.torrents.remove(&info_hash);
                 self.torrent_manager_command_txs.remove(&info_hash);
@@ -2310,6 +3509,24 @@ impl App {
                         saved_location = ?saved_location,
                         error = %error,
                         "Foreground disk read marked torrent data unavailable"
+                    );
+                }
+
+                if availability_changed {
+                    let torrent_name = self
+                        .app_state
+                        .torrents
+                        .get(&info_hash)
+                        .map(|torrent| torrent.latest_state.torrent_name.clone());
+                    self.record_data_health_event(
+                        &info_hash,
+                        torrent_name,
+                        EventType::DataUnavailable,
+                        Vec::new(),
+                        format!(
+                            "Foreground disk read marked torrent data unavailable at piece {}",
+                            piece_index
+                        ),
                     );
                 }
 
@@ -2421,6 +3638,28 @@ impl App {
                             self.save_state_to_disk();
                         }
                     }
+
+                    self.record_data_health_event(
+                        &info_hash,
+                        Some(torrent_name),
+                        if is_available {
+                            EventType::DataRecovered
+                        } else {
+                            EventType::DataUnavailable
+                        },
+                        issue_files,
+                        if is_available {
+                            "Torrent probe found data available".to_string()
+                        } else {
+                            format!(
+                                "Torrent probe found data unavailable with {} issue(s)",
+                                issue_count
+                            )
+                        },
+                    );
+                    if is_available || !should_persist_unavailable {
+                        self.save_state_to_disk();
+                    }
                 }
 
                 if should_request_recovery {
@@ -2435,10 +3674,15 @@ impl App {
             ManagerEvent::MetadataLoaded { info_hash, torrent } => {
                 self.integrity_scheduler.on_metadata_loaded(&info_hash);
 
+                let mut file_priorities = HashMap::new();
                 if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
                     display.latest_state.is_multi_file = !torrent.info.files.is_empty();
                     display.latest_state.file_count = Some(torrent_file_count(&torrent));
+                    display.latest_state.total_size = torrent.info.total_length().max(0) as u64;
+                    file_priorities = display.latest_state.file_priorities.clone();
                 }
+
+                self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
 
                 self.dispatch_integrity_probe_batches();
 
@@ -2518,27 +3762,14 @@ impl App {
         match result {
             Ok(event) => {
                 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
+
                 for path in event.paths {
                     if path.to_string_lossy().ends_with(".tmp") {
                         continue;
                     }
 
-                    let now = Instant::now();
-                    if let Some(last_time) = self.app_state.recently_processed_files.get(&path) {
-                        if now.duration_since(*last_time) < DEBOUNCE_DURATION {
-                            continue;
-                        }
-                    }
-
-                    self.app_state
-                        .recently_processed_files
-                        .insert(path.clone(), now);
-
-                    // Use externalized logic for mapping path/event to command.
-                    // Note: event_to_commands could be used, but since we are already looping and debouncing,
-                    // we can just use the path-to-command logic if we expose it or just use event_to_commands as a batch.
                     if let Some(cmd) = watcher::path_to_command(&path) {
-                        let _ = self.app_command_tx.send(cmd).await;
+                        self.enqueue_watch_command(cmd, DEBOUNCE_DURATION).await;
                     }
                 }
             }
@@ -2570,7 +3801,7 @@ impl App {
 
                     match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", new_port)).await {
                         Ok(new_listener) => {
-                            self.listener = new_listener;
+                            self.listener = Some(new_listener);
                             self.client_configs.client_port = new_port;
 
                             tracing_event!(
@@ -2752,13 +3983,47 @@ impl App {
     fn drain_latest_torrent_metrics(&mut self) {
         let mut changed = false;
         let mut closed_info_hashes = Vec::new();
+        let mut completion_events: Vec<(Vec<u8>, String)> = Vec::new();
 
         for (info_hash, rx) in self.torrent_metric_watch_rxs.iter_mut() {
             match rx.has_changed() {
                 Ok(false) => {}
                 Ok(true) => {
+                    let was_complete = self
+                        .app_state
+                        .torrents
+                        .get(info_hash)
+                        .map(|torrent| !torrent_is_effectively_incomplete(&torrent.latest_state))
+                        .unwrap_or(false);
                     let message = rx.borrow_and_update().clone();
                     UiTelemetry::on_metrics(&mut self.app_state, message);
+                    let completion_record = self.app_state.torrents.get(info_hash).map(|torrent| {
+                        (
+                            !torrent_is_effectively_incomplete(&torrent.latest_state),
+                            torrent.latest_state.torrent_name.clone(),
+                        )
+                    });
+                    if let Some(torrent) = self.app_state.torrents.get(info_hash) {
+                        let metrics = &torrent.latest_state;
+                        let info_hash_hex = hex::encode(info_hash.as_slice());
+                        tracing_event!(
+                            Level::INFO,
+                            info_hash = %info_hash_hex,
+                            torrent_name = %metrics.torrent_name,
+                            was_complete,
+                            is_complete = !torrent_is_effectively_incomplete(metrics),
+                            metrics_is_complete = metrics.is_complete,
+                            pieces_complete = metrics.number_of_pieces_completed,
+                            pieces_total = metrics.number_of_pieces_total,
+                            activity = %metrics.activity_message,
+                            "Processing torrent metrics update for completion journaling"
+                        );
+                    }
+                    if let Some((is_complete, torrent_name)) = completion_record {
+                        if !was_complete && is_complete {
+                            completion_events.push((info_hash.clone(), torrent_name));
+                        }
+                    }
                     changed = true;
                 }
                 Err(_) => {
@@ -2769,6 +4034,13 @@ impl App {
 
         for info_hash in closed_info_hashes {
             self.torrent_metric_watch_rxs.remove(&info_hash);
+        }
+
+        if !completion_events.is_empty() {
+            for (info_hash, torrent_name) in completion_events {
+                self.record_torrent_completed_event(&info_hash, Some(torrent_name));
+            }
+            self.save_state_to_disk();
         }
 
         if changed {
@@ -2853,6 +4125,10 @@ impl App {
     }
 
     fn save_state_to_disk(&mut self) {
+        if !self.cluster_capabilities().can_persist_local_runtime_state {
+            return;
+        }
+
         let payload = build_persist_payload(&mut self.client_configs, &mut self.app_state);
         let network_history_request_id = payload
             .network_history
@@ -3010,17 +4286,17 @@ impl App {
         torrent_control_state: TorrentControlState,
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
-    ) {
+    ) -> CommandIngestResult {
         let buffer = match fs::read(&path) {
             Ok(buf) => buf,
             Err(e) => {
-                tracing_event!(
-                    Level::ERROR,
-                    "Failed to read torrent file {:?}: {}",
-                    &path,
-                    e
-                );
-                return;
+                let message = format!("Failed to read torrent file {:?}: {}", &path, e);
+                tracing_event!(Level::ERROR, "{}", message);
+                return CommandIngestResult::Failed {
+                    info_hash: None,
+                    torrent_name: None,
+                    message,
+                };
             }
         };
 
@@ -3037,33 +4313,36 @@ impl App {
                 } else {
                     "malformed or unsupported bencode payload"
                 };
-                tracing_event!(
-                    Level::ERROR,
+                let message = format!(
                     "Failed to parse torrent file {:?}: {} | size={} bytes | head={} | tail={} | hint={}",
-                    &path,
-                    e,
-                    file_size,
-                    head_hex,
-                    tail_hex,
-                    likely_cause
+                    &path, e, file_size, head_hex, tail_hex, likely_cause
                 );
-                return;
+                tracing_event!(Level::ERROR, "{}", message);
+                return CommandIngestResult::Invalid {
+                    info_hash: None,
+                    torrent_name: None,
+                    message,
+                };
             }
         };
 
         #[cfg(all(feature = "dht", feature = "pex"))]
         {
             if torrent.info.private == Some(1) {
-                tracing_event!(
-                    Level::ERROR,
+                let message = format!(
                     "Rejected private torrent '{}' in normal build.",
                     torrent.info.name
                 );
+                tracing_event!(Level::ERROR, "{}", message);
                 self.app_state.system_error = Some(format!(
                     "Private Torrent Rejected:'{}' This build (with DHT/PEX) is not safe for private trackers. Please use private builds for this torrent.",
                     torrent.info.name
                 ));
-                return;
+                return CommandIngestResult::Failed {
+                    info_hash: None,
+                    torrent_name: Some(torrent.info.name.clone()),
+                    message,
+                };
             }
         }
 
@@ -3086,82 +4365,106 @@ impl App {
         };
 
         if self.app_state.torrents.contains_key(&info_hash) {
-            tracing_event!(
-                Level::INFO,
-                "Ignoring already present torrent: {}",
-                torrent.info.name
-            );
-            return;
+            if !self.has_live_runtime_for_torrent(&info_hash) {
+                self.clear_display_only_torrent(&info_hash);
+            } else {
+                let message = format!("Ignoring already present torrent: {}", torrent.info.name);
+                tracing_event!(Level::INFO, "{}", message);
+                return CommandIngestResult::Duplicate {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(torrent.info.name),
+                };
+            }
         }
 
-        let torrent_files_dir = match get_app_paths() {
-            Some((_, data_dir)) => data_dir.join("torrents"),
+        let torrent_files_dir = match crate::config::runtime_data_dir() {
+            Some(data_dir) => data_dir.join("torrents"),
             None => {
-                tracing_event!(
-                    Level::ERROR,
-                    "Could not determine application data directory."
-                );
-                return;
+                let message = "Could not determine application data directory.".to_string();
+                tracing_event!(Level::ERROR, "{}", message);
+                return CommandIngestResult::Failed {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(torrent.info.name.clone()),
+                    message,
+                };
             }
         };
         if let Err(e) = fs::create_dir_all(&torrent_files_dir) {
-            tracing_event!(
-                Level::ERROR,
-                "Could not create torrents data directory: {}",
-                e
-            );
-            return;
+            let message = format!("Could not create torrents data directory: {}", e);
+            tracing_event!(Level::ERROR, "{}", message);
+            return CommandIngestResult::Failed {
+                info_hash: Some(info_hash),
+                torrent_name: Some(torrent.info.name.clone()),
+                message,
+            };
         }
         let permanent_torrent_path =
             torrent_files_dir.join(format!("{}.torrent", hex::encode(&info_hash)));
-        // Persist from in-memory bytes via temp+rename to avoid self-copy corruption
-        // when `path` already points at `permanent_torrent_path` during startup reload.
-        let temp_torrent_path = torrent_files_dir.join(format!(
-            "{}.{}.tmp",
-            hex::encode(&info_hash),
-            std::process::id()
-        ));
-        if let Err(e) = fs::write(&temp_torrent_path, &buffer) {
-            tracing_event!(
-                Level::ERROR,
-                "Failed to write temp torrent in data directory: {}",
-                e
-            );
-            return;
-        }
-        if let Err(e) = fs::rename(&temp_torrent_path, &permanent_torrent_path) {
-            if e.kind() == ErrorKind::AlreadyExists {
-                if let Err(remove_err) = fs::remove_file(&permanent_torrent_path) {
-                    if remove_err.kind() != ErrorKind::NotFound {
-                        let _ = fs::remove_file(&temp_torrent_path);
-                        tracing_event!(
-                            Level::ERROR,
-                            "Failed to replace existing torrent file in data directory: {}",
-                            remove_err
-                        );
-                        return;
-                    }
-                }
+        let shared_torrent_path = crate::config::shared_torrent_file_path(&info_hash);
 
-                if let Err(retry_err) = fs::rename(&temp_torrent_path, &permanent_torrent_path) {
+        let persist_torrent_copy = |destination: &PathBuf, label: &str| -> std::io::Result<()> {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let temp_torrent_path =
+                destination.with_extension(format!("torrent.{}.tmp", std::process::id()));
+            fs::write(&temp_torrent_path, &buffer)?;
+            if let Err(e) = fs::rename(&temp_torrent_path, destination) {
+                if e.kind() == ErrorKind::AlreadyExists {
+                    if let Err(remove_err) = fs::remove_file(destination) {
+                        if remove_err.kind() != ErrorKind::NotFound {
+                            let _ = fs::remove_file(&temp_torrent_path);
+                            return Err(remove_err);
+                        }
+                    }
+                    if let Err(retry_err) = fs::rename(&temp_torrent_path, destination) {
+                        let _ = fs::remove_file(&temp_torrent_path);
+                        return Err(retry_err);
+                    }
+                } else {
                     let _ = fs::remove_file(&temp_torrent_path);
-                    tracing_event!(
-                        Level::ERROR,
-                        "Failed to finalize torrent copy in data directory after replace: {}",
-                        retry_err
-                    );
-                    return;
+                    return Err(e);
                 }
-            } else {
-                let _ = fs::remove_file(&temp_torrent_path);
-                tracing_event!(
-                    Level::ERROR,
-                    "Failed to finalize torrent copy in data directory: {}",
-                    e
-                );
-                return;
+            }
+
+            tracing_event!(
+                Level::DEBUG,
+                "Persisted torrent file copy in {}: {:?}",
+                label,
+                destination
+            );
+            Ok(())
+        };
+
+        if let Err(e) = persist_torrent_copy(&permanent_torrent_path, "data directory") {
+            let message = format!("Failed to persist torrent copy in data directory: {}", e);
+            tracing_event!(Level::ERROR, "{}", message);
+            return CommandIngestResult::Failed {
+                info_hash: Some(info_hash),
+                torrent_name: Some(torrent.info.name.clone()),
+                message,
+            };
+        }
+
+        if self.can_write_shared_state() {
+            if let Some(shared_path) = &shared_torrent_path {
+                if let Err(e) = persist_torrent_copy(shared_path, "shared config directory") {
+                    let message = format!(
+                        "Failed to persist torrent copy in shared config directory: {}",
+                        e
+                    );
+                    tracing_event!(Level::ERROR, "{}", message);
+                    return CommandIngestResult::Failed {
+                        info_hash: Some(info_hash),
+                        torrent_name: Some(torrent.info.name.clone()),
+                        message,
+                    };
+                }
             }
         }
+
+        self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
 
         let number_of_pieces_total = if !torrent.info.pieces.is_empty() {
             (torrent.info.pieces.len() / 20) as u32
@@ -3176,14 +4479,21 @@ impl App {
             }
         };
 
+        let resolved_torrent_name = torrent.info.name.clone();
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
                 torrent_control_state: torrent_control_state.clone(),
+                delete_files: false,
                 info_hash: info_hash.clone(),
-                torrent_or_magnet: permanent_torrent_path.to_string_lossy().to_string(),
-                torrent_name: torrent.info.name.clone(),
+                torrent_or_magnet: shared_torrent_path
+                    .clone()
+                    .unwrap_or_else(|| permanent_torrent_path.clone())
+                    .to_string_lossy()
+                    .to_string(),
+                torrent_name: resolved_torrent_name.clone(),
                 download_path: download_path.clone(),
                 container_name: container_name.clone(),
+                is_complete: is_validated,
                 is_multi_file: !torrent.info.files.is_empty(),
                 file_count: Some(torrent_file_count(&torrent)),
                 number_of_pieces_total,
@@ -3245,20 +4555,34 @@ impl App {
                         .run(torrent_control_state == TorrentControlState::Paused)
                         .await;
                 });
+                tracing_event!(
+                    Level::INFO,
+                    info_hash = %hex::encode(&info_hash),
+                    torrent_name = %resolved_torrent_name,
+                    torrent_count = self.app_state.torrents.len(),
+                    has_runtime_entry = self.app_state.torrents.contains_key(&info_hash),
+                    "Magnet torrent manager created successfully"
+                );
                 self.dispatch_integrity_probe_batches();
+                CommandIngestResult::Added {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(resolved_torrent_name),
+                }
             }
             Err(e) => {
-                tracing_event!(
-                    Level::ERROR,
-                    "Failed to create torrent manager from file: {:?}",
-                    e
-                );
+                let message = format!("Failed to create torrent manager from file: {:?}", e);
+                tracing_event!(Level::ERROR, "{}", message);
                 self.app_state.torrents.remove(&info_hash);
                 self.app_state
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
                 self.refresh_rss_derived();
+                CommandIngestResult::Failed {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(resolved_torrent_name),
+                    message,
+                }
             }
         }
     }
@@ -3273,45 +4597,65 @@ impl App {
         torrent_control_state: TorrentControlState,
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
-    ) {
+    ) -> CommandIngestResult {
         tracing::info!(target: "magnet_flow", "Engine: add_magnet_torrent entry. Link: {}", magnet_link);
         let magnet = match Magnet::new(&magnet_link) {
             Ok(m) => m,
             Err(e) => {
+                let message = format!("Could not parse invalid magnet: {:?}", e);
                 tracing_event!(Level::ERROR, "Could not parse invalid magnet: {:?}", e);
-                return;
+                return CommandIngestResult::Invalid {
+                    info_hash: None,
+                    torrent_name: None,
+                    message,
+                };
             }
         };
 
         let (v1_hash, v2_hash) = parse_hybrid_hashes(&magnet_link);
-        let info_hash = v1_hash
-            .clone()
-            .or_else(|| v2_hash.clone())
-            .expect("Magnet link missing both btih and btmh hashes");
+        let Some(info_hash) = v1_hash.clone().or_else(|| v2_hash.clone()) else {
+            let message = "Magnet link is missing both btih and btmh hashes".to_string();
+            tracing_event!(Level::ERROR, "{}", message);
+            return CommandIngestResult::Invalid {
+                info_hash: None,
+                torrent_name: None,
+                message,
+            };
+        };
         let resolved_name = resolve_magnet_torrent_name(&torrent_name, &magnet_link, &info_hash);
+        let resolved_torrent_name = resolved_name.clone();
 
         if self.app_state.torrents.contains_key(&info_hash) {
-            if let Some(path) = download_path {
-                if let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash) {
-                    let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
-                        torrent_data_path: path,
-                        file_priorities: file_priorities.clone(),
-                        container_name,
-                    });
+            if !self.has_live_runtime_for_torrent(&info_hash) {
+                self.clear_display_only_torrent(&info_hash);
+            } else {
+                if let Some(path) = download_path {
+                    if let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash) {
+                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
+                            torrent_data_path: path,
+                            file_priorities: file_priorities.clone(),
+                            container_name,
+                        });
+                    }
                 }
+                tracing_event!(Level::INFO, "Updated path for existing torrent from magnet");
+                return CommandIngestResult::Duplicate {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(resolved_name),
+                };
             }
-            tracing_event!(Level::INFO, "Updated path for existing torrent from magnet");
-            return;
         }
 
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
                 torrent_control_state: torrent_control_state.clone(),
+                delete_files: false,
                 info_hash: info_hash.clone(),
                 torrent_or_magnet: magnet_link.clone(),
-                torrent_name: resolved_name,
+                torrent_name: resolved_name.clone(),
                 download_path: download_path.clone(),
                 container_name: container_name.clone(),
+                is_complete: is_validated,
                 is_multi_file: false,
                 file_count: None,
                 ..Default::default()
@@ -3367,34 +4711,635 @@ impl App {
                         .await;
                 });
                 self.dispatch_integrity_probe_batches();
+                CommandIngestResult::Added {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(resolved_torrent_name),
+                }
             }
             Err(e) => {
-                tracing_event!(
-                    Level::ERROR,
-                    "Failed to create new torrent manager from magnet: {:?}",
-                    e
-                );
+                let message = format!("Failed to create new torrent manager from magnet: {:?}", e);
+                tracing_event!(Level::ERROR, "{}", message);
                 self.app_state.torrents.remove(&info_hash);
                 self.app_state
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
                 self.refresh_rss_derived();
+                CommandIngestResult::Failed {
+                    info_hash: Some(info_hash),
+                    torrent_name: Some(resolved_name),
+                    message,
+                }
+            }
+        }
+    }
+
+    fn source_watch_folder_for_path(&self, path: &std::path::Path) -> Option<PathBuf> {
+        path.parent().map(Path::to_path_buf)
+    }
+
+    fn has_live_runtime_for_torrent(&self, info_hash: &[u8]) -> bool {
+        self.torrent_manager_command_txs.contains_key(info_hash)
+    }
+
+    fn clear_display_only_torrent(&mut self, info_hash: &[u8]) {
+        if self.has_live_runtime_for_torrent(info_hash) {
+            return;
+        }
+
+        self.app_state.torrents.remove(info_hash);
+        self.app_state
+            .torrent_list_order
+            .retain(|existing| existing.as_slice() != info_hash);
+    }
+
+    fn is_host_watch_path(&self, path: &Path) -> bool {
+        let Some(host_watch) = resolve_host_watch_path(&self.client_configs) else {
+            return false;
+        };
+        path.parent() == Some(host_watch.as_path())
+    }
+
+    fn is_shared_inbox_path(&self, path: &Path) -> bool {
+        let Some(shared_inbox) = shared_inbox_path() else {
+            return false;
+        };
+        path.parent() == Some(shared_inbox.as_path())
+    }
+
+    fn relay_local_watch_file(&mut self, path: &Path, fallback_extension: &str) {
+        match relay_watch_file_to_shared_inbox(path) {
+            Ok(relayed_path) => {
+                tracing_event!(
+                    Level::INFO,
+                    "Relayed local watch file {:?} to shared inbox {:?}",
+                    path,
+                    relayed_path
+                );
+            }
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to relay local watch file {:?}: {}",
+                    path,
+                    error
+                );
+                if let Err(archive_error) = archive_watch_file(path, fallback_extension) {
+                    tracing_event!(
+                        Level::WARN,
+                        "Failed to archive local watch file {:?}: {}",
+                        path,
+                        archive_error
+                    );
+                }
+            }
+        }
+    }
+
+    fn append_event_journal_entry(&mut self, entry: EventJournalEntry) {
+        append_event_journal_entry(&mut self.app_state.event_journal_state, entry);
+    }
+
+    fn control_event_scope(&self) -> EventScope {
+        if crate::config::is_shared_config_mode() {
+            EventScope::Shared
+        } else {
+            EventScope::Host
+        }
+    }
+
+    fn persist_torrent_metadata_snapshot(
+        &self,
+        info_hash: &[u8],
+        torrent: &crate::torrent_file::Torrent,
+        file_priorities: &HashMap<usize, FilePriority>,
+    ) {
+        if !self.cluster_capabilities().can_write_shared_state {
+            return;
+        }
+
+        let entry = TorrentMetadataEntry {
+            info_hash_hex: hex::encode(info_hash),
+            torrent_name: torrent.info.name.clone(),
+            total_size: torrent.info.total_length().max(0) as u64,
+            is_multi_file: !torrent.info.files.is_empty(),
+            files: torrent
+                .file_list()
+                .into_iter()
+                .map(|(parts, length)| TorrentMetadataFileEntry {
+                    relative_path: parts.join("/"),
+                    length,
+                })
+                .collect(),
+            file_priorities: file_priorities.clone(),
+        };
+
+        if let Err(error) = upsert_torrent_metadata(entry) {
+            tracing_event!(
+                Level::WARN,
+                "Failed to persist torrent metadata snapshot: {}",
+                error
+            );
+        }
+    }
+
+    fn record_ingest_queued(
+        &mut self,
+        path: PathBuf,
+        origin: IngestOrigin,
+        ingest_kind: IngestKind,
+        source_watch_folder: Option<PathBuf>,
+    ) -> bool {
+        if self.app_state.pending_ingest_by_path.contains_key(&path) {
+            return false;
+        }
+
+        let correlation_id = event_correlation_id_for_path(&path);
+        self.app_state.pending_ingest_by_path.insert(
+            path.clone(),
+            PendingIngestRecord {
+                correlation_id: correlation_id.clone(),
+                origin,
+                ingest_kind,
+                source_watch_folder: source_watch_folder.clone(),
+                source_path: path.clone(),
+            },
+        );
+        self.append_event_journal_entry(EventJournalEntry {
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestQueued,
+            source_watch_folder,
+            source_path: Some(path),
+            correlation_id: Some(correlation_id),
+            message: Some("Queued ingest item".to_string()),
+            details: EventDetails::Ingest {
+                origin,
+                ingest_kind,
+            },
+            ..Default::default()
+        });
+        true
+    }
+
+    fn record_watch_path_discovered(&mut self, path: &Path) {
+        if let Some(ingest_kind) = ingest_kind_from_path(path) {
+            if self.record_ingest_queued(
+                path.to_path_buf(),
+                IngestOrigin::WatchFolder,
+                ingest_kind,
+                self.source_watch_folder_for_path(path),
+            ) {
+                self.save_state_to_disk();
+            }
+        }
+    }
+
+    fn record_rss_queued(&mut self, path: PathBuf, origin: IngestOrigin, ingest_kind: IngestKind) {
+        if self.record_ingest_queued(path, origin, ingest_kind, shared_inbox_path()) {
+            self.save_state_to_disk();
+        }
+    }
+
+    fn control_origin_for_command_path(&self, path: &Path) -> ControlOrigin {
+        if self.is_shared_inbox_path(path) {
+            ControlOrigin::SharedRelay
+        } else if self.is_host_watch_path(path) {
+            ControlOrigin::WatchFolder
+        } else {
+            ControlOrigin::CliOnline
+        }
+    }
+
+    fn control_origin_for_ingest_path(&self, path: &Path) -> ControlOrigin {
+        match self
+            .app_state
+            .pending_ingest_by_path
+            .get(path)
+            .map(|record| record.origin)
+        {
+            Some(IngestOrigin::RssAuto) => ControlOrigin::RssAuto,
+            Some(IngestOrigin::RssManual) => ControlOrigin::RssManual,
+            Some(IngestOrigin::WatchFolder) | None => ControlOrigin::WatchFolder,
+        }
+    }
+
+    fn record_control_queued(
+        &mut self,
+        path: PathBuf,
+        request: ControlRequest,
+        origin: ControlOrigin,
+    ) -> bool {
+        if self.app_state.pending_control_by_path.contains_key(&path) {
+            return false;
+        }
+
+        let correlation_id = event_correlation_id_for_path(&path);
+        let source_watch_folder = self.source_watch_folder_for_path(&path);
+        self.app_state.pending_control_by_path.insert(
+            path.clone(),
+            PendingControlRecord {
+                correlation_id: correlation_id.clone(),
+                request: request.clone(),
+                origin,
+                source_watch_folder: source_watch_folder.clone(),
+                source_path: path.clone(),
+            },
+        );
+        self.append_event_journal_entry(EventJournalEntry {
+            scope: self.control_event_scope(),
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Control,
+            event_type: EventType::ControlQueued,
+            source_watch_folder,
+            source_path: Some(path),
+            correlation_id: Some(correlation_id),
+            message: Some(format!("Queued control action '{}'", request.action_name())),
+            details: control_event_details(&request, origin),
+            ..Default::default()
+        });
+        true
+    }
+
+    fn record_control_result(
+        &mut self,
+        path: &PathBuf,
+        request: &ControlRequest,
+        result: Result<String, String>,
+    ) {
+        let pending = self.app_state.pending_control_by_path.remove(path);
+        let correlation_id = pending
+            .as_ref()
+            .map(|record| record.correlation_id.clone())
+            .unwrap_or_else(|| event_correlation_id_for_path(path));
+        let (source_watch_folder, source_path, request, origin) = pending
+            .map(|record| {
+                (
+                    record.source_watch_folder,
+                    Some(record.source_path),
+                    record.request,
+                    record.origin,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.source_watch_folder_for_path(path),
+                    Some(path.clone()),
+                    request.clone(),
+                    self.control_origin_for_command_path(path),
+                )
+            });
+        let (event_type, message) = match result {
+            Ok(message) => (EventType::ControlApplied, Some(message)),
+            Err(message) => (EventType::ControlFailed, Some(message)),
+        };
+        self.append_event_journal_entry(EventJournalEntry {
+            scope: self.control_event_scope(),
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Control,
+            event_type,
+            source_watch_folder,
+            source_path,
+            correlation_id: Some(correlation_id),
+            message,
+            details: control_event_details(&request, origin),
+            ..Default::default()
+        });
+    }
+
+    fn record_ingest_result(&mut self, path: &PathBuf, result: &CommandIngestResult) {
+        let pending = self.app_state.pending_ingest_by_path.remove(path);
+        let fallback_kind = ingest_kind_from_path(path).unwrap_or_default();
+        let correlation_id = pending
+            .as_ref()
+            .map(|record| record.correlation_id.clone())
+            .unwrap_or_else(|| event_correlation_id_for_path(path));
+        let (origin, ingest_kind, source_watch_folder, source_path) = pending
+            .map(|record| {
+                (
+                    record.origin,
+                    record.ingest_kind,
+                    record.source_watch_folder,
+                    Some(record.source_path),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    IngestOrigin::WatchFolder,
+                    fallback_kind,
+                    self.source_watch_folder_for_path(path),
+                    Some(path.clone()),
+                )
+            });
+
+        let (event_type, torrent_name, info_hash_hex, message) = match result {
+            CommandIngestResult::Added {
+                info_hash,
+                torrent_name,
+            } => (
+                EventType::IngestAdded,
+                torrent_name.clone(),
+                info_hash.as_ref().map(hex::encode),
+                Some("Added torrent from ingest item".to_string()),
+            ),
+            CommandIngestResult::Duplicate {
+                info_hash,
+                torrent_name,
+            } => (
+                EventType::IngestDuplicate,
+                torrent_name.clone(),
+                info_hash.as_ref().map(hex::encode),
+                Some("Ignored duplicate ingest item".to_string()),
+            ),
+            CommandIngestResult::Invalid {
+                info_hash,
+                torrent_name,
+                message,
+            } => (
+                EventType::IngestInvalid,
+                torrent_name.clone(),
+                info_hash.as_ref().map(hex::encode),
+                Some(message.clone()),
+            ),
+            CommandIngestResult::Failed {
+                info_hash,
+                torrent_name,
+                message,
+            } => (
+                EventType::IngestFailed,
+                torrent_name.clone(),
+                info_hash.as_ref().map(hex::encode),
+                Some(message.clone()),
+            ),
+        };
+
+        self.append_event_journal_entry(EventJournalEntry {
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Ingest,
+            event_type,
+            torrent_name,
+            info_hash_hex,
+            source_watch_folder,
+            source_path,
+            correlation_id: Some(correlation_id),
+            message,
+            details: EventDetails::Ingest {
+                origin,
+                ingest_kind,
+            },
+            ..Default::default()
+        });
+    }
+
+    fn record_data_health_event(
+        &mut self,
+        info_hash: &[u8],
+        torrent_name: Option<String>,
+        event_type: EventType,
+        issue_files: Vec<String>,
+        message: String,
+    ) {
+        self.append_event_journal_entry(EventJournalEntry {
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::DataHealth,
+            event_type,
+            torrent_name,
+            info_hash_hex: Some(hex::encode(info_hash)),
+            message: Some(message),
+            details: EventDetails::DataHealth {
+                issue_count: issue_files.len(),
+                issue_files,
+            },
+            ..Default::default()
+        });
+    }
+
+    fn record_torrent_completed_event(&mut self, info_hash: &[u8], torrent_name: Option<String>) {
+        let info_hash_hex = hex::encode(info_hash);
+        if self.startup_completion_suppressed_hashes.remove(info_hash) {
+            tracing_event!(
+                Level::INFO,
+                info_hash = %info_hash_hex,
+                torrent_name = %torrent_name.clone().unwrap_or_default(),
+                "Skipping startup TorrentCompleted journal entry for restored complete torrent"
+            );
+            return;
+        }
+        if self
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.event_type == EventType::TorrentCompleted
+                    && entry.info_hash_hex.as_deref() == Some(info_hash_hex.as_str())
+            })
+        {
+            tracing_event!(
+                Level::INFO,
+                info_hash = %info_hash_hex,
+                torrent_name = %torrent_name.clone().unwrap_or_default(),
+                "Skipping duplicate TorrentCompleted journal entry"
+            );
+            return;
+        }
+
+        tracing_event!(
+            Level::INFO,
+            info_hash = %info_hash_hex,
+            torrent_name = %torrent_name.clone().unwrap_or_default(),
+            "Recording TorrentCompleted journal entry"
+        );
+        self.append_event_journal_entry(EventJournalEntry {
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::TorrentLifecycle,
+            event_type: EventType::TorrentCompleted,
+            torrent_name,
+            info_hash_hex: Some(info_hash_hex),
+            message: Some("Torrent completed".to_string()),
+            ..Default::default()
+        });
+    }
+
+    async fn apply_control_request(&mut self, request: &ControlRequest) -> Result<String, String> {
+        match plan_control_request(&self.client_configs, request)? {
+            ControlExecutionPlan::StatusNow => {
+                self.trigger_status_dump_now();
+                Ok("Wrote fresh status snapshot".to_string())
+            }
+            ControlExecutionPlan::StatusFollowStart { interval_secs } => {
+                self.set_runtime_status_dump_interval_override(Some(interval_secs));
+                self.trigger_status_dump_now();
+                Ok(format!(
+                    "Enabled runtime status dumps every {} seconds",
+                    interval_secs
+                ))
+            }
+            ControlExecutionPlan::StatusFollowStop => {
+                self.set_runtime_status_dump_interval_override(Some(0));
+                Ok("Stopped runtime status dumps".to_string())
+            }
+            ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message,
+            } => {
+                self.apply_settings_update(next_settings, true).await;
+                self.trigger_status_dump_after_successful_cluster_mutation();
+                Ok(success_message)
+            }
+            ControlExecutionPlan::AddTorrentFile {
+                source_path,
+                download_path,
+                container_name,
+                file_priorities,
+            } => {
+                let ingest_result = self
+                    .add_torrent_from_file(
+                        source_path.clone(),
+                        download_path,
+                        false,
+                        TorrentControlState::Running,
+                        file_priorities,
+                        container_name,
+                    )
+                    .await;
+                Self::cleanup_staged_add_file(&source_path);
+                if matches!(
+                    ingest_result,
+                    CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
+                ) {
+                    self.save_state_to_disk();
+                    self.trigger_status_dump_after_successful_cluster_mutation();
+                }
+                Self::map_add_result_to_control_response(ingest_result)
+            }
+            ControlExecutionPlan::AddMagnet {
+                magnet_link,
+                download_path,
+                container_name,
+                file_priorities,
+            } => {
+                let ingest_result = self
+                    .add_magnet_torrent(
+                        "Fetching name...".to_string(),
+                        magnet_link,
+                        download_path,
+                        false,
+                        TorrentControlState::Running,
+                        file_priorities,
+                        container_name,
+                    )
+                    .await;
+                if matches!(
+                    ingest_result,
+                    CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
+                ) {
+                    self.save_state_to_disk();
+                    self.trigger_status_dump_after_successful_cluster_mutation();
+                }
+                Self::map_add_result_to_control_response(ingest_result)
+            }
+        }
+    }
+
+    fn watch_command_path(cmd: &AppCommand) -> Option<&PathBuf> {
+        match cmd {
+            AppCommand::AddTorrentFromFile(path)
+            | AppCommand::AddTorrentFromPathFile(path)
+            | AppCommand::AddMagnetFromFile(path)
+            | AppCommand::ReloadClusterState(path)
+            | AppCommand::ControlRequest { path, .. }
+            | AppCommand::ClientShutdown(path)
+            | AppCommand::PortFileChanged(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    async fn enqueue_watch_command(&mut self, cmd: AppCommand, min_spacing: Duration) {
+        if let Some(path) = Self::watch_command_path(&cmd).cloned() {
+            let now = Instant::now();
+            if let Some(last_time) = self.app_state.recently_processed_files.get(&path) {
+                let elapsed = now.duration_since(*last_time);
+                if elapsed < min_spacing {
+                    return;
+                }
+            }
+
+            self.app_state
+                .recently_processed_files
+                .insert(path.clone(), now);
+            match &cmd {
+                AppCommand::ControlRequest { request, .. } => {
+                    let origin = self.control_origin_for_command_path(&path);
+                    if self.record_control_queued(path, request.clone(), origin) {
+                        self.save_state_to_disk();
+                    }
+                }
+                _ => self.record_watch_path_discovered(&path),
+            }
+        }
+
+        if let Err(error) = self.app_command_tx.try_send(cmd) {
+            match error {
+                tokio::sync::mpsc::error::TrySendError::Full(cmd) => {
+                    self.app_state.pending_watch_commands.push_back(cmd);
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_cmd) => {
+                    tracing_event!(
+                        Level::WARN,
+                        "App command channel closed while queuing watch command"
+                    );
+                }
             }
         }
     }
 
     async fn process_pending_commands(&mut self) {
-        let commands = watcher::scan_watch_folders(&self.client_configs);
-        for cmd in commands {
-            let _ = self.app_command_tx.send(cmd).await;
+        for path in watcher::scan_watch_folder_paths(&self.watched_paths) {
+            if let Some(cmd) = watcher::path_to_command(&path) {
+                self.enqueue_watch_command(
+                    cmd,
+                    Duration::from_secs(WATCH_FOLDER_RESCAN_INTERVAL_SECS),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn flush_pending_watch_commands(&mut self) {
+        loop {
+            let Some(cmd) = self.app_state.pending_watch_commands.pop_front() else {
+                break;
+            };
+
+            if let Err(error) = self.app_command_tx.try_send(cmd) {
+                match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(cmd) => {
+                        self.app_state.pending_watch_commands.push_front(cmd);
+                        break;
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_cmd) => {
+                        tracing_event!(
+                            Level::WARN,
+                            "App command channel closed while flushing pending watch commands"
+                        );
+                        break;
+                    }
+                }
+            }
         }
     }
 
     async fn rebind_listener(&mut self, new_port: u16) {
         match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", new_port)).await {
             Ok(new_listener) => {
-                self.listener = new_listener;
+                self.listener = Some(new_listener);
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
                 // but we ensure consistency here just in case.
                 self.client_configs.client_port = new_port;
@@ -3473,12 +5418,12 @@ impl App {
             return;
         };
 
-        let (added, info_hash) = if link.starts_with("magnet:") {
-            let added = rss_ingest::write_magnet(&self.client_configs, link.as_str())
+        let (added, info_hash, command_path) = if link.starts_with("magnet:") {
+            let command_path = rss_ingest::write_magnet(&self.client_configs, link.as_str())
                 .await
-                .is_ok();
+                .ok();
             let (v1_hash, v2_hash) = parse_hybrid_hashes(link.as_str());
-            (added, v1_hash.or(v2_hash))
+            (command_path.is_some(), v1_hash.or(v2_hash), command_path)
         } else if link.starts_with("http://") || link.starts_with("https://") {
             self.download_rss_torrent_from_url(link.as_str()).await
         } else {
@@ -3487,11 +5432,16 @@ impl App {
                 "Skipping RSS manual download: unsupported link scheme '{}'",
                 link
             );
-            (false, None)
+            (false, None, None)
         };
 
         if !added {
             return;
+        }
+
+        if let Some(command_path) = command_path.clone() {
+            let ingest_kind = ingest_kind_from_path(&command_path).unwrap_or_default();
+            self.record_rss_queued(command_path, IngestOrigin::RssManual, ingest_kind);
         }
 
         for preview in &mut self.app_state.rss_runtime.preview_items {
@@ -3545,14 +5495,17 @@ impl App {
         self.refresh_rss_derived();
     }
 
-    async fn download_rss_torrent_from_url(&mut self, url: &str) -> (bool, Option<Vec<u8>>) {
+    async fn download_rss_torrent_from_url(
+        &mut self,
+        url: &str,
+    ) -> (bool, Option<Vec<u8>>, Option<PathBuf>) {
         if !is_safe_rss_item_url(url).await {
             tracing_event!(
                 Level::WARN,
                 "RSS manual download blocked URL by network safety policy: {}",
                 url
             );
-            return (false, None);
+            return (false, None, None);
         }
 
         let client = match reqwest::Client::builder()
@@ -3567,7 +5520,7 @@ impl App {
                     "RSS manual download failed to build HTTP client: {}",
                     e
                 );
-                return (false, None);
+                return (false, None, None);
             }
         };
 
@@ -3580,7 +5533,7 @@ impl App {
                     url,
                     e
                 );
-                return (false, None);
+                return (false, None, None);
             }
         };
         if !response.status().is_success() {
@@ -3590,7 +5543,7 @@ impl App {
                 response.status(),
                 url
             );
-            return (false, None);
+            return (false, None, None);
         }
 
         let bytes = match response.bytes().await {
@@ -3602,7 +5555,7 @@ impl App {
                     url,
                     e
                 );
-                return (false, None);
+                return (false, None, None);
             }
         };
         if bytes.len() > RSS_MAX_TORRENT_DOWNLOAD_BYTES {
@@ -3612,7 +5565,7 @@ impl App {
                 url,
                 bytes.len()
             );
-            return (false, None);
+            return (false, None, None);
         }
         let Some(info_hash) = info_hash_from_torrent_bytes(bytes.as_ref()) else {
             tracing_event!(
@@ -3620,50 +5573,20 @@ impl App {
                 "RSS manual download produced invalid torrent payload for {}",
                 url
             );
-            return (false, None);
+            return (false, None, None);
         };
 
-        let file_hash = hex::encode(sha1::Sha1::digest(url.as_bytes()));
-        let temp_path = std::env::temp_dir().join(format!("superseedr-rss-{}.torrent", file_hash));
-        if let Err(e) = fs::write(&temp_path, bytes.as_ref()) {
-            tracing_event!(
-                Level::ERROR,
-                "RSS manual download failed to write temp file {:?}: {}",
-                temp_path,
-                e
-            );
-            return (false, None);
-        }
-
-        let existed_before = self.app_state.torrents.contains_key(&info_hash);
-        self.add_torrent_from_file(
-            temp_path.clone(),
-            self.client_configs.default_download_folder.clone(),
-            false,
-            TorrentControlState::Running,
-            HashMap::new(),
-            None,
-        )
-        .await;
-        let exists_after = self.app_state.torrents.contains_key(&info_hash);
-
-        if let Err(e) = fs::remove_file(&temp_path) {
-            tracing_event!(
-                Level::DEBUG,
-                "RSS manual download temp cleanup skipped for {:?}: {}",
-                temp_path,
-                e
-            );
-        }
-        if existed_before || exists_after {
-            (true, Some(info_hash))
-        } else {
-            tracing_event!(
-                Level::ERROR,
-                "RSS manual download did not register torrent {} after add_torrent_from_file",
-                hex::encode(&info_hash)
-            );
-            (false, None)
+        match rss_ingest::write_torrent_bytes(&self.client_configs, url, bytes.as_ref()).await {
+            Ok(path) => (true, Some(info_hash), Some(path)),
+            Err(e) => {
+                tracing_event!(
+                    Level::ERROR,
+                    "RSS manual download failed to queue torrent file for {}: {}",
+                    url,
+                    e
+                );
+                (false, None, None)
+            }
         }
     }
 
@@ -3692,27 +5615,83 @@ impl App {
             ram_usage_percent: s.ram_usage_percent,
             total_download_bps: s.avg_download_history.last().copied().unwrap_or(0),
             total_upload_bps: s.avg_upload_history.last().copied().unwrap_or(0),
+            status_config: status::status_config_from_settings(&self.client_configs),
             torrents: torrent_metrics,
-            settings: self.client_configs.clone(),
         }
     }
 
     pub fn dump_status_to_file(&self) {
-        status::dump(self.generate_output_state(), self.shutdown_tx.clone());
+        if self.is_current_shared_follower() {
+            return;
+        }
+
+        let generation = self
+            .status_dump_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+
+        status::dump(
+            self.generate_output_state(),
+            self.shutdown_tx.clone(),
+            self.is_current_shared_leader(),
+            generation,
+            self.status_dump_generation.clone(),
+        );
+    }
+
+    fn effective_status_dump_interval_secs(&self) -> u64 {
+        let configured_interval = self
+            .status_dump_interval_override_secs
+            .unwrap_or(self.client_configs.output_status_interval);
+        if configured_interval == 0 && self.is_current_shared_leader() {
+            5
+        } else {
+            configured_interval
+        }
+    }
+
+    fn reschedule_status_dump_deadline(&mut self) {
+        let interval_secs = self.effective_status_dump_interval_secs();
+        self.next_status_dump_at = if interval_secs > 0 {
+            Some(time::Instant::now() + Duration::from_secs(interval_secs))
+        } else {
+            None
+        };
+    }
+
+    fn trigger_status_dump_now(&mut self) {
+        self.dump_status_to_file();
+        self.reschedule_status_dump_deadline();
+    }
+
+    fn trigger_status_dump_after_successful_cluster_mutation(&mut self) {
+        if self.is_current_shared_leader() {
+            self.trigger_status_dump_now();
+        }
+    }
+
+    fn set_runtime_status_dump_interval_override(&mut self, interval_secs: Option<u64>) {
+        self.status_dump_interval_override_secs = interval_secs;
+        self.reschedule_status_dump_deadline();
     }
 }
 
-fn persisted_validation_status_from_piece_completion(
-    total_pieces: u32,
-    completed_pieces: u32,
+fn persisted_validation_status_from_metrics(
+    metrics: &TorrentMetrics,
     previous_validation_status: bool,
 ) -> bool {
     // Metadata may not be available yet for magnet sessions; preserve prior validation
-    // only for the unknown 0/0 snapshot.
-    if total_pieces == 0 && completed_pieces == 0 {
+    // only for the unknown 0/0 snapshot when we also have no explicit completion signal.
+    if metrics.number_of_pieces_total == 0
+        && metrics.number_of_pieces_completed == 0
+        && !metrics.is_complete
+        && !activity_marks_torrent_complete(&metrics.activity_message)
+        && !torrent_has_skipped_files(metrics)
+    {
         return previous_validation_status;
     }
-    total_pieces > 0 && completed_pieces == total_pieces
+
+    metrics.is_complete || !torrent_is_effectively_incomplete(metrics)
 }
 
 fn activity_marks_torrent_complete(activity_message: &str) -> bool {
@@ -3822,93 +5801,12 @@ fn compose_system_warning(
     }
 }
 
-pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
-    // Try Hex Decoding (Handles standard V1 and Hex-encoded V2 Multihash)
-    if let Ok(bytes) = hex::decode(hash_string) {
-        // V1: 20 bytes (SHA-1)
-        if bytes.len() == 20 {
-            return Ok(bytes);
-        }
-        // V2: 34 bytes (Multihash: 2 byte prefix + 32 byte SHA-256)
-        // Prefix 0x12 (SHA2-256) + 0x20 (32 bytes)
-        if bytes.len() == 34 && bytes[0] == 0x12 && bytes[1] == 0x20 {
-            // Return truncated 20 bytes for internal ID
-            return Ok(bytes[2..22].to_vec());
-        }
-    }
-
-    // Try Base32 Decoding (Handles Base32-encoded V1 and V2)
-    if let Ok(bytes) = BASE32.decode(hash_string.to_uppercase().as_bytes()) {
-        if bytes.len() == 20 {
-            return Ok(bytes);
-        }
-        if bytes.len() == 34 && bytes[0] == 0x12 && bytes[1] == 0x20 {
-            return Ok(bytes[2..22].to_vec());
-        }
-    }
-
-    Err(format!("Invalid info_hash format/length: {}", hash_string))
-}
-
 pub fn parse_hybrid_hashes(magnet_link: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let query = magnet_link
-        .split_once('?')
-        .map(|(_, q)| q)
-        .unwrap_or(magnet_link);
-    let mut v1: Option<Vec<u8>> = None;
-    let mut v2: Option<Vec<u8>> = None;
-
-    for part in query.split('&') {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        if !key.eq_ignore_ascii_case("xt") {
-            continue;
-        }
-
-        const BTIH_PREFIX: &str = "urn:btih:";
-        const BTMH_PREFIX: &str = "urn:btmh:";
-        if value.len() > BTIH_PREFIX.len()
-            && value
-                .get(..BTIH_PREFIX.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(BTIH_PREFIX))
-        {
-            v1 = value
-                .get(BTIH_PREFIX.len()..)
-                .and_then(|h| decode_info_hash(h).ok());
-        } else if value.len() > BTMH_PREFIX.len()
-            && value
-                .get(..BTMH_PREFIX.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(BTMH_PREFIX))
-        {
-            v2 = value
-                .get(BTMH_PREFIX.len()..)
-                .and_then(|h| decode_info_hash(h).ok());
-        }
-    }
-    (v1, v2)
+    crate::torrent_identity::parse_hybrid_hashes(magnet_link)
 }
 
 pub fn info_hash_from_torrent_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
-    let torrent = from_bytes(bytes).ok()?;
-
-    let hash = if torrent.info.meta_version == Some(2) {
-        if !torrent.info.pieces.is_empty() {
-            let mut hasher = sha1::Sha1::new();
-            hasher.update(&torrent.info_dict_bencode);
-            hasher.finalize().to_vec()
-        } else {
-            let mut hasher = Sha256::new();
-            hasher.update(&torrent.info_dict_bencode);
-            hasher.finalize()[0..20].to_vec()
-        }
-    } else {
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(&torrent.info_dict_bencode);
-        hasher.finalize().to_vec()
-    };
-
-    Some(hash)
+    crate::torrent_identity::info_hash_from_torrent_bytes(bytes)
 }
 
 fn resolve_magnet_torrent_name(
@@ -4109,11 +6007,8 @@ fn build_persist_payload(
                 .copied()
                 .unwrap_or(false);
 
-            let final_validation_status = persisted_validation_status_from_piece_completion(
-                torrent_state.number_of_pieces_total,
-                torrent_state.number_of_pieces_completed,
-                previous_validation_status,
-            );
+            let final_validation_status =
+                persisted_validation_status_from_metrics(torrent_state, previous_validation_status);
 
             TorrentSettings {
                 torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
@@ -4122,6 +6017,7 @@ fn build_persist_payload(
                 download_path: torrent_state.download_path.clone(),
                 container_name: torrent_state.container_name.clone(),
                 torrent_control_state: torrent_state.torrent_control_state.clone(),
+                delete_files: torrent_state.delete_files,
                 file_priorities: torrent_state.file_priorities.clone(),
             }
         })
@@ -4180,6 +6076,7 @@ fn build_persist_payload(
         rss_state,
         network_history,
         activity_history,
+        event_journal_state: app_state.event_journal_state.clone(),
     }
 }
 
@@ -4244,28 +6141,41 @@ fn prune_rss_feed_errors(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)]
+
     use super::{
         apply_network_history_persist_result, build_persist_payload,
         clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
-        flush_persistence_writer_parts, parse_hybrid_hashes,
-        persisted_validation_status_from_piece_completion, prune_rss_feed_errors,
-        queue_persistence_payload, resolve_magnet_torrent_name, rss_settings_changed,
-        should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, torrent_completion_percent,
-        torrent_is_effectively_incomplete, App, AppMode, AppState, FilePriority, PeerInfo,
+        flush_persistence_writer_parts, move_file_with_fallback_impl, parse_hybrid_hashes,
+        persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
+        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
+        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
+        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
+        AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority, PeerInfo,
         PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
         TorrentMetrics, TorrentSortColumn, UiState,
     };
-    use crate::config::TorrentSettings;
+    use crate::config::{
+        clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
+    };
+    use crate::control_service::control_event_details;
     use crate::errors::StorageError;
+    use crate::integrations::control::{read_control_request, ControlRequest};
+    use crate::integrations::status::{self, AppOutputState};
+    use crate::persistence::event_journal::{
+        ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
+    };
+    use crate::persistence::event_journal::{EventCategory, EventJournalEntry};
     use crate::telemetry::ui_telemetry::UiTelemetry;
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
     use std::collections::HashMap;
+    use std::env;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use tokio::sync::watch;
     use tokio::time;
 
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
@@ -4280,23 +6190,82 @@ mod tests {
         display
     }
 
+    fn shared_env_guard() -> &'static std::sync::Mutex<()> {
+        crate::config::shared_env_guard_for_tests()
+    }
+
+    fn lock_shared_env() -> std::sync::MutexGuard<'static, ()> {
+        shared_env_guard()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn configure_temp_app_paths_for_test() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        set_app_paths_override_for_tests(Some((config_dir, data_dir)));
+        dir
+    }
+
+    #[test]
+    fn move_file_with_fallback_copies_when_rename_crosses_devices() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("bridge.magnet");
+        let destination = dir.path().join("processed").join("bridge.magnet");
+        std::fs::write(
+            &source,
+            b"magnet:?xt=urn:btih:1111111111111111111111111111111111111111",
+        )
+        .expect("write source file");
+
+        move_file_with_fallback_impl(&source, &destination, |_src, _dst| {
+            Err(std::io::Error::from_raw_os_error(18))
+        })
+        .expect("fallback move should succeed");
+
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read copied destination"),
+            "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+        );
+    }
+
     #[test]
     fn persisted_validation_status_is_true_only_when_complete() {
-        assert!(!persisted_validation_status_from_piece_completion(
-            0, 0, false
+        assert!(!persisted_validation_status_from_metrics(
+            &TorrentMetrics::default(),
+            false
         ));
-        assert!(!persisted_validation_status_from_piece_completion(
-            10, 9, false
+        assert!(!persisted_validation_status_from_metrics(
+            &TorrentMetrics {
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 9,
+                ..Default::default()
+            },
+            false
         ));
-        assert!(persisted_validation_status_from_piece_completion(
-            10, 10, false
+        assert!(persisted_validation_status_from_metrics(
+            &TorrentMetrics {
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 10,
+                ..Default::default()
+            },
+            false
         ));
     }
 
     #[test]
     fn persisted_validation_status_downgrades_when_incomplete() {
         assert!(
-            !persisted_validation_status_from_piece_completion(10, 8, true),
+            !persisted_validation_status_from_metrics(
+                &TorrentMetrics {
+                    number_of_pieces_total: 10,
+                    number_of_pieces_completed: 8,
+                    ..Default::default()
+                },
+                true
+            ),
             "Validation status must not stay true once piece completion regresses"
         );
     }
@@ -4304,9 +6273,29 @@ mod tests {
     #[test]
     fn persisted_validation_status_preserves_prior_true_for_metadata_unavailable_snapshot() {
         assert!(
-            persisted_validation_status_from_piece_completion(0, 0, true),
+            persisted_validation_status_from_metrics(&TorrentMetrics::default(), true),
             "0/0 snapshot should preserve prior validated status (magnet metadata pending)"
         );
+    }
+
+    #[test]
+    fn persisted_validation_status_treats_effectively_complete_torrents_as_complete() {
+        assert!(persisted_validation_status_from_metrics(
+            &TorrentMetrics {
+                activity_message: "Seeding".to_string(),
+                ..Default::default()
+            },
+            false
+        ));
+        assert!(persisted_validation_status_from_metrics(
+            &TorrentMetrics {
+                file_priorities: HashMap::from([(0, FilePriority::Skip)]),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 8,
+                ..Default::default()
+            },
+            false
+        ));
     }
 
     #[test]
@@ -4649,7 +6638,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         app.tuning_controller.on_second_tick();
         app.app_state.tuning_countdown = app.tuning_controller.countdown_secs();
         let stale_deadline = time::Instant::now() + Duration::from_secs(300);
@@ -4675,7 +6666,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -4722,12 +6715,289 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_availability_fault_records_event_journal_entry() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"fault_journal_hash".to_vec();
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Sample Fault".to_string();
+        display.latest_state.torrent_control_state = TorrentControlState::Running;
+        display.latest_state.data_available = true;
+        app.app_state.torrents.insert(info_hash.clone(), display);
+        app.integrity_scheduler
+            .sync_torrents(app.current_integrity_snapshots());
+
+        app.handle_manager_event(ManagerEvent::DataAvailabilityFault {
+            info_hash: info_hash.clone(),
+            piece_index: 4,
+            error: StorageError::from(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+        });
+
+        let journal_entry = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .find(|entry| entry.event_type == EventType::DataUnavailable)
+            .expect("expected data unavailable event");
+        let expected_hash = hex::encode(&info_hash);
+        assert_eq!(
+            journal_entry.info_hash_hex.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn ingest_journal_records_queue_and_terminal_result_with_shared_correlation() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let queued_path = std::env::temp_dir().join("event-journal-alpha.magnet");
+
+        app.record_watch_path_discovered(&queued_path);
+        app.record_ingest_result(
+            &queued_path,
+            &CommandIngestResult::Duplicate {
+                info_hash: Some(vec![0x11; 20]),
+                torrent_name: Some("Sample Alpha".to_string()),
+            },
+        );
+
+        let entries = &app.app_state.event_journal_state.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event_type, EventType::IngestQueued);
+        assert_eq!(entries[1].event_type, EventType::IngestDuplicate);
+        assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
+        assert_eq!(entries[0].source_path.as_ref(), Some(&queued_path));
+        assert_eq!(entries[1].source_path.as_ref(), Some(&queued_path));
+        assert_eq!(
+            entries[0].details,
+            EventDetails::Ingest {
+                origin: IngestOrigin::WatchFolder,
+                ingest_kind: IngestKind::MagnetFile,
+            }
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn control_journal_preserves_watch_folder_origin() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let queued_path = std::env::temp_dir().join("event-journal-alpha.control");
+        let request = ControlRequest::Pause {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+
+        assert!(app.record_control_queued(
+            queued_path.clone(),
+            request.clone(),
+            ControlOrigin::WatchFolder
+        ));
+        app.record_control_result(&queued_path, &request, Ok("Paused torrent".to_string()));
+
+        let entries = &app.app_state.event_journal_state.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event_type, EventType::ControlQueued);
+        assert_eq!(entries[1].event_type, EventType::ControlApplied);
+        assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
+        assert_eq!(
+            entries[0].details,
+            control_event_details(&request, ControlOrigin::WatchFolder)
+        );
+        assert_eq!(
+            entries[1].details,
+            control_event_details(&request, ControlOrigin::WatchFolder)
+        );
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn control_origin_for_ingest_path_uses_rss_origin_when_available() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let queued_path = std::env::temp_dir().join("event-journal-rss.magnet");
+
+        app.record_rss_queued(
+            queued_path.clone(),
+            IngestOrigin::RssManual,
+            IngestKind::MagnetFile,
+        );
+
+        assert_eq!(
+            app.control_origin_for_ingest_path(&queued_path),
+            ControlOrigin::RssManual
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn manual_torrent_browser_moves_standalone_watch_file_to_processed_and_updates_journal() {
+        let _guard = lock_shared_env();
+        let dir = configure_temp_app_paths_for_test();
+        let data_dir = dir.path().join("data");
+        let watch_dir = data_dir.join("watch_files");
+        let processed_dir = data_dir.join("processed_files");
+        std::fs::create_dir_all(&watch_dir).expect("create watch dir");
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("integration_tests")
+            .join("torrents")
+            .join("v1")
+            .join("single_4k.bin.torrent");
+        let watched_path = watch_dir.join("manual-input.torrent");
+        std::fs::copy(&fixture, &watched_path).expect("copy fixture");
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        app.record_watch_path_discovered(&watched_path);
+        app.open_manual_browser_for_torrent_file(watched_path.clone())
+            .expect("open manual browser");
+
+        let final_path = processed_dir.join("manual-input.torrent");
+        assert_eq!(app.app_state.pending_torrent_path, Some(final_path.clone()));
+        assert!(final_path.exists());
+        assert!(!watched_path.exists());
+        assert_eq!(
+            app.app_state
+                .event_journal_state
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.event_type == EventType::IngestQueued)
+                .and_then(|entry| entry.source_path.clone()),
+            Some(final_path)
+        );
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn manual_torrent_browser_moves_shared_inbox_file_to_shared_processed_and_updates_journal(
+    ) {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+        std::fs::create_dir_all(effective_root.join("inbox")).expect("create shared inbox");
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("integration_tests")
+            .join("torrents")
+            .join("v1")
+            .join("single_4k.bin.torrent");
+        let watched_path = effective_root.join("inbox").join("manual-input.torrent");
+        std::fs::copy(&fixture, &watched_path).expect("copy fixture");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let mut app = App::new(settings, AppRuntimeMode::SharedLeader)
+            .await
+            .expect("build shared app");
+
+        assert!(app.record_ingest_queued(
+            watched_path.clone(),
+            IngestOrigin::WatchFolder,
+            IngestKind::TorrentFile,
+            crate::config::shared_inbox_path(),
+        ));
+        app.open_manual_browser_for_torrent_file(watched_path.clone())
+            .expect("open manual browser");
+
+        let final_path = effective_root
+            .join("processed")
+            .join("manual-input.torrent");
+        assert_eq!(app.app_state.pending_torrent_path, Some(final_path.clone()));
+        assert!(final_path.exists());
+        assert!(!watched_path.exists());
+        assert_eq!(
+            app.app_state
+                .event_journal_state
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.event_type == EventType::IngestQueued)
+                .and_then(|entry| entry.source_path.clone()),
+            Some(final_path)
+        );
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
     async fn partial_probe_result_does_not_clear_previous_unavailable_state() {
         let settings = crate::config::Settings {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"partial_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -4789,7 +7059,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"dispatch_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -4827,7 +7099,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"metadata_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -4889,7 +7163,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let faulted_info_hash = b"metadata_faulted_hash".to_vec();
         let sibling_info_hash = b"metadata_sibling_hash".to_vec();
 
@@ -4977,7 +7253,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let faulted_info_hash = b"faulted_probe_hash".to_vec();
         let sibling_info_hash = b"sibling_probe_hash".to_vec();
 
@@ -5070,7 +7348,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"partial_unavailable_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -5144,7 +7424,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"recovery_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -5188,6 +7470,964 @@ mod tests {
             .get(&info_hash)
             .expect("torrent display should exist");
         assert!(!torrent.latest_state.data_available);
+        let recovery_entry = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .find(|entry| entry.event_type == EventType::DataRecovered)
+            .expect("expected data recovery event");
+        let expected_hash = hex::encode(&info_hash);
+        assert_eq!(
+            recovery_entry.info_hash_hex.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn completion_transition_records_single_torrent_completed_event() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"completion_journal_hash".to_vec();
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Sample Completion".to_string();
+        display.latest_state.number_of_pieces_total = 10;
+        display.latest_state.number_of_pieces_completed = 3;
+        display.latest_state.activity_message = "Downloading".to_string();
+        app.app_state.torrents.insert(info_hash.clone(), display);
+
+        let (tx, rx) = watch::channel(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Completion".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 3,
+            activity_message: "Downloading".to_string(),
+            ..Default::default()
+        });
+        app.torrent_metric_watch_rxs.insert(info_hash.clone(), rx);
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Completion".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send completion metrics");
+        app.drain_latest_torrent_metrics();
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Completion".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send steady completion metrics");
+        app.drain_latest_torrent_metrics();
+
+        let completion_entries = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| entry.event_type == EventType::TorrentCompleted)
+            .count();
+        assert_eq!(completion_entries, 1);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn completed_torrents_restored_as_complete_do_not_rejournal_on_metrics_refresh() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"restored_complete_hash".to_vec();
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Sample Restore".to_string();
+        display.latest_state.number_of_pieces_total = 10;
+        display.latest_state.number_of_pieces_completed = 10;
+        display.latest_state.is_complete = true;
+        display.latest_state.activity_message = "Seeding".to_string();
+        app.app_state.torrents.insert(info_hash.clone(), display);
+
+        let (tx, rx) = watch::channel(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        });
+        app.torrent_metric_watch_rxs.insert(info_hash.clone(), rx);
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send completed metrics");
+        app.drain_latest_torrent_metrics();
+
+        let completion_entries = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| entry.event_type == EventType::TorrentCompleted)
+            .count();
+        assert_eq!(completion_entries, 0);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn completed_torrents_do_not_duplicate_existing_completion_journal_entries() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"existing_complete_hash".to_vec();
+        let info_hash_hex = hex::encode(&info_hash);
+
+        app.app_state
+            .event_journal_state
+            .entries
+            .push(EventJournalEntry {
+                id: 1,
+                category: EventCategory::TorrentLifecycle,
+                event_type: EventType::TorrentCompleted,
+                torrent_name: Some("Sample Existing".to_string()),
+                info_hash_hex: Some(info_hash_hex.clone()),
+                ..Default::default()
+            });
+        app.app_state.event_journal_state.next_id = 2;
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Sample Existing".to_string();
+        display.latest_state.number_of_pieces_total = 10;
+        display.latest_state.number_of_pieces_completed = 0;
+        display.latest_state.is_complete = false;
+        app.app_state.torrents.insert(info_hash.clone(), display);
+
+        let (tx, rx) = watch::channel(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Existing".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 0,
+            is_complete: false,
+            ..Default::default()
+        });
+        app.torrent_metric_watch_rxs.insert(info_hash.clone(), rx);
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Existing".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send completed metrics");
+        app.drain_latest_torrent_metrics();
+
+        let completion_entries = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.event_type == EventType::TorrentCompleted
+                    && entry.info_hash_hex.as_deref() == Some(info_hash_hex.as_str())
+            })
+            .count();
+        assert_eq!(completion_entries, 1);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn restored_completed_torrents_skip_startup_recompletion_once() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"startup_recompletion_hash".to_vec();
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Sample Startup Restore".to_string();
+        display.latest_state.number_of_pieces_total = 10;
+        display.latest_state.number_of_pieces_completed = 10;
+        display.latest_state.is_complete = true;
+        display.latest_state.activity_message = "Seeding".to_string();
+        app.app_state.torrents.insert(info_hash.clone(), display);
+        app.startup_completion_suppressed_hashes
+            .insert(info_hash.clone());
+
+        let (tx, rx) = watch::channel(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Startup Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        });
+        app.torrent_metric_watch_rxs.insert(info_hash.clone(), rx);
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Startup Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 0,
+            is_complete: false,
+            activity_message: "Validating 0% (0/10)".to_string(),
+            ..Default::default()
+        })
+        .expect("send startup validating metrics");
+        app.drain_latest_torrent_metrics();
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Startup Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send recovered complete metrics");
+        app.drain_latest_torrent_metrics();
+
+        let completion_entries = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| entry.event_type == EventType::TorrentCompleted)
+            .count();
+        assert_eq!(completion_entries, 0);
+        assert!(
+            !app.startup_completion_suppressed_hashes
+                .contains(&info_hash),
+            "startup suppression should clear after the first skipped re-completion"
+        );
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Startup Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 0,
+            is_complete: false,
+            activity_message: "Checking".to_string(),
+            ..Default::default()
+        })
+        .expect("send later incomplete metrics");
+        app.drain_latest_torrent_metrics();
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Sample Startup Restore".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".to_string(),
+            ..Default::default()
+        })
+        .expect("send later complete metrics");
+        app.drain_latest_torrent_metrics();
+
+        let completion_entries = app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| entry.event_type == EventType::TorrentCompleted)
+            .count();
+        assert_eq!(completion_entries, 1);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn control_request_pause_updates_runtime_config() {
+        let info_hash_hex = "1111111111111111111111111111111111111111";
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", info_hash_hex),
+                name: "Sample Alpha".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let result = app
+            .apply_control_request(&ControlRequest::Pause {
+                info_hash_hex: info_hash_hex.to_string(),
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            app.client_configs.torrents[0].torrent_control_state,
+            TorrentControlState::Paused
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_follower_suppresses_incomplete_runtime_and_converges_display_state() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+
+        assert!(app.listener.is_some());
+
+        let next_settings = crate::config::Settings {
+            client_port: app.client_configs.client_port,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Delta".to_string(),
+                torrent_control_state: TorrentControlState::Paused,
+                ..Default::default()
+            }],
+            ..app.client_configs.clone()
+        };
+
+        app.apply_settings_update(next_settings, false).await;
+
+        assert_eq!(app.app_state.torrents.len(), 1);
+        assert!(
+            app.torrent_manager_command_txs.is_empty(),
+            "incomplete torrents should not start local follower runtime in phase 1"
+        );
+        let metrics = app
+            .app_state
+            .torrents
+            .values()
+            .next()
+            .expect("cluster follower should load converged torrent");
+        assert_eq!(metrics.latest_state.torrent_name, "Sample Delta");
+        assert_eq!(
+            metrics.latest_state.torrent_control_state,
+            TorrentControlState::Paused
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_follower_promotion_starts_previously_suppressed_runtime() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .to_string(),
+                name: "Sample Echo".to_string(),
+                torrent_control_state: TorrentControlState::Running,
+                validation_status: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+
+        assert_eq!(app.app_state.torrents.len(), 1);
+        assert!(
+            app.torrent_manager_command_txs.is_empty(),
+            "follower should suppress incomplete runtime before promotion"
+        );
+
+        app.current_cluster_role = Some(AppClusterRole::Leader);
+        app.runtime_mode = AppRuntimeMode::SharedLeader;
+        app.sync_cluster_role_label();
+        app.start_missing_runtime_torrents_for_current_role().await;
+
+        assert_eq!(
+            app.torrent_manager_command_txs.len(),
+            1,
+            "promotion should start the previously suppressed runtime"
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn cluster_revision_reload_applies_for_followers_and_stops_after_promotion() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let initial_settings =
+            crate::config::load_settings().expect("load initial shared settings");
+        let mut app = App::new(initial_settings.clone(), AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+
+        let revision_path =
+            crate::config::shared_cluster_revision_path().expect("shared cluster revision path");
+
+        let mut follower_reload_settings = initial_settings.clone();
+        follower_reload_settings.global_download_limit_bps = 42;
+        crate::config::save_settings(&follower_reload_settings)
+            .expect("save follower reload settings");
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path.clone()))
+            .await;
+        assert_eq!(app.client_configs.global_download_limit_bps, 42);
+
+        app.current_cluster_role = Some(AppClusterRole::Leader);
+        app.runtime_mode = AppRuntimeMode::SharedLeader;
+        app.sync_cluster_role_label();
+
+        let mut leader_ignored_settings = follower_reload_settings.clone();
+        leader_ignored_settings.global_download_limit_bps = 99;
+        crate::config::save_settings(&leader_ignored_settings)
+            .expect("save leader ignored settings");
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path.clone()))
+            .await;
+        assert_eq!(
+            app.client_configs.global_download_limit_bps, 42,
+            "leader should ignore revision-triggered reloads"
+        );
+
+        app.current_cluster_role = Some(AppClusterRole::Follower);
+        app.runtime_mode = AppRuntimeMode::SharedFollower;
+        app.sync_cluster_role_label();
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path))
+            .await;
+        assert_eq!(
+            app.client_configs.global_download_limit_bps, 99,
+            "follower should resume applying revision-triggered reloads after demotion"
+        );
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_follower_read_model_prefers_leader_snapshot_for_incomplete_torrents() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:3333333333333333333333333333333333333333"
+                    .to_string(),
+                name: "Sample Foxtrot".to_string(),
+                torrent_control_state: TorrentControlState::Running,
+                validation_status: false,
+                ..Default::default()
+            }],
+            ..crate::config::load_settings().expect("load shared settings")
+        };
+        crate::config::save_settings(&settings).expect("save shared settings");
+
+        let mut app = App::new(settings.clone(), AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+
+        let info_hash = app
+            .app_state
+            .torrents
+            .keys()
+            .next()
+            .expect("placeholder torrent should exist")
+            .clone();
+
+        let mut snapshot = status::offline_output_state(&settings);
+        let metrics = snapshot
+            .torrents
+            .get_mut(&info_hash)
+            .expect("leader snapshot torrent metrics");
+        metrics.activity_message = "Leader downloading".to_string();
+        metrics.number_of_pieces_total = 10;
+        metrics.number_of_pieces_completed = 4;
+        metrics.download_speed_bps = 1234;
+        metrics.upload_speed_bps = 55;
+        metrics.eta = Duration::from_secs(42);
+        metrics.is_complete = false;
+
+        let leader_status_path =
+            crate::config::shared_leader_status_path().expect("leader status path");
+        std::fs::create_dir_all(
+            leader_status_path
+                .parent()
+                .expect("leader status parent directory"),
+        )
+        .expect("create status dir");
+        std::fs::write(
+            &leader_status_path,
+            crate::fs_atomic::serialize_versioned_json(&snapshot)
+                .expect("serialize leader snapshot"),
+        )
+        .expect("write leader snapshot");
+
+        let reread = status::read_cluster_output_state().expect("read leader snapshot");
+        let reread_metrics = reread
+            .torrents
+            .get(&info_hash)
+            .expect("reread leader metrics by info hash");
+        assert_eq!(reread_metrics.activity_message, "Leader downloading");
+        assert_eq!(reread_metrics.download_speed_bps, 1234);
+
+        app.refresh_follower_read_model();
+
+        let display = app
+            .app_state
+            .torrents
+            .get(&info_hash)
+            .expect("display state for shared follower");
+        assert_eq!(display.latest_state.activity_message, "Leader downloading");
+        assert_eq!(display.latest_state.download_speed_bps, 1234);
+        assert_eq!(display.latest_state.eta, Duration::from_secs(42));
+        assert_eq!(display.latest_state.number_of_pieces_completed, 4);
+        assert!(app.leader_status_snapshot.is_some());
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_leader_dump_writes_host_and_cluster_status_files() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let app = App::new(settings, AppRuntimeMode::SharedLeader)
+            .await
+            .expect("build shared leader app");
+
+        app.dump_status_to_file();
+        time::sleep(Duration::from_millis(100)).await;
+
+        let host_status_path = crate::config::shared_status_path().expect("host status path");
+        let leader_status_path =
+            crate::config::shared_leader_status_path().expect("leader status path");
+
+        assert!(host_status_path.exists());
+        assert!(leader_status_path.exists());
+
+        let host_snapshot: AppOutputState = crate::fs_atomic::deserialize_versioned_json(
+            &std::fs::read_to_string(&host_status_path).expect("read host status"),
+        )
+        .expect("parse host status");
+        let leader_snapshot: AppOutputState = crate::fs_atomic::deserialize_versioned_json(
+            &std::fs::read_to_string(&leader_status_path).expect("read leader status"),
+        )
+        .expect("parse leader status");
+        assert_eq!(host_snapshot, leader_snapshot);
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_leader_defaults_status_follow_to_five_seconds() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let app = App::new(settings, AppRuntimeMode::SharedLeader)
+            .await
+            .expect("build shared leader app");
+
+        assert_eq!(app.client_configs.output_status_interval, 0);
+        assert_eq!(app.effective_status_dump_interval_secs(), 5);
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_follower_path_file_with_default_download_routes_through_control_request() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let local_dir = tempfile::tempdir().expect("create local dir");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let mut settings = crate::config::load_settings().expect("load shared settings");
+        settings.client_port = 0;
+        settings.default_download_folder = Some(effective_root.join("data").join("downloads"));
+        crate::config::save_settings(&settings).expect("save shared settings");
+
+        let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+        let torrent_path = local_dir.path().join("sample-input.torrent");
+        let path_file = local_dir.path().join("sample.path");
+        std::fs::write(&torrent_path, b"placeholder torrent payload").expect("write torrent file");
+        std::fs::write(&path_file, torrent_path.to_string_lossy().to_string())
+            .expect("write path file");
+
+        app.handle_app_command(AppCommand::AddTorrentFromPathFile(path_file))
+            .await;
+
+        assert!(app.app_state.torrents.is_empty());
+        let inbox_entries: Vec<_> = std::fs::read_dir(effective_root.join("inbox"))
+            .expect("read shared inbox")
+            .collect();
+        assert_eq!(inbox_entries.len(), 1);
+        let queued_path = inbox_entries[0]
+            .as_ref()
+            .expect("queued inbox entry")
+            .path();
+        let queued_request = read_control_request(&queued_path).expect("read queued request");
+
+        match queued_request {
+            ControlRequest::AddTorrentFile {
+                source_path,
+                download_path,
+                ..
+            } => {
+                assert!(source_path.starts_with(effective_root.join("staged-adds")));
+                assert!(source_path.exists());
+                assert_eq!(
+                    download_path,
+                    Some(effective_root.join("data").join("downloads"))
+                );
+            }
+            other => panic!("unexpected queued request: {:?}", other),
+        }
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_follower_allows_host_local_config_updates_and_rewatches_host_folder() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+        let old_watch = shared_root.path().join("old-watch");
+        let new_watch = shared_root.path().join("new-watch");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            format!(
+                "client_port = 0\nwatch_folder = {:?}\n",
+                old_watch.to_string_lossy()
+            ),
+        )
+        .expect("write host config");
+
+        let settings = crate::config::load_settings().expect("load shared settings");
+        let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+        let mut next_settings = app.client_configs.clone();
+        next_settings.watch_folder = Some(new_watch.clone());
+        next_settings.client_port = app.client_configs.client_port;
+
+        app.handle_app_command(AppCommand::UpdateConfig(next_settings))
+            .await;
+
+        assert_eq!(app.client_configs.watch_folder, Some(new_watch.clone()));
+        assert!(app.watched_paths.contains(&new_watch));
+        assert!(!app.watched_paths.contains(&old_watch));
+
+        let reloaded = crate::config::load_settings().expect("reload shared settings");
+        assert_eq!(reloaded.watch_folder, Some(new_watch));
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn control_request_status_follow_start_sets_runtime_override() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let result = app
+            .apply_control_request(&ControlRequest::StatusFollowStart { interval_secs: 5 })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(app.status_dump_interval_override_secs, Some(5));
+        assert!(app.next_status_dump_at.is_some());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn enqueue_watch_command_spills_to_pending_queue_when_channel_is_full() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        for idx in 0..11 {
+            let path = std::env::temp_dir().join(format!("queued-{idx}.magnet"));
+            app.enqueue_watch_command(
+                AppCommand::AddMagnetFromFile(path),
+                Duration::from_millis(0),
+            )
+            .await;
+        }
+
+        assert_eq!(app.app_state.pending_watch_commands.len(), 1);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn add_magnet_torrent_rejects_hashless_magnet_without_panicking() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let result = app
+            .add_magnet_torrent(
+                "Fetching name...".to_string(),
+                "magnet:?dn=SampleNoHash".to_string(),
+                None,
+                false,
+                TorrentControlState::Running,
+                HashMap::new(),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            CommandIngestResult::Invalid {
+                info_hash: None,
+                torrent_name: None,
+                message: "Magnet link is missing both btih and btmh hashes".to_string(),
+            }
+        );
 
         let _ = app.shutdown_tx.send(());
     }
@@ -5198,7 +8438,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"already_healthy_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -5240,7 +8482,9 @@ mod tests {
             client_port: 0,
             ..Default::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         let info_hash = b"stale_recovery_probe_hash".to_vec();
 
         let mut display = TorrentDisplayState::default();
@@ -5446,6 +8690,7 @@ mod tests {
                 state: network_history_state.clone(),
             }),
             activity_history: None,
+            event_journal_state: EventJournalState::default(),
         };
 
         assert!(queue_persistence_payload(Some(&tx), payload).is_ok());

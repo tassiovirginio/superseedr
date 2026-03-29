@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::AppCommand;
-use crate::config::{get_watch_path, Settings};
+use crate::integrations::control::read_control_request;
 use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 use tracing::{event as tracing_event, Level};
 
 pub fn create_watcher(
-    settings: &Settings,
+    watch_paths: &[PathBuf],
+    watch_port_file: bool,
     tx: mpsc::Sender<Result<Event, NotifyError>>,
 ) -> Result<RecommendedWatcher, Box<dyn std::error::Error>> {
     let mut watcher = RecommendedWatcher::new(
@@ -22,76 +23,60 @@ pub fn create_watcher(
         Config::default(),
     )?;
 
-    if let Some(path) = &settings.watch_folder {
+    for path in watch_paths {
         if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
-            tracing_event!(Level::ERROR, "Failed to watch user path {:?}: {}", path, e);
-        } else {
-            tracing_event!(Level::INFO, "Watching user path: {:?}", path);
-        }
-    }
-
-    if let Some((watch_path, _)) = get_watch_path() {
-        if let Err(e) = watcher.watch(&watch_path, RecursiveMode::NonRecursive) {
             tracing_event!(
                 Level::ERROR,
-                "Failed to watch system path {:?}: {}",
-                watch_path,
-                e
-            );
-        }
-    }
-
-    let port_file_path = PathBuf::from("/port-data/forwarded_port");
-    if let Some(port_dir) = port_file_path.parent() {
-        if let Err(e) = watcher.watch(port_dir, RecursiveMode::NonRecursive) {
-            tracing_event!(
-                Level::WARN,
-                "Failed to watch port file directory {:?}: {}",
-                port_dir,
+                "Failed to watch command path {:?}: {}",
+                path,
                 e
             );
         } else {
-            tracing_event!(
-                Level::INFO,
-                "Watching for port file changes in {:?}",
-                port_dir
-            );
+            tracing_event!(Level::INFO, "Watching command path: {:?}", path);
+        }
+    }
+
+    if watch_port_file {
+        let port_file_path = PathBuf::from("/port-data/forwarded_port");
+        if let Some(port_dir) = port_file_path.parent() {
+            if let Err(e) = watcher.watch(port_dir, RecursiveMode::NonRecursive) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to watch port file directory {:?}: {}",
+                    port_dir,
+                    e
+                );
+            } else {
+                tracing_event!(
+                    Level::INFO,
+                    "Watching for port file changes in {:?}",
+                    port_dir
+                );
+            }
         }
     }
 
     Ok(watcher)
 }
 
-pub fn scan_watch_folders(settings: &Settings) -> Vec<AppCommand> {
-    let mut commands = Vec::new();
+pub fn scan_watch_folder_paths(watch_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
 
-    if let Some(user_watch_path) = &settings.watch_folder {
-        if let Ok(entries) = fs::read_dir(user_watch_path) {
+    for watch_path in watch_paths {
+        if let Ok(entries) = fs::read_dir(watch_path) {
             for entry in entries.flatten() {
-                if let Some(cmd) = path_to_command(&entry.path()) {
-                    commands.push(cmd);
-                }
+                paths.push(entry.path());
             }
         } else {
             tracing_event!(
                 Level::WARN,
-                "Failed to read user watch directory: {:?}",
-                user_watch_path
+                "Failed to read watch directory: {:?}",
+                watch_path
             );
         }
     }
 
-    if let Some((watch_path, _)) = get_watch_path() {
-        if let Ok(entries) = fs::read_dir(watch_path) {
-            for entry in entries.flatten() {
-                if let Some(cmd) = path_to_command(&entry.path()) {
-                    commands.push(cmd);
-                }
-            }
-        }
-    }
-
-    commands
+    paths
 }
 
 pub fn path_to_command(path: &Path) -> Option<AppCommand> {
@@ -118,11 +103,33 @@ pub fn path_to_command(path: &Path) -> Option<AppCommand> {
         return Some(AppCommand::PortFileChanged(path.to_path_buf()));
     }
 
+    if path
+        .file_name()
+        .is_some_and(|name| name == "cluster.revision")
+    {
+        return Some(AppCommand::ReloadClusterState(path.to_path_buf()));
+    }
+
     let ext = path.extension().and_then(|s| s.to_str())?;
     match ext {
         "torrent" => Some(AppCommand::AddTorrentFromFile(path.to_path_buf())),
         "path" => Some(AppCommand::AddTorrentFromPathFile(path.to_path_buf())),
         "magnet" => Some(AppCommand::AddMagnetFromFile(path.to_path_buf())),
+        "control" => match read_control_request(path) {
+            Ok(request) => Some(AppCommand::ControlRequest {
+                path: path.to_path_buf(),
+                request,
+            }),
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to parse control request {:?}: {}",
+                    path,
+                    error
+                );
+                None
+            }
+        },
         "cmd" if path.file_name().is_some_and(|name| name == "shutdown.cmd") => {
             Some(AppCommand::ClientShutdown(path.to_path_buf()))
         }
@@ -140,7 +147,10 @@ pub fn path_to_command(path: &Path) -> Option<AppCommand> {
 mod tests {
     use super::*;
     use crate::app::AppCommand;
+    use crate::integrations::control::{write_control_request, ControlRequest};
+    use notify::EventKind;
     use std::fs::File;
+    use std::time::Duration;
 
     // Helper to create a dummy file for testing (since path_to_command checks is_file())
     fn with_dummy_file<F>(name: &str, test_fn: F)
@@ -176,11 +186,82 @@ mod tests {
     }
 
     #[test]
+    fn test_path_to_command_control_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = write_control_request(&ControlRequest::StatusNow, dir.path())
+            .expect("write control request");
+
+        let cmd = path_to_command(&path);
+        assert!(matches!(
+            cmd,
+            Some(AppCommand::ControlRequest {
+                request: ControlRequest::StatusNow,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scan_watch_folder_paths_reads_provided_paths() {
+        let dir = std::env::temp_dir().join(format!("watcher_env_test_{}", rand::random::<u32>()));
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("queued-job.magnet");
+        File::create(&file_path).unwrap();
+
+        let paths = scan_watch_folder_paths(std::slice::from_ref(&dir));
+        assert!(paths.contains(&file_path));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn create_watcher_emits_live_events_for_provided_watch_paths() {
+        let dir = std::env::temp_dir().join(format!("watcher_live_test_{}", rand::random::<u32>()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _watcher = create_watcher(std::slice::from_ref(&dir), false, tx).unwrap();
+
+        let file_path = dir.join("bridge.magnet");
+        std::fs::write(
+            &file_path,
+            "magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=LocalWatchProbe",
+        )
+        .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(Ok(event)) if event.paths.iter().any(|path| path == &file_path) => {
+                        break event;
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("watcher error: {error}"),
+                    None => panic!("watcher channel closed before receiving file event"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for watch event");
+
+        assert!(matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_)
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_path_to_command_special_files() {
         // Test regression fix: forwarded_port (no extension)
         with_dummy_file("forwarded_port", |path| {
             let cmd = path_to_command(path);
             assert!(matches!(cmd, Some(AppCommand::PortFileChanged(_))));
+        });
+
+        with_dummy_file("cluster.revision", |path| {
+            let cmd = path_to_command(path);
+            assert!(matches!(cmd, Some(AppCommand::ReloadClusterState(_))));
         });
 
         // Test shutdown command

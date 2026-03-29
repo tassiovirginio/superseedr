@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::{get_app_paths, FeedSyncError, RssHistoryEntry};
+use crate::config::{runtime_persistence_dir, FeedSyncError, RssHistoryEntry};
+use crate::fs_atomic::{
+    deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -19,14 +22,14 @@ pub struct RssPersistedState {
 
 #[allow(dead_code)]
 pub fn rss_state_file_path() -> io::Result<PathBuf> {
-    let (_, data_dir) = get_app_paths().ok_or_else(|| {
+    let data_dir = runtime_persistence_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Could not resolve app data directory for RSS persistence",
         )
     })?;
 
-    Ok(data_dir.join("persistence").join("rss.toml"))
+    Ok(data_dir.join("rss.toml"))
 }
 
 #[allow(dead_code)]
@@ -56,7 +59,7 @@ fn load_rss_state_from_path(path: &Path) -> RssPersistedState {
     }
 
     match fs::read_to_string(path) {
-        Ok(content) => match toml::from_str::<RssPersistedState>(&content) {
+        Ok(content) => match deserialize_versioned_toml::<RssPersistedState>(&content) {
             Ok(state) => state,
             Err(e) => {
                 tracing_event!(
@@ -81,17 +84,8 @@ fn load_rss_state_from_path(path: &Path) -> RssPersistedState {
 }
 
 fn save_rss_state_to_path(state: &RssPersistedState, path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let content = toml::to_string_pretty(state).map_err(io::Error::other)?;
-    let tmp_path = path.with_extension("toml.tmp");
-
-    fs::write(&tmp_path, content)?;
-    fs::rename(&tmp_path, path)?;
-
-    Ok(())
+    let content = serialize_versioned_toml(state)?;
+    write_string_atomically(path, &content)
 }
 
 #[cfg(test)]

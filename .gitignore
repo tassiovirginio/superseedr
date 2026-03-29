@@ -6,6 +6,9 @@
 # --- local temp---
 tmp
 *.tmp
+logs/
+*.log
+*.lock
 integration_tests/test_output/
 integration_tests/artifacts/
 
@@ -45,3 +48,7 @@ rust-toolchain
 *.tar
 *.gz
 *.nfo
+
+# --- Local Docker Runtime State ---
+docker-data/
+

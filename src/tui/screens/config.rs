@@ -54,6 +54,9 @@ pub struct ConfigReduceResult {
     pub effects: Vec<ConfigEffect>,
 }
 
+fn shared_path_is_manual(item: ConfigItem) -> bool {
+    crate::config::is_shared_config_mode() && item == ConfigItem::DefaultDownloadFolder
+}
 fn map_key_to_config_action(
     key_code: KeyCode,
     editing: &Option<(ConfigItem, String)>,
@@ -106,6 +109,9 @@ pub fn reduce_config_action(
                     *editing = Some((selected_item, String::new()));
                 }
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
+                    if shared_path_is_manual(selected_item) {
+                        return result;
+                    }
                     let initial_path = if selected_item == ConfigItem::WatchFolder {
                         settings_edit.watch_folder.clone()
                     } else {
@@ -151,8 +157,10 @@ pub fn reduce_config_action(
                     settings_edit.client_port = default_settings.client_port;
                 }
                 ConfigItem::DefaultDownloadFolder => {
-                    settings_edit.default_download_folder =
-                        default_settings.default_download_folder;
+                    if !shared_path_is_manual(selected_item) {
+                        settings_edit.default_download_folder =
+                            default_settings.default_download_folder;
+                    }
                 }
                 ConfigItem::WatchFolder => {
                     settings_edit.watch_folder = default_settings.watch_folder;
@@ -364,6 +372,8 @@ pub fn draw(
         }
     }
 
+    let shared_path_notice = crate::config::is_shared_config_mode()
+        && items.get(selected_index) == Some(&ConfigItem::DefaultDownloadFolder);
     let help_text = if editing.is_some() {
         Line::from(vec![
             Span::styled(
@@ -373,6 +383,18 @@ pub fn draw(
             Span::raw(" to confirm, "),
             Span::styled("[Esc]", ctx.apply(Style::default().fg(ctx.state_error()))),
             Span::raw(" to cancel."),
+        ])
+    } else if shared_path_notice {
+        let settings_label = crate::config::shared_settings_path()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "settings.toml".to_string());
+        Line::from(vec![
+            Span::raw("Shared mode: edit Default Download Folder in "),
+            Span::styled(
+                settings_label,
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ),
+            Span::raw(". Host-local fields still save here."),
         ])
     } else {
         Line::from(vec![

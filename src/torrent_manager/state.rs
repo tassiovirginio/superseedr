@@ -2361,7 +2361,7 @@ impl TorrentState {
     }
 }
 
-fn calculate_deletion_lists(
+pub fn calculate_deletion_lists(
     mfi: &MultiFileInfo,
     base_path: &Path,
     known_container_name: Option<&str>,

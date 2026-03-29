@@ -94,11 +94,11 @@ cargo run
 # Build the Docker image locally
 docker build -t superseedr-dev .
 
-# Test standalone Docker setup
-docker compose -f docker-compose.standalone.yml up
-
-# Test with Gluetun (requires .env and .gluetun.env configuration)
+# Test the supported Docker Compose stack (requires .env and .gluetun.env)
 docker compose up
+
+# Or test the image directly without Gluetun
+docker run --rm -it superseedr-dev
 ```
 
 ### Code Style & Formatting
@@ -165,7 +165,7 @@ Superseedr uses [[Ratatui](https://ratatui.rs/)](https://ratatui.rs/) for the te
 
 When modifying Docker setup or VPN integration:
 
-- Test with both Gluetun and standalone configurations
+- Test with the Compose stack and direct `docker run` flow
 - Verify port forwarding works correctly
 - Check that dynamic port reloading functions as expected
 - Update `.env.example` and `.gluetun.env.example` if adding new configuration variables
@@ -344,3 +344,4 @@ If you're unsure about anything, don't hesitate to:
 - Reach out to maintainers
 
 We're here to help and appreciate your interest in contributing! 🚀
+

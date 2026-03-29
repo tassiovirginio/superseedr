@@ -280,7 +280,7 @@ async fn run_sync(
         let mut is_downloaded = identity_keys.iter().any(|k| downloaded_keys.contains(k));
 
         if is_match && !is_downloaded {
-            let (added, info_hash) = auto_ingest_item(settings, &client, &item).await;
+            let (added, info_hash, command_path) = auto_ingest_item(settings, &client, &item).await;
             if added {
                 is_downloaded = true;
                 for key in &identity_keys {
@@ -302,7 +302,10 @@ async fn run_sync(
                 };
 
                 let _ = app_command_tx
-                    .send(AppCommand::RssDownloadSelected(entry))
+                    .send(AppCommand::RssDownloadSelected {
+                        entry,
+                        command_path,
+                    })
                     .await;
             }
         }
@@ -523,34 +526,32 @@ async fn auto_ingest_item(
     settings: &Settings,
     client: &Client,
     item: &CandidateItem,
-) -> (bool, Option<Vec<u8>>) {
+) -> (bool, Option<Vec<u8>>, Option<std::path::PathBuf>) {
     let Some(link) = &item.link else {
-        return (false, None);
+        return (false, None, None);
     };
 
     if link.starts_with("magnet:") {
-        let added = rss_ingest::write_magnet(settings, link.as_str())
-            .await
-            .is_ok();
+        let command_path = rss_ingest::write_magnet(settings, link.as_str()).await.ok();
         let (v1_hash, v2_hash) = crate::app::parse_hybrid_hashes(link.as_str());
-        return (added, v1_hash.or(v2_hash));
+        return (command_path.is_some(), v1_hash.or(v2_hash), command_path);
     }
 
     if !(link.starts_with("http://") || link.starts_with("https://")) {
-        return (false, None);
+        return (false, None, None);
     }
 
     match fetch_torrent_bytes(client, link).await {
         Ok(bytes) => {
             let Some(info_hash) = crate::app::info_hash_from_torrent_bytes(&bytes) else {
-                return (false, None);
+                return (false, None, None);
             };
-            let added = rss_ingest::write_torrent_bytes(settings, link.as_str(), &bytes)
+            let command_path = rss_ingest::write_torrent_bytes(settings, link.as_str(), &bytes)
                 .await
-                .is_ok();
-            (added, Some(info_hash))
+                .ok();
+            (command_path.is_some(), Some(info_hash), command_path)
         }
-        Err(_) => (false, None),
+        Err(_) => (false, None, None),
     }
 }
 
@@ -773,7 +774,7 @@ mod tests {
                 continue;
             };
             match cmd {
-                AppCommand::RssDownloadSelected(entry) => got_download = Some(entry),
+                AppCommand::RssDownloadSelected { entry, .. } => got_download = Some(entry),
                 AppCommand::RssPreviewUpdated(items) => got_preview = Some(items),
                 _ => {}
             }
@@ -939,7 +940,7 @@ mod tests {
                 continue;
             };
             match cmd {
-                AppCommand::RssDownloadSelected(_) => got_download = true,
+                AppCommand::RssDownloadSelected { .. } => got_download = true,
                 AppCommand::RssPreviewUpdated(items) => got_preview = Some(items),
                 _ => {}
             }

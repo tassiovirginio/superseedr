@@ -3,7 +3,9 @@
 
 use crate::app::{App, AppMode};
 use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
-use crate::tui::screens::{browser, config, delete_confirm, help, normal, power, rss, welcome};
+use crate::tui::screens::{
+    browser, config, delete_confirm, help, journal, normal, power, rss, welcome,
+};
 
 use ratatui::crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -181,12 +183,11 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Help => {
             help::handle_event(event, &mut app.app_state);
         }
+        AppMode::Journal => {
+            journal::handle_event(event, &mut app.app_state, &app.app_command_tx);
+        }
         AppMode::Welcome => {
-            if matches!(event, CrosstermEvent::Paste(_)) {
-                normal::handle_event(event, app).await;
-            } else {
-                welcome::handle_event(event, &mut app.app_state);
-            }
+            welcome::handle_event(event, &mut app.app_state);
         }
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
@@ -285,7 +286,9 @@ mod tests {
             client_port: 0,
             ..Settings::default()
         };
-        let mut app = App::new(settings).await.expect("build app");
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
         app.app_state.mode = AppMode::Normal;
         app
     }
@@ -622,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_paste_on_welcome_screen_uses_normal_paste_handler() {
+    async fn explicit_paste_on_welcome_screen_is_ignored() {
         let mut app = build_test_app().await;
         app.app_state.mode = AppMode::Welcome;
         let magnet = "magnet:?xt=urn:btih:00112233445566778899aabbccddeeff00112233";
@@ -634,8 +637,8 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(app.app_state.mode, AppMode::Normal));
-        assert_eq!(app.app_state.pending_torrent_link, magnet);
+        assert!(matches!(app.app_state.mode, AppMode::Welcome));
+        assert!(app.app_state.pending_torrent_link.is_empty());
         let _ = app.shutdown_tx.send(());
     }
 
