@@ -410,6 +410,7 @@ def _phase_failover(ctx: ClusterRunContext) -> dict[str, Any]:
 
 def _phase_failback(ctx: ClusterRunContext) -> dict[str, Any]:
     fixture = fixture_by_id("single_25k_v1")
+    surviving_fixture = fixture_by_id("single_16k_v1")
     phase: dict[str, Any] = {"name": "failback"}
     _compose_start(ctx, [SERVICE_HOST_A], no_build=True)
     _wait_for_leader(ctx, "host-b")
@@ -427,6 +428,8 @@ def _phase_failback(ctx: ClusterRunContext) -> dict[str, Any]:
     _wait_for_control_state(ctx, ctx.host_a, fixture.info_hash_hex, "Paused", running=True)
     _docker_json(ctx, SERVICE_HOST_A, ["purge", fixture.info_hash_hex], running=True)
     _wait_for_torrent_presence(ctx, ctx.host_a, fixture.info_hash_hex, False, running=True)
+    _docker_json(ctx, SERVICE_HOST_A, ["purge", surviving_fixture.info_hash_hex], running=True)
+    _wait_for_torrent_presence(ctx, ctx.host_a, surviving_fixture.info_hash_hex, False, running=True)
     final_torrents = _docker_json(ctx, SERVICE_HOST_A, ["torrents"], running=True)
     if final_torrents["data"]["torrents"]:
         raise ClusterCliError("final failback cleanup did not leave an empty torrent list")

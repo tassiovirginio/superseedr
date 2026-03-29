@@ -133,6 +133,7 @@ const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
 const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
+
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
@@ -2243,6 +2244,19 @@ impl App {
                         .await
                     }
                 };
+                if let CommandIngestResult::Added {
+                    info_hash: Some(info_hash),
+                    ..
+                } = &ingest_result
+                {
+                    tracing_event!(
+                        Level::INFO,
+                        info_hash = %hex::encode(info_hash),
+                        torrent_count = self.app_state.torrents.len(),
+                        present_in_runtime = self.app_state.torrents.contains_key(info_hash),
+                        "Direct ingest added torrent to runtime before persistence"
+                    );
+                }
                 self.record_ingest_result(&path, &ingest_result);
                 self.save_state_to_disk();
                 self.archive_processed_ingest(source, &path);
@@ -3377,6 +3391,9 @@ impl App {
             }
             AppCommand::ReloadClusterState(_path) => match crate::config::load_settings() {
                 Ok(new_settings) => {
+                    if self.is_current_shared_leader() {
+                        return;
+                    }
                     if new_settings != self.client_configs {
                         self.apply_settings_update(new_settings, false).await;
                     }
@@ -4503,6 +4520,14 @@ impl App {
                         .run(torrent_control_state == TorrentControlState::Paused)
                         .await;
                 });
+                tracing_event!(
+                    Level::INFO,
+                    info_hash = %hex::encode(&info_hash),
+                    torrent_name = %resolved_torrent_name,
+                    torrent_count = self.app_state.torrents.len(),
+                    has_runtime_entry = self.app_state.torrents.contains_key(&info_hash),
+                    "Magnet torrent manager created successfully"
+                );
                 self.dispatch_integrity_probe_batches();
                 CommandIngestResult::Added {
                     info_hash: Some(info_hash),
@@ -6103,6 +6128,14 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn configure_temp_app_paths_for_test() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        set_app_paths_override_for_tests(Some((config_dir, data_dir)));
+        dir
+    }
+
     #[test]
     fn move_file_with_fallback_copies_when_rename_crosses_devices() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -6656,6 +6689,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_journal_preserves_watch_folder_origin() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
         let settings = crate::config::Settings {
             client_port: 0,
             ..Default::default()
@@ -6690,6 +6725,7 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -6719,13 +6755,12 @@ mod tests {
 
     #[tokio::test]
     async fn manual_torrent_browser_moves_standalone_watch_file_to_processed_and_updates_journal() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join("config");
+        let _guard = lock_shared_env();
+        let dir = configure_temp_app_paths_for_test();
         let data_dir = dir.path().join("data");
         let watch_dir = data_dir.join("watch_files");
         let processed_dir = data_dir.join("processed_files");
         std::fs::create_dir_all(&watch_dir).expect("create watch dir");
-        set_app_paths_override_for_tests(Some((config_dir, data_dir.clone())));
 
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("integration_tests")
@@ -6756,6 +6791,7 @@ mod tests {
                 .event_journal_state
                 .entries
                 .iter()
+                .rev()
                 .find(|entry| entry.event_type == EventType::IngestQueued)
                 .and_then(|entry| entry.source_path.clone()),
             Some(final_path)
@@ -6823,6 +6859,7 @@ mod tests {
                 .event_journal_state
                 .entries
                 .iter()
+                .rev()
                 .find(|entry| entry.event_type == EventType::IngestQueued)
                 .and_then(|entry| entry.source_path.clone()),
             Some(final_path)
@@ -7341,6 +7378,8 @@ mod tests {
 
     #[tokio::test]
     async fn completion_transition_records_single_torrent_completed_event() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
         let settings = crate::config::Settings {
             client_port: 0,
             ..Default::default()
@@ -7402,10 +7441,13 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
     async fn completed_torrents_restored_as_complete_do_not_rejournal_on_metrics_refresh() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
         let settings = crate::config::Settings {
             client_port: 0,
             ..Default::default()
@@ -7457,6 +7499,7 @@ mod tests {
         assert_eq!(completion_entries, 0);
 
         let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -7572,6 +7615,88 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn cluster_revision_reload_applies_for_followers_and_stops_after_promotion() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let initial_settings =
+            crate::config::load_settings().expect("load initial shared settings");
+        let mut app = App::new(initial_settings.clone(), AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+
+        let revision_path =
+            crate::config::shared_cluster_revision_path().expect("shared cluster revision path");
+
+        let mut follower_reload_settings = initial_settings.clone();
+        follower_reload_settings.global_download_limit_bps = 42;
+        crate::config::save_settings(&follower_reload_settings)
+            .expect("save follower reload settings");
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path.clone()))
+            .await;
+        assert_eq!(app.client_configs.global_download_limit_bps, 42);
+
+        app.current_cluster_role = Some(AppClusterRole::Leader);
+        app.runtime_mode = AppRuntimeMode::SharedLeader;
+        app.sync_cluster_role_label();
+
+        let mut leader_ignored_settings = follower_reload_settings.clone();
+        leader_ignored_settings.global_download_limit_bps = 99;
+        crate::config::save_settings(&leader_ignored_settings)
+            .expect("save leader ignored settings");
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path.clone()))
+            .await;
+        assert_eq!(
+            app.client_configs.global_download_limit_bps, 42,
+            "leader should ignore revision-triggered reloads"
+        );
+
+        app.current_cluster_role = Some(AppClusterRole::Follower);
+        app.runtime_mode = AppRuntimeMode::SharedFollower;
+        app.sync_cluster_role_label();
+
+        app.handle_app_command(AppCommand::ReloadClusterState(revision_path))
+            .await;
+        assert_eq!(
+            app.client_configs.global_download_limit_bps, 99,
+            "follower should resume applying revision-triggered reloads after demotion"
+        );
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
     }
 
     #[tokio::test]
