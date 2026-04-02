@@ -810,7 +810,7 @@ impl Default for TorrentMetrics {
 pub struct TorrentDisplayState {
     pub latest_state: TorrentMetrics,
     pub file_preview_tree: Vec<RawNode<TorrentPreviewPayload>>,
-    pub recent_file_activity: HashMap<String, (FileActivityDirection, Instant)>,
+    pub recent_file_activity: HashMap<String, RecentFileActivity>,
     pub latest_file_probe_status: Option<TorrentFileProbeStatus>,
     pub integrity_next_probe_in: Option<Duration>,
     pub download_history: Vec<u64>,
@@ -838,6 +838,12 @@ pub struct TorrentDisplayState {
     pub peer_disconnect_history: Vec<u64>,
     pub last_seen_session_total_downloaded: u64,
     pub last_seen_session_total_uploaded: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecentFileActivity {
+    pub download_at: Option<Instant>,
+    pub upload_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -3810,9 +3816,14 @@ impl App {
                 if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
                     let now = Instant::now();
                     for relative_path in touched_relative_paths {
-                        display
+                        let activity = display
                             .recent_file_activity
-                            .insert(relative_path, (direction, now));
+                            .entry(relative_path)
+                            .or_default();
+                        match direction {
+                            FileActivityDirection::Download => activity.download_at = Some(now),
+                            FileActivityDirection::Upload => activity.upload_at = Some(now),
+                        }
                     }
                     self.app_state.ui.needs_redraw = true;
                 }
@@ -4830,14 +4841,14 @@ impl App {
         let Some(host_watch) = resolve_host_watch_path(&self.client_configs) else {
             return false;
         };
-        path.parent() == Some(host_watch.as_path())
+        watched_parent_matches(path, &host_watch)
     }
 
     fn is_shared_inbox_path(&self, path: &Path) -> bool {
         let Some(shared_inbox) = shared_inbox_path() else {
             return false;
         };
-        path.parent() == Some(shared_inbox.as_path())
+        watched_parent_matches(path, &shared_inbox)
     }
 
     fn relay_local_watch_file(&mut self, path: &Path, fallback_extension: &str) {
@@ -6212,6 +6223,23 @@ fn prune_rss_feed_errors(
     feed_errors.len() != before
 }
 
+fn watched_parent_matches(path: &Path, watch_dir: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| normalized_watch_path(parent) == normalized_watch_path(watch_dir))
+}
+
+#[cfg(windows)]
+fn normalized_watch_path(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw.as_ref());
+    PathBuf::from(stripped.to_ascii_lowercase())
+}
+
+#[cfg(not(windows))]
+fn normalized_watch_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::await_holding_lock)]
@@ -6223,10 +6251,10 @@ mod tests {
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority, PeerInfo,
-        PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
-        TorrentMetrics, TorrentSortColumn, UiState,
+        torrent_completion_percent, torrent_is_effectively_incomplete, watched_parent_matches, App,
+        AppClusterRole, AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult,
+        FilePriority, IngestSource, PeerInfo, PersistPayload, SelectedHeader, SortDirection,
+        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentSortColumn, UiState,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -7047,6 +7075,69 @@ mod tests {
                 .and_then(|entry| entry.source_path.clone()),
             Some(final_path)
         );
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_verbatim_shared_inbox_magnet_is_ignored() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+        std::fs::create_dir_all(effective_root.join("inbox")).expect("create shared inbox");
+
+        let app = App::new(
+            crate::config::load_settings().expect("load shared settings"),
+            AppRuntimeMode::SharedLeader,
+        )
+        .await
+        .expect("build shared app");
+
+        let verbatim_missing_path = PathBuf::from(format!(
+            r"\\?\{}",
+            effective_root
+                .join("inbox")
+                .join("stale-event.magnet")
+                .display()
+        ));
+
+        assert!(watched_parent_matches(
+            &verbatim_missing_path,
+            &effective_root.join("inbox")
+        ));
+        assert!(matches!(
+            app.resolve_add_ingress_action(IngestSource::MagnetFile, &verbatim_missing_path),
+            super::AddIngressAction::IgnoreMissingSharedInboxItem { .. }
+        ));
 
         let _ = app.shutdown_tx.send(());
         if let Some(value) = original_shared_dir {
