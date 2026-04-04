@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use crate::app::file_activity_wave_steps_per_second;
 use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::torrent_completion_percent;
 use crate::app::AppCommand;
@@ -4164,7 +4165,8 @@ pub fn draw_torrent_files_panel(
         area.width,
         area.height.saturating_sub(2),
         app_state.anonymize_torrent_names,
-        app_state.ui.effects_phase_time,
+        app_state.ui.file_activity_download_phase,
+        app_state.ui.file_activity_upload_phase,
         ctx,
     );
     tracing::info!(
@@ -4204,11 +4206,11 @@ fn build_torrent_file_list_items(
     width: u16,
     height: u16,
     anonymize: bool,
-    effects_phase_time: f64,
+    download_phase: f64,
+    upload_phase: f64,
     ctx: &ThemeContext,
 ) -> Vec<ListItem<'static>> {
     let mut list_items = Vec::new();
-    let any_recent_activity = torrent_has_recent_file_activity(torrent);
     let root_style = ctx.apply(
         Style::default()
             .fg(ctx.theme.semantic.text)
@@ -4219,34 +4221,32 @@ fn build_torrent_file_list_items(
     let root_width = width.saturating_sub(6) as usize;
     let root_rows = shape_root_path_for_viewport(&root_path, root_width.max(1), height as usize);
     let root_row_offsets = shaped_row_start_offsets(&root_rows);
-    list_items.extend(
-        root_rows
-            .into_iter()
-            .zip(root_row_offsets)
-            .enumerate()
-            .map(|(idx, (row, row_start_offset))| {
-                let indent = "  ".repeat(idx);
-                let mut spans = vec![
-                    Span::styled(
-                        indent,
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-                    ),
-                    Span::styled(ASCII_TREE_DIR_ICON, root_style),
-                ];
-                spans.extend(render_file_tree_name_spans(
-                    torrent,
-                    "",
-                    &row,
-                    true,
-                    any_recent_activity,
-                    effects_phase_time,
+    list_items.extend(root_rows.into_iter().zip(root_row_offsets).enumerate().map(
+        |(idx, (row, row_start_offset))| {
+            let indent = "  ".repeat(idx);
+            let mut spans = vec![
+                Span::styled(
+                    indent,
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                ),
+                Span::styled(ASCII_TREE_DIR_ICON, root_style),
+            ];
+            spans.extend(render_file_tree_name_spans(
+                torrent,
+                "",
+                &row,
+                true,
+                FileTreeNameRenderContext {
+                    download_phase,
+                    upload_phase,
                     row_start_offset,
-                    root_style,
+                    base_style: root_style,
                     ctx,
-                ));
-                ListItem::new(Line::from(spans))
-            }),
-    );
+                },
+            ));
+            ListItem::new(Line::from(spans))
+        },
+    ));
     let root_depth = list_items.len();
 
     if torrent.file_preview_tree.is_empty() {
@@ -4276,11 +4276,15 @@ fn build_torrent_file_list_items(
                 &torrent.latest_state.torrent_name,
                 &child_name,
                 false,
-                any_recent_activity,
-                effects_phase_time,
-                root_path_char_len + 1 + path_parent_prefix_len(&torrent.latest_state.torrent_name),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ctx,
+                FileTreeNameRenderContext {
+                    download_phase,
+                    upload_phase,
+                    row_start_offset: root_path_char_len
+                        + 1
+                        + path_parent_prefix_len(&torrent.latest_state.torrent_name),
+                    base_style: ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                    ctx,
+                },
             ));
             if torrent.latest_state.total_size > 0 {
                 spans.push(Span::styled(
@@ -4370,11 +4374,13 @@ fn build_torrent_file_list_items(
             &relative_path,
             &display_name,
             item.node.is_dir,
-            any_recent_activity,
-            effects_phase_time,
-            root_path_char_len + 1 + path_parent_prefix_len(&relative_path),
-            name_style,
-            ctx,
+            FileTreeNameRenderContext {
+                download_phase,
+                upload_phase,
+                row_start_offset: root_path_char_len + 1 + path_parent_prefix_len(&relative_path),
+                base_style: name_style,
+                ctx,
+            },
         ));
 
         if !item.node.is_dir {
@@ -4424,17 +4430,6 @@ fn shaped_row_start_offsets(rows: &[String]) -> Vec<usize> {
     offsets
 }
 
-fn torrent_has_recent_file_activity(torrent: &TorrentDisplayState) -> bool {
-    torrent.recent_file_activity.values().any(|activity| {
-        activity
-            .download_at
-            .is_some_and(|seen_at| seen_at.elapsed() <= FILE_ACTIVITY_HIGHLIGHT_WINDOW)
-            || activity
-                .upload_at
-                .is_some_and(|seen_at| seen_at.elapsed() <= FILE_ACTIVITY_HIGHLIGHT_WINDOW)
-    })
-}
-
 fn file_tree_activity_paths<'a>(
     torrent: &'a TorrentDisplayState,
     relative_path: &str,
@@ -4447,7 +4442,8 @@ fn file_tree_activity_paths<'a>(
         let matches_row = if is_dir && relative_path.is_empty() {
             true
         } else if is_dir {
-            activity_path == relative_path || activity_path.starts_with(&format!("{relative_path}/"))
+            activity_path == relative_path
+                || activity_path.starts_with(&format!("{relative_path}/"))
         } else {
             activity_path == relative_path
         };
@@ -4473,36 +4469,39 @@ fn file_tree_activity_paths<'a>(
     (download_paths, upload_paths)
 }
 
+#[derive(Clone, Copy)]
+struct FileTreeNameRenderContext<'a> {
+    download_phase: f64,
+    upload_phase: f64,
+    row_start_offset: usize,
+    base_style: Style,
+    ctx: &'a ThemeContext,
+}
+
 fn render_file_tree_name_spans(
     torrent: &TorrentDisplayState,
     relative_path: &str,
     display_name: &str,
     is_dir: bool,
-    _any_recent_activity: bool,
-    effects_phase_time: f64,
-    row_start_offset: usize,
-    base_style: Style,
-    ctx: &ThemeContext,
+    render_ctx: FileTreeNameRenderContext<'_>,
 ) -> Vec<Span<'static>> {
     let (download_paths, upload_paths) = file_tree_activity_paths(torrent, relative_path, is_dir);
     let row_active = !download_paths.is_empty() || !upload_paths.is_empty();
 
     if !row_active {
-        let dimmed_inactive_style = ctx.apply(
-            base_style
-                .fg(ctx.theme.semantic.surface1)
-                .add_modifier(Modifier::DIM),
-        );
-        return vec![Span::styled(display_name.to_string(), dimmed_inactive_style)];
+        return vec![Span::styled(
+            display_name.to_string(),
+            render_ctx.ctx.apply(render_ctx.base_style),
+        )];
     }
 
     let chars: Vec<char> = display_name.chars().collect();
     let len = chars.len().max(1);
     let download_wave = file_activity_wave_profile(torrent.smoothed_download_speed_bps, len);
     let upload_wave = file_activity_wave_profile(torrent.smoothed_upload_speed_bps, len);
-    let download_step = (effects_phase_time * download_wave.steps_per_second).floor() as usize;
-    let upload_step = (effects_phase_time * upload_wave.steps_per_second).floor() as usize;
-    let active_base_style = ctx.apply(base_style);
+    let download_step = render_ctx.download_phase.floor() as usize;
+    let upload_step = render_ctx.upload_phase.floor() as usize;
+    let active_base_style = render_ctx.ctx.apply(render_ctx.base_style);
     let root_path_char_len = torrent_root_logical_len(torrent);
 
     chars
@@ -4512,7 +4511,7 @@ fn render_file_tree_name_spans(
             let download_hit = download_paths.iter().any(|path| {
                 file_activity_wave_hits(
                     path,
-                    row_start_offset + idx,
+                    render_ctx.row_start_offset + idx,
                     root_path_char_len,
                     download_wave,
                     download_step,
@@ -4522,7 +4521,7 @@ fn render_file_tree_name_spans(
             let upload_hit = upload_paths.iter().any(|path| {
                 file_activity_wave_hits(
                     path,
-                    row_start_offset + idx,
+                    render_ctx.row_start_offset + idx,
                     root_path_char_len,
                     upload_wave,
                     upload_step,
@@ -4531,19 +4530,22 @@ fn render_file_tree_name_spans(
             });
 
             let style = match (download_hit, upload_hit) {
-                (true, true) => ctx.apply(
-                    base_style
-                        .fg(ctx.state_selected())
+                (true, true) => render_ctx.ctx.apply(
+                    render_ctx
+                        .base_style
+                        .fg(render_ctx.ctx.state_selected())
                         .add_modifier(Modifier::BOLD),
                 ),
-                (true, false) => ctx.apply(
-                    base_style
-                        .fg(ctx.state_info())
+                (true, false) => render_ctx.ctx.apply(
+                    render_ctx
+                        .base_style
+                        .fg(render_ctx.ctx.state_info())
                         .add_modifier(Modifier::BOLD),
                 ),
-                (false, true) => ctx.apply(
-                    base_style
-                        .fg(ctx.state_success())
+                (false, true) => render_ctx.ctx.apply(
+                    render_ctx
+                        .base_style
+                        .fg(render_ctx.ctx.state_success())
                         .add_modifier(Modifier::BOLD),
                 ),
                 (false, false) => active_base_style,
@@ -4569,29 +4571,19 @@ struct FileActivityWaveProfile {
 }
 
 fn file_activity_wave_profile(speed_bps: u64, text_len: usize) -> FileActivityWaveProfile {
-    let (target_band_width, steps_per_second) = if speed_bps == 0 {
-        (4, 8.0)
-    } else if speed_bps < 50_000 {
-        (4, 7.0)
-    } else if speed_bps < 500_000 {
-        (5, 8.0)
-    } else if speed_bps < 2_000_000 {
-        (5, 9.0)
-    } else if speed_bps < 10_000_000 {
-        (6, 10.5)
+    let target_band_width = if speed_bps < 500_000 {
+        4 + usize::from(speed_bps >= 50_000)
     } else if speed_bps < 20_000_000 {
-        (6, 12.0)
-    } else if speed_bps < 50_000_000 {
-        (7, 13.0)
+        5 + usize::from(speed_bps >= 2_000_000)
     } else if speed_bps < 100_000_000 {
-        (8, 14.0)
+        7 + usize::from(speed_bps >= 50_000_000)
     } else {
-        (9, 15.0)
+        9
     };
 
     FileActivityWaveProfile {
         band_width: target_band_width.min(text_len.max(1)),
-        steps_per_second,
+        steps_per_second: file_activity_wave_steps_per_second(speed_bps),
     }
 }
 
@@ -4609,7 +4601,9 @@ fn file_activity_wave_hits(
         } else {
             1 + relative_path.chars().count()
         };
-    let head = step % (total_len + wave.band_width);
+    let cycle_len = total_len + wave.band_width;
+    let phase_offset = file_activity_wave_phase_offset(relative_path, left_to_right, cycle_len);
+    let head = (step + phase_offset) % cycle_len;
     let logical_idx = if left_to_right {
         global_char_idx
     } else {
@@ -4618,6 +4612,25 @@ fn file_activity_wave_hits(
 
     (head as isize - logical_idx as isize) >= 0
         && (head as isize - logical_idx as isize) < wave.band_width as isize
+}
+
+fn file_activity_wave_phase_offset(
+    relative_path: &str,
+    left_to_right: bool,
+    cycle_len: usize,
+) -> usize {
+    if cycle_len == 0 {
+        return 0;
+    }
+
+    let mut hash = 1469598103934665603_u64;
+    for byte in relative_path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash ^= u64::from(left_to_right);
+    hash = hash.wrapping_mul(1099511628211);
+    (hash % cycle_len as u64) as usize
 }
 
 fn torrent_root_path_label(metrics: &crate::app::TorrentMetrics, anonymize: bool) -> String {
@@ -5564,10 +5577,22 @@ mod tests {
         let anonymized = anonymize_preserving_shape(original);
 
         assert_eq!(anonymized.chars().count(), original.chars().count());
-        assert_eq!(anonymized.matches('\\').count(), original.matches('\\').count());
-        assert_eq!(anonymized.matches(':').count(), original.matches(':').count());
-        assert_eq!(anonymized.matches('.').count(), original.matches('.').count());
-        assert_eq!(anonymized.matches('_').count(), original.matches('_').count());
+        assert_eq!(
+            anonymized.matches('\\').count(),
+            original.matches('\\').count()
+        );
+        assert_eq!(
+            anonymized.matches(':').count(),
+            original.matches(':').count()
+        );
+        assert_eq!(
+            anonymized.matches('.').count(),
+            original.matches('.').count()
+        );
+        assert_eq!(
+            anonymized.matches('_').count(),
+            original.matches('_').count()
+        );
         assert_ne!(anonymized, original);
     }
 
@@ -5583,8 +5608,14 @@ mod tests {
         let anonymized = torrent_root_path_label(&metrics, true);
 
         assert_eq!(anonymized.chars().count(), original.chars().count());
-        assert_eq!(anonymized.matches('\\').count(), original.matches('\\').count());
-        assert_eq!(anonymized.matches(':').count(), original.matches(':').count());
+        assert_eq!(
+            anonymized.matches('\\').count(),
+            original.matches('\\').count()
+        );
+        assert_eq!(
+            anonymized.matches(':').count(),
+            original.matches(':').count()
+        );
         assert_ne!(anonymized, original);
     }
 
@@ -5610,7 +5641,9 @@ mod tests {
         let total_len = root_len + 1 + relative_path.chars().count();
         let logical_hit_idx = 10usize;
         let mirrored_idx = total_len - 1 - logical_hit_idx;
-        let step = mirrored_idx + 1;
+        let cycle_len = total_len + wave.band_width;
+        let phase_offset = file_activity_wave_phase_offset(relative_path, false, cycle_len);
+        let step = (mirrored_idx + 1 + cycle_len - phase_offset) % cycle_len;
 
         assert!(file_activity_wave_hits(
             relative_path,
@@ -6441,7 +6474,32 @@ mod tests {
         let profile = file_activity_wave_profile(120_000_000, 3);
 
         assert_eq!(profile.band_width, 3);
-        assert_eq!(profile.steps_per_second, 15.0);
+        assert_eq!(profile.steps_per_second, 23.0);
+    }
+
+    #[test]
+    fn file_activity_wave_phase_can_continue_across_speed_changes() {
+        let start_phase = 41.0;
+        let dt = 0.25;
+        let next_phase = start_phase + dt * file_activity_wave_steps_per_second(120_000_000);
+        let later_phase = next_phase + dt * file_activity_wave_steps_per_second(10_000);
+
+        assert!(next_phase > start_phase);
+        assert!(later_phase > next_phase);
+        assert!((later_phase - 49.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn file_activity_wave_phase_offset_is_stable_per_path() {
+        let cycle_len = 23;
+        let alpha = file_activity_wave_phase_offset("folder/alpha.bin", false, cycle_len);
+        let alpha_again = file_activity_wave_phase_offset("folder/alpha.bin", false, cycle_len);
+        let beta = file_activity_wave_phase_offset("folder/beta.bin", false, cycle_len);
+
+        assert_eq!(alpha, alpha_again);
+        assert!(alpha < cycle_len);
+        assert!(beta < cycle_len);
+        assert_ne!(alpha, beta);
     }
 
     #[test]

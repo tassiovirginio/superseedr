@@ -852,6 +852,8 @@ pub struct UiState {
     pub effects_phase_time: f64,
     pub effects_last_wall_time: f64,
     pub effects_speed_multiplier: f64,
+    pub file_activity_download_phase: f64,
+    pub file_activity_upload_phase: f64,
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
     pub selected_peer_index: usize,
@@ -2666,6 +2668,19 @@ impl App {
         self.app_state.ui.effects_last_wall_time = frame_wall_time;
         self.app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
         self.app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
+        let selected_torrent = self
+            .app_state
+            .torrent_list_order
+            .get(self.app_state.ui.selected_torrent_index)
+            .and_then(|info_hash| self.app_state.torrents.get(info_hash));
+        let download_steps_per_second = selected_torrent
+            .map(|torrent| file_activity_wave_steps_per_second(torrent.smoothed_download_speed_bps))
+            .unwrap_or_else(|| file_activity_wave_steps_per_second(0));
+        let upload_steps_per_second = selected_torrent
+            .map(|torrent| file_activity_wave_steps_per_second(torrent.smoothed_upload_speed_bps))
+            .unwrap_or_else(|| file_activity_wave_steps_per_second(0));
+        self.app_state.ui.file_activity_download_phase += frame_dt * download_steps_per_second;
+        self.app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
 
         let disk_activity = self
             .app_state
@@ -5953,6 +5968,28 @@ pub(crate) fn clamp_selected_indices_in_state(app_state: &mut AppState) {
         app_state.ui.selected_peer_index = 0;
     } else if app_state.ui.selected_peer_index >= peer_count {
         app_state.ui.selected_peer_index = peer_count - 1;
+    }
+}
+
+pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
+    if speed_bps == 0 {
+        12.0
+    } else if speed_bps < 50_000 {
+        11.0
+    } else if speed_bps < 500_000 {
+        12.5
+    } else if speed_bps < 2_000_000 {
+        14.0
+    } else if speed_bps < 10_000_000 {
+        16.0
+    } else if speed_bps < 20_000_000 {
+        17.5
+    } else if speed_bps < 50_000_000 {
+        19.0
+    } else if speed_bps < 100_000_000 {
+        21.0
+    } else {
+        23.0
     }
 }
 
