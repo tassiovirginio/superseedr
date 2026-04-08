@@ -50,6 +50,7 @@ use crate::networking::PeerSession;
 use crate::tracker::client::{
     announce_completed, announce_periodic, announce_started, announce_stopped,
 };
+use crate::tracker::normalize_tracker_urls;
 
 use rand::Rng;
 
@@ -66,6 +67,7 @@ use mainline::Id;
 #[cfg(not(feature = "dht"))]
 type AsyncDht = ();
 
+use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -90,7 +92,6 @@ use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 #[cfg(feature = "dht")]
@@ -264,17 +265,7 @@ impl TorrentManager {
         torrent: Torrent,
     ) -> Result<Self, String> {
         // 1. Extract Trackers
-        let mut trackers = HashMap::new();
-        if let Some(ref announce) = torrent.announce {
-            trackers.insert(
-                announce.clone(),
-                TrackerState {
-                    next_announce_time: Instant::now(),
-                    leeching_interval: None,
-                    seeding_interval: None,
-                },
-            );
-        }
+        let trackers = build_tracker_state_map(torrent.tracker_urls(), Instant::now());
 
         // 2. Calculate Info Hash
         let info_hash = if torrent.info.meta_version == Some(2) {
@@ -350,10 +341,9 @@ impl TorrentManager {
         );
 
         // 2. Extract and Decode Trackers
-        let trackers_set: HashSet<String> = magnet
+        let decoded_trackers: Vec<String> = magnet
             .trackers()
             .iter()
-            .filter(|t| t.starts_with("http"))
             .filter_map(|t| {
                 match decode(t) {
                     Ok(decoded_url) => Some(decoded_url.into_owned()),
@@ -364,18 +354,8 @@ impl TorrentManager {
                 }
             })
             .collect();
-
-        let mut trackers = HashMap::new();
-        for url in trackers_set {
-            trackers.insert(
-                url.clone(),
-                TrackerState {
-                    next_announce_time: Instant::now(),
-                    leeching_interval: None,
-                    seeding_interval: None,
-                },
-            );
-        }
+        let trackers =
+            build_tracker_state_map(normalize_tracker_urls(decoded_trackers), Instant::now());
 
         let validation_status = torrent_parameters.torrent_validation_status;
         let torrent_data_path = torrent_parameters.torrent_data_path.clone();
@@ -857,9 +837,9 @@ impl TorrentManager {
                     .insert(block_info, handle);
             }
 
-            Effect::ConnectToPeer { ip, port } => {
+            Effect::ConnectToPeer { addr } => {
                 if self.should_accept_new_peers() {
-                    self.connect_to_peer(ip, port);
+                    self.connect_to_peer(addr);
                 }
             }
 
@@ -1740,14 +1720,14 @@ impl TorrentManager {
         bitfield_bytes
     }
 
-    pub fn connect_to_peer(&mut self, peer_ip: String, peer_port: u16) {
+    pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
         let _ = self
             .manager_event_tx
             .try_send(ManagerEvent::PeerDiscovered {
                 info_hash: self.state.info_hash.clone(),
             });
 
-        let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
+        let peer_ip_port = peer_addr.to_string();
 
         if let Some((failure_count, next_attempt_time)) =
             self.state.timed_out_peers.get(&peer_ip_port)
@@ -1805,11 +1785,8 @@ impl TorrentManager {
             };
 
             if let Some(session_permit) = session_permit {
-                let connection_result = timeout(
-                    Duration::from_secs(2),
-                    TcpStream::connect(&peer_ip_port_clone),
-                )
-                .await;
+                let connection_result =
+                    timeout(Duration::from_secs(2), TcpStream::connect(peer_addr)).await;
 
                 if let Ok(Ok(stream)) = connection_result {
                     let _held_session_permit = session_permit;
@@ -2574,7 +2551,7 @@ impl TorrentManager {
                             for peer in peers {
                                 event!(Level::DEBUG, "PEER FROM DHT {}", peer);
                                 if self.should_accept_new_peers() {
-                                    self.connect_to_peer(peer.ip().to_string(), peer.port());
+                                    self.connect_to_peer(peer.into());
                                 }
                             }
                         } else {
@@ -2746,9 +2723,9 @@ impl TorrentManager {
 
                         #[cfg(feature = "pex")]
                         TorrentCommand::AddPexPeers(_peer_id, new_peers) => {
-                            for peer_tuple in new_peers {
+                            for peer_addr in new_peers {
                                 if self.should_accept_new_peers() {
-                                    self.connect_to_peer(peer_tuple.0, peer_tuple.1);
+                                    self.connect_to_peer(peer_addr);
                                 }
                             }
                         },
@@ -2910,7 +2887,7 @@ impl TorrentManager {
                         TorrentCommand::AnnounceResponse(url, response) => {
                             self.apply_action(Action::TrackerResponse {
                                 url,
-                                peers: response.peers.into_iter().map(|p| (p.ip, p.port)).collect(),
+                                peers: response.peers,
                                 interval: response.interval as u64,
                                 min_interval: response.min_interval.map(|i| i as u64)
                             });
@@ -2955,6 +2932,24 @@ impl TorrentManager {
             }
         }
     }
+}
+
+fn build_tracker_state_map<I>(urls: I, now: Instant) -> HashMap<String, TrackerState>
+where
+    I: IntoIterator<Item = String>,
+{
+    urls.into_iter()
+        .map(|url| {
+            (
+                url,
+                TrackerState {
+                    next_announce_time: now,
+                    leeching_interval: None,
+                    seeding_interval: None,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3206,6 +3201,50 @@ mod resource_tests {
         }
     }
 
+    fn build_test_params() -> TorrentParameters {
+        let (_incoming_tx, incoming_rx) = mpsc::channel(100);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(100);
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        let (metrics_tx, _) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(ResourceType::DiskRead, (1000, 1000));
+        limits.insert(ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(ResourceType::Reserve, (0, 0));
+
+        let (_resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx);
+
+        let dht_handle = {
+            #[cfg(feature = "dht")]
+            {
+                mainline::Dht::builder().port(0).build().unwrap().as_async()
+            }
+            #[cfg(not(feature = "dht"))]
+            {
+                ()
+            }
+        };
+
+        TorrentParameters {
+            dht_handle,
+            incoming_peer_rx: incoming_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx: cmd_rx,
+            manager_event_tx: event_tx,
+            settings,
+            resource_manager: rm_client,
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        }
+    }
+
     // --- Helper to spawn a manager quickly ---
     fn setup_test_harness() -> (
         TorrentManager,
@@ -3268,6 +3307,55 @@ mod resource_tests {
         let torrent_tx = manager.torrent_manager_tx.clone();
 
         (manager, torrent_tx, cmd_tx, shutdown_tx, resource_manager)
+    }
+
+    #[tokio::test]
+    async fn test_from_magnet_prefers_udp_tracker_and_keeps_distinct_tracker() {
+        let magnet_link = concat!(
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+            "&tr=http%3A%2F%2Ftracker.local%3A6969%2Fannounce",
+            "&tr=udp%3A%2F%2Ftracker.local%3A6969%2Fannounce",
+            "&tr=https%3A%2F%2Ftracker-alt.local%2Fannounce"
+        );
+        let magnet = Magnet::new(magnet_link).unwrap();
+
+        let manager = TorrentManager::from_magnet(build_test_params(), magnet, magnet_link)
+            .expect("manager from magnet");
+
+        let mut trackers: Vec<_> = manager.state.trackers.keys().cloned().collect();
+        trackers.sort();
+
+        assert_eq!(
+            trackers,
+            vec![
+                "https://tracker-alt.local/announce".to_string(),
+                "udp://tracker.local:6969/announce".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_torrent_uses_announce_list_with_udp_preference() {
+        let mut torrent = create_dummy_torrent(1);
+        torrent.announce = Some("http://tracker.local:6969/announce".to_string());
+        torrent.announce_list = Some(vec![vec![
+            "udp://tracker.local:6969/announce".to_string(),
+            "https://tracker-alt.local/announce".to_string(),
+        ]]);
+
+        let manager = TorrentManager::from_torrent(build_test_params(), torrent)
+            .expect("manager from torrent");
+
+        let mut trackers: Vec<_> = manager.state.trackers.keys().cloned().collect();
+        trackers.sort();
+
+        assert_eq!(
+            trackers,
+            vec![
+                "https://tracker-alt.local/announce".to_string(),
+                "udp://tracker.local:6969/announce".to_string(),
+            ]
+        );
     }
 
     #[cfg(not(feature = "dht"))]
@@ -3374,11 +3462,10 @@ mod resource_tests {
 
         manager.state.accepting_new_peers = false;
 
-        let ip = "127.0.0.1".to_string();
-        let port = 1;
-        let peer_id = format!("{}:{}", ip, port);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_id = addr.to_string();
 
-        manager.handle_effect(Effect::ConnectToPeer { ip, port });
+        manager.handle_effect(Effect::ConnectToPeer { addr });
 
         assert!(
             !manager.state.peers.contains_key(&peer_id),
@@ -3393,11 +3480,10 @@ mod resource_tests {
 
         manager.state.accepting_new_peers = true;
 
-        let ip = "127.0.0.1".to_string();
-        let port = 1;
-        let peer_id = format!("{}:{}", ip, port);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_id = addr.to_string();
 
-        manager.handle_effect(Effect::ConnectToPeer { ip, port });
+        manager.handle_effect(Effect::ConnectToPeer { addr });
 
         assert!(
             manager.state.peers.contains_key(&peer_id),
@@ -3414,8 +3500,7 @@ mod resource_tests {
 
         for port in 10_000u16..20_000u16 {
             manager.handle_effect(Effect::ConnectToPeer {
-                ip: "127.0.0.1".to_string(),
-                port,
+                addr: SocketAddr::from(([127, 0, 0, 1], port)),
             });
         }
 
@@ -3888,7 +3973,7 @@ mod resource_tests {
         });
 
         // --- 3. Run Manager ---
-        manager.connect_to_peer(peer_addr.ip().to_string(), peer_addr.port());
+        manager.connect_to_peer(peer_addr);
         let manager_handle = tokio::spawn(async move {
             let _ = manager.run(false).await;
         });
@@ -4136,7 +4221,7 @@ mod resource_tests {
         });
 
         // --- 3. Run Manager ---
-        manager.connect_to_peer(peer_addr.ip().to_string(), peer_addr.port());
+        manager.connect_to_peer(peer_addr);
         let manager_handle = tokio::spawn(async move {
             let _ = manager.run(false).await;
         });

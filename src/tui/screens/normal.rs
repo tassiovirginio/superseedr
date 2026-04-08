@@ -947,19 +947,21 @@ pub fn draw_footer(
     ctx: &ThemeContext,
 ) {
     let show_branding = footer_chunk.width >= 80;
-    let cluster_status_width = app_state
-        .cluster_role_label
-        .as_deref()
-        .map(|label| format!(" | Cluster: {}", label).len() as u16)
-        .unwrap_or(0)
-        .saturating_add(
-            app_state
-                .cluster_runtime_label
-                .as_deref()
-                .map(|label| format!(" | {}", label).len() as u16)
-                .unwrap_or(0),
-        );
-    let status_width = 21u16.saturating_add(cluster_status_width);
+    let any_port_open =
+        app_state.externally_accessable_port_v4 || app_state.externally_accessable_port_v6;
+    let overall_port_status = if any_port_open { "Open" } else { "Closed" };
+    let now = Instant::now();
+    let v4_highlight_active = app_state
+        .externally_accessable_port_v4_highlight_until
+        .is_some_and(|deadline| deadline > now);
+    let v6_highlight_active = app_state
+        .externally_accessable_port_v6_highlight_until
+        .is_some_and(|deadline| deadline > now);
+    let status_width = format!(
+        "Port: {} [{}] [IPv4/IPv6]",
+        settings.client_port, overall_port_status
+    )
+    .len() as u16;
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
@@ -1314,40 +1316,43 @@ pub fn draw_footer(
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
     f.render_widget(footer_paragraph, commands_chunk);
 
-    let port_style = if app_state.externally_accessable_port {
+    let port_style = if any_port_open {
         ctx.apply(Style::default().fg(ctx.state_success()))
     } else {
         ctx.apply(Style::default().fg(ctx.state_error()))
     };
-    let port_text = if app_state.externally_accessable_port {
-        "Open"
+    let v4_port_style = if app_state.externally_accessable_port_v4 {
+        let style = Style::default().fg(ctx.state_success());
+        if v4_highlight_active {
+            ctx.apply(style.bold())
+        } else {
+            ctx.apply(style)
+        }
     } else {
-        "Closed"
+        ctx.apply(Style::default().fg(ctx.state_error()))
+    };
+    let v6_port_style = if app_state.externally_accessable_port_v6 {
+        let style = Style::default().fg(ctx.state_success());
+        if v6_highlight_active {
+            ctx.apply(style.bold())
+        } else {
+            ctx.apply(style)
+        }
+    } else {
+        ctx.apply(Style::default().fg(ctx.state_error()))
     };
 
-    let mut footer_status_spans = vec![
+    let footer_status_spans = vec![
         Span::raw("Port: "),
         Span::styled(settings.client_port.to_string(), port_style),
         Span::raw(" ["),
-        Span::styled(port_text, port_style),
+        Span::styled(overall_port_status, port_style),
+        Span::raw("] ["),
+        Span::styled("IPv4", v4_port_style),
+        Span::raw("/"),
+        Span::styled("IPv6", v6_port_style),
         Span::raw("]"),
     ];
-    if let Some(cluster_role) = app_state.cluster_role_label.as_deref() {
-        let cluster_style = if cluster_role == "Leader" {
-            ctx.apply(Style::default().fg(ctx.state_success()).bold())
-        } else {
-            ctx.apply(Style::default().fg(ctx.state_warning()).bold())
-        };
-        footer_status_spans.push(Span::raw(" | Cluster: "));
-        footer_status_spans.push(Span::styled(cluster_role.to_string(), cluster_style));
-    }
-    if let Some(runtime_label) = app_state.cluster_runtime_label.as_deref() {
-        footer_status_spans.push(Span::raw(" | "));
-        footer_status_spans.push(Span::styled(
-            runtime_label.to_string(),
-            ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
-        ));
-    }
     let footer_status = Line::from(footer_status_spans).alignment(Alignment::Right);
 
     let status_paragraph = Paragraph::new(footer_status)
@@ -5938,7 +5943,10 @@ mod tests {
             rows.first().is_some_and(|row| row.starts_with("C:")),
             "{rows:?}"
         );
-        assert_eq!(rows.last().map(String::as_str), Some("i"));
+        assert!(
+            rows.last().is_some_and(|row| row.ends_with('i')),
+            "{rows:?}"
+        );
     }
 
     #[test]

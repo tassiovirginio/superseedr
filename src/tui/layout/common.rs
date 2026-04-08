@@ -171,9 +171,9 @@ pub fn get_peer_columns() -> Vec<PeerColumnDefinition> {
         PeerColumnDefinition {
             id: PeerColumnId::Address,
             header: "Address",
-            min_width: 16,
+            min_width: 24,
             priority: 0,
-            default_constraint: Constraint::Fill(1),
+            default_constraint: Constraint::Fill(2),
             sort_enum: Some(PeerSortColumn::Address),
         },
         PeerColumnDefinition {
@@ -281,4 +281,30 @@ pub fn compute_smart_table_layout(
         .collect();
 
     (final_constraints, active_indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_visible_peer_columns, get_peer_columns, PeerColumnId};
+    use ratatui::layout::Constraint;
+
+    #[test]
+    fn peer_address_column_reserves_more_width_for_ipv6_addresses() {
+        let columns = get_peer_columns();
+        let address = columns
+            .iter()
+            .find(|column| column.id == PeerColumnId::Address)
+            .expect("address column");
+
+        assert_eq!(address.min_width, 24);
+        assert_eq!(address.default_constraint, Constraint::Fill(2));
+    }
+
+    #[test]
+    fn peer_columns_drop_low_priority_fields_before_address_on_medium_widths() {
+        let (_constraints, visible) = compute_visible_peer_columns(90);
+
+        assert!(visible.contains(&2), "address column should stay visible");
+        assert!(!visible.contains(&6), "action column should drop first");
+    }
 }

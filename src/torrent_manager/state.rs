@@ -16,6 +16,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 
 use std::mem::Discriminant;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ pub const MAX_PIPELINE_DEPTH: usize = 512;
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
 
-pub type PeerAddr = (String, u16);
+pub type PeerAddr = SocketAddr;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -223,8 +224,7 @@ pub enum Effect {
         piece_index: u32,
     },
     ConnectToPeer {
-        ip: String,
-        port: u16,
+        addr: SocketAddr,
     },
     RequestHashes {
         peer_id: String,
@@ -1639,14 +1639,14 @@ impl TorrentState {
                     tracker.next_announce_time = self.now + next_interval;
                 }
 
-                for (ip, port) in peers {
-                    let peer_addr = format!("{}:{}", ip, port);
-                    if let Some((_, next_attempt)) = self.timed_out_peers.get(&peer_addr) {
+                for peer_addr in peers {
+                    let peer_key = peer_addr.to_string();
+                    if let Some((_, next_attempt)) = self.timed_out_peers.get(&peer_key) {
                         if self.now < *next_attempt {
                             continue;
                         }
                     }
-                    effects.push(Effect::ConnectToPeer { ip, port });
+                    effects.push(Effect::ConnectToPeer { addr: peer_addr });
                 }
 
                 effects
@@ -1741,9 +1741,9 @@ impl TorrentState {
                     }
                 }
 
-                if let Some(announce) = &torrent.announce {
+                for announce in torrent.tracker_urls() {
                     self.trackers.insert(
-                        announce.clone(),
+                        announce,
                         TrackerState {
                             next_announce_time: self.now,
                             leeching_interval: None,
@@ -1986,13 +1986,8 @@ impl TorrentState {
                     .into_iter()
                     .collect();
                 for peer_addr in peers_to_connect {
-                    if let Ok(std::net::SocketAddr::V4(v4)) =
-                        peer_addr.parse::<std::net::SocketAddr>()
-                    {
-                        effects.push(Effect::ConnectToPeer {
-                            ip: v4.ip().to_string(),
-                            port: v4.port(),
-                        });
+                    if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
+                        effects.push(Effect::ConnectToPeer { addr });
                     }
                 }
 
@@ -10443,7 +10438,7 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = listener.local_addr().unwrap();
 
-        manager.connect_to_peer(peer_addr.ip().to_string(), peer_addr.port());
+        manager.connect_to_peer(peer_addr);
 
         let (tx_events, rx_events) = mpsc::channel(100);
         let (tx_ctrl, mut rx_ctrl) = mpsc::channel(1);

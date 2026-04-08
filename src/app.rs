@@ -4,6 +4,7 @@
 use std::fs;
 use std::fs::File;
 use std::io::{self, ErrorKind, Stdout};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use std::collections::VecDeque;
@@ -114,7 +115,7 @@ use sysinfo::System;
 use tracing::{event as tracing_event, Level};
 
 use crate::resource_manager::{ResourceManager, ResourceManagerClient};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use tokio::time;
@@ -159,6 +160,89 @@ const STARTUP_ROLLING_LOADS_PER_INTERVAL: usize = 1;
 
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const PORT_FAMILY_HIGHLIGHT_DURATION: Duration = Duration::from_secs(2);
+const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
+
+pub struct ListenerSet {
+    ipv4: Option<TcpListener>,
+    ipv6: Option<TcpListener>,
+}
+
+impl ListenerSet {
+    async fn bind(port: u16) -> io::Result<Self> {
+        let ipv6 = match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    error = %error,
+                    "IPv6 listener bind failed; continuing without IPv6 listener."
+                );
+                None
+            }
+        };
+
+        let ipv4_port = match (port, ipv6.as_ref()) {
+            (0, Some(listener)) => listener.local_addr()?.port(),
+            _ => port,
+        };
+
+        let ipv4 = match TcpListener::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ipv4_port,
+        ))
+        .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
+            Err(error) if ipv6.is_some() => {
+                tracing_event!(
+                    Level::WARN,
+                    error = %error,
+                    "IPv4 listener bind failed; continuing with IPv6 listener only."
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        };
+
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "failed to bind IPv4 or IPv6 listener",
+            ));
+        }
+
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        match (&self.ipv4, &self.ipv6) {
+            (Some(ipv4), Some(ipv6)) => {
+                tokio::select! {
+                    res = ipv4.accept() => res,
+                    res = ipv6.accept() => res,
+                }
+            }
+            (Some(ipv4), None) => ipv4.accept().await,
+            (None, Some(ipv6)) => ipv6.accept().await,
+            (None, None) => Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no listener is currently bound",
+            )),
+        }
+    }
+
+    fn local_port(&self) -> Option<u16> {
+        self.ipv4
+            .as_ref()
+            .or(self.ipv6.as_ref())
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.port())
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct CratesResponse {
@@ -488,6 +572,7 @@ pub enum AppCommand {
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
+    MarkPortOpen(SocketAddr),
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
     ControlRequest {
@@ -1062,7 +1147,10 @@ pub struct AppState {
 
     pub screen_area: Rect,
     pub mode: AppMode,
-    pub externally_accessable_port: bool,
+    pub externally_accessable_port_v4: bool,
+    pub externally_accessable_port_v6: bool,
+    pub externally_accessable_port_v4_highlight_until: Option<Instant>,
+    pub externally_accessable_port_v6_highlight_until: Option<Instant>,
     pub anonymize_torrent_names: bool,
 
     pub pending_torrent_path: Option<PathBuf>,
@@ -1172,7 +1260,7 @@ pub struct App {
     #[cfg(feature = "dht")]
     pub dht_bootstrap_warning: Option<String>,
 
-    pub listener: Option<tokio::net::TcpListener>,
+    pub listener: Option<ListenerSet>,
 
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(TcpStream, Vec<u8>)>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
@@ -1360,14 +1448,16 @@ impl App {
     }
 
     pub async fn new_with_lock(
-        client_configs: Settings,
+        mut client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = Some(
-            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", client_configs.client_port))
-                .await?,
-        );
+        let listener = Some(ListenerSet::bind(client_configs.client_port).await?);
+        if client_configs.client_port == 0 {
+            if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
+                client_configs.client_port = bound_port;
+            }
+        }
 
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(1000);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
@@ -2721,6 +2811,28 @@ impl App {
     }
 
     fn tick_ui_effects_clock(&mut self) {
+        let now = Instant::now();
+        let mut cleared_port_highlight = false;
+        if self
+            .app_state
+            .externally_accessable_port_v4_highlight_until
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.app_state.externally_accessable_port_v4_highlight_until = None;
+            cleared_port_highlight = true;
+        }
+        if self
+            .app_state
+            .externally_accessable_port_v6_highlight_until
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.app_state.externally_accessable_port_v6_highlight_until = None;
+            cleared_port_highlight = true;
+        }
+        if cleared_port_highlight {
+            self.app_state.ui.needs_redraw = true;
+        }
+
         let frame_wall_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2947,15 +3059,13 @@ impl App {
     }
 
     async fn handle_incoming_peer(&mut self, mut stream: TcpStream) {
-        if !self.app_state.externally_accessable_port {
-            self.app_state.externally_accessable_port = true;
-        }
-
         let torrent_manager_incoming_peer_txs_clone =
             self.torrent_manager_incoming_peer_txs.clone();
         let resource_manager_clone = self.resource_manager.clone();
+        let app_command_tx = self.app_command_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
+            let peer_addr = stream.peer_addr().ok();
             let Some(_session_permit) = (tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
@@ -2981,11 +3091,23 @@ impl App {
                 .await,
                 Ok(Ok(_))
             ) {
+                if !is_valid_incoming_bittorrent_handshake(&buffer) {
+                    tracing::trace!(
+                        "Rejected inbound TCP connection with invalid BitTorrent handshake."
+                    );
+                    return;
+                }
+
                 let peer_info_hash = &buffer[28..48];
 
                 if let Some(torrent_manager_tx) =
                     torrent_manager_incoming_peer_txs_clone.get(peer_info_hash)
                 {
+                    if let Some(peer_addr) = peer_addr {
+                        let _ = app_command_tx
+                            .send(AppCommand::MarkPortOpen(peer_addr))
+                            .await;
+                    }
                     let torrent_manager_tx_clone = torrent_manager_tx.clone();
                     let _ = torrent_manager_tx_clone.send((stream, buffer)).await;
                 } else {
@@ -3264,6 +3386,25 @@ impl App {
                 let action = self.resolve_add_ingress_action(IngestSource::MagnetFile, &path);
                 self.execute_add_ingress_action(IngestSource::MagnetFile, path, action)
                     .await;
+            }
+            AppCommand::MarkPortOpen(peer_addr) => {
+                let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
+                let open_flag = match peer_addr {
+                    SocketAddr::V4(_) => {
+                        self.app_state.externally_accessable_port_v4_highlight_until =
+                            highlight_until;
+                        &mut self.app_state.externally_accessable_port_v4
+                    }
+                    SocketAddr::V6(_) => {
+                        self.app_state.externally_accessable_port_v6_highlight_until =
+                            highlight_until;
+                        &mut self.app_state.externally_accessable_port_v6
+                    }
+                };
+                if !*open_flag {
+                    *open_flag = true;
+                }
+                self.app_state.ui.needs_redraw = true;
             }
             AppCommand::SubmitControlRequest(request) => {
                 if let Err(error) = self
@@ -3966,10 +4107,14 @@ impl App {
                         new_port
                     );
 
-                    match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", new_port)).await {
+                    match ListenerSet::bind(new_port).await {
                         Ok(new_listener) => {
                             self.listener = Some(new_listener);
-                            self.client_configs.client_port = new_port;
+                            self.client_configs.client_port = self
+                                .listener
+                                .as_ref()
+                                .and_then(ListenerSet::local_port)
+                                .unwrap_or(new_port);
 
                             tracing_event!(
                                 Level::INFO,
@@ -5510,12 +5655,16 @@ impl App {
     }
 
     async fn rebind_listener(&mut self, new_port: u16) {
-        match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", new_port)).await {
+        match ListenerSet::bind(new_port).await {
             Ok(new_listener) => {
                 self.listener = Some(new_listener);
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
                 // but we ensure consistency here just in case.
-                self.client_configs.client_port = new_port;
+                self.client_configs.client_port = self
+                    .listener
+                    .as_ref()
+                    .and_then(ListenerSet::local_port)
+                    .unwrap_or(new_port);
 
                 tracing_event!(
                     Level::INFO,
@@ -5908,6 +6057,12 @@ impl App {
             self.save_state_to_disk();
         }
     }
+}
+
+fn is_valid_incoming_bittorrent_handshake(buffer: &[u8]) -> bool {
+    buffer.len() >= 48
+        && buffer[0] as usize == BITTORRENT_PROTOCOL_STR.len()
+        && buffer[1..(1 + BITTORRENT_PROTOCOL_STR.len())] == *BITTORRENT_PROTOCOL_STR
 }
 
 fn persisted_validation_status_from_metrics(
@@ -6435,15 +6590,15 @@ mod tests {
     use super::{
         apply_network_history_persist_result, build_persist_payload,
         clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
-        flush_persistence_writer_parts, format_filesystem_path_error, move_file_with_fallback_impl,
-        parse_hybrid_hashes, persisted_validation_status_from_metrics, prune_rss_feed_errors,
-        queue_persistence_payload, resolve_magnet_torrent_name, rss_settings_changed,
-        should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, torrent_completion_percent,
-        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
-        AppRuntimeMode, AppState, CommandIngestResult, FilePriority, PeerInfo, PersistPayload,
-        SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState, TorrentMetrics,
-        TorrentSortColumn, UiState,
+        flush_persistence_writer_parts, format_filesystem_path_error,
+        is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
+        persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
+        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
+        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
+        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
+        AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority, PeerInfo,
+        PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
+        TorrentMetrics, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -6464,6 +6619,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::env;
     use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -6974,6 +7130,56 @@ mod tests {
             Some("dht warning".to_string())
         );
         assert_eq!(compose_system_warning(None, None), None);
+    }
+
+    #[test]
+    fn incoming_handshake_validator_accepts_bittorrent_handshake_prefix() {
+        let mut handshake = vec![0u8; 68];
+        handshake[0] = BITTORRENT_PROTOCOL_STR.len() as u8;
+        handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(BITTORRENT_PROTOCOL_STR);
+
+        assert!(is_valid_incoming_bittorrent_handshake(&handshake));
+    }
+
+    #[test]
+    fn incoming_handshake_validator_rejects_non_bittorrent_prefix() {
+        let mut handshake = vec![0u8; 68];
+        handshake[0] = BITTORRENT_PROTOCOL_STR.len() as u8;
+        handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(b"NotTorrent protocol");
+
+        assert!(!is_valid_incoming_bittorrent_handshake(&handshake));
+    }
+
+    #[tokio::test]
+    async fn mark_port_open_command_tracks_ipv4_and_ipv6_independently() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+
+        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            6681,
+        )))
+        .await;
+
+        assert!(app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+
+        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            6681,
+        )))
+        .await;
+
+        assert!(app.app_state.externally_accessable_port_v4);
+        assert!(app.app_state.externally_accessable_port_v6);
     }
 
     #[test]
