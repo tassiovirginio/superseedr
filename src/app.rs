@@ -76,7 +76,7 @@ use crate::integrity_scheduler::{
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
-use crate::torrent_manager::FileActivityDirection;
+use crate::torrent_manager::FileActivityUpdate;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
 use crate::torrent_manager::TorrentFileProbeStatus;
@@ -871,6 +871,9 @@ pub struct TorrentMetrics {
     #[serde(skip)]
     pub blocks_out_history: Vec<u64>,
 
+    #[serde(skip)]
+    pub file_activity_updates: Vec<FileActivityUpdate>,
+
     pub blocks_in_this_tick: u64,
     pub blocks_out_this_tick: u64,
 }
@@ -907,6 +910,7 @@ impl Default for TorrentMetrics {
             bytes_written: 0,
             blocks_in_history: Vec::new(),
             blocks_out_history: Vec::new(),
+            file_activity_updates: Vec::new(),
             blocks_in_this_tick: 0,
             blocks_out_this_tick: 0,
         }
@@ -4066,26 +4070,6 @@ impl App {
                     // 7. Force UI redraw
                     self.app_state.ui.needs_redraw = true;
                     tracing::info!(target: "superseedr", "Magnet preview tree hydrated (first arrival)");
-                }
-            }
-            ManagerEvent::FileActivity {
-                info_hash,
-                touched_relative_paths,
-                direction,
-            } => {
-                if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
-                    let now = Instant::now();
-                    for relative_path in touched_relative_paths {
-                        let activity = display
-                            .recent_file_activity
-                            .entry(relative_path)
-                            .or_default();
-                        match direction {
-                            FileActivityDirection::Download => activity.download_at = Some(now),
-                            FileActivityDirection::Upload => activity.upload_at = Some(now),
-                        }
-                    }
-                    self.app_state.ui.needs_redraw = true;
                 }
             }
             ManagerEvent::DiskReadStarted { .. }

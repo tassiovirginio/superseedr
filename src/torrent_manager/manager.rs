@@ -395,8 +395,12 @@ impl TorrentManager {
                 let _ = self.manager_event_tx.try_send(event);
             }
 
-            Effect::EmitMetrics { bytes_dl, bytes_ul } => {
-                self.send_metrics(bytes_dl, bytes_ul);
+            Effect::EmitMetrics {
+                bytes_dl,
+                bytes_ul,
+                file_activity_updates,
+            } => {
+                self.send_metrics(bytes_dl, bytes_ul, file_activity_updates);
             }
 
             Effect::SendToPeer { peer_id, cmd } => {
@@ -2030,7 +2034,12 @@ impl TorrentManager {
         format!("{}...", truncated)
     }
 
-    fn send_metrics(&mut self, bytes_dl: u64, bytes_ul: u64) {
+    fn send_metrics(
+        &mut self,
+        bytes_dl: u64,
+        bytes_ul: u64,
+        file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
+    ) {
         if let Some(ref torrent) = self.state.torrent {
             let multi_file_info = match self.state.multi_file_info.as_ref() {
                 Some(mfi) => mfi,
@@ -2174,6 +2183,7 @@ impl TorrentManager {
                 total_size: total_size_bytes,
                 bytes_written,
                 file_priorities: self.state.file_priorities.clone(),
+                file_activity_updates,
                 ..Default::default()
             };
             if self.telemetry.should_emit(&torrent_state) {
@@ -3252,6 +3262,90 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_metrics_flushes_batched_file_activity() {
+        let (_incoming_tx, incoming_peer_rx) = mpsc::channel(32);
+        let (_manager_command_tx, manager_command_rx) = mpsc::channel(32);
+        let (manager_event_tx, mut manager_event_rx) = mpsc::channel(32);
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+
+        let mut limits = HashMap::new();
+        limits.insert(
+            crate::resource_manager::ResourceType::PeerConnection,
+            (1000, 1000),
+        );
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskRead,
+            (1000, 1000),
+        );
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskWrite,
+            (1000, 1000),
+        );
+        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+
+        let (_resource_manager, resource_manager_client) =
+            ResourceManager::new(limits, shutdown_tx);
+
+        let params = TorrentParameters {
+            dht_handle: {
+                #[cfg(feature = "dht")]
+                {
+                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                }
+                #[cfg(not(feature = "dht"))]
+                {
+                    ()
+                }
+            },
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings,
+            resource_manager: resource_manager_client,
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+
+        let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1)).unwrap();
+
+        manager.apply_action(Action::IncomingBlock {
+            peer_id: "peer_a".to_string(),
+            piece_index: 0,
+            block_offset: 0,
+            data: vec![1; 256],
+        });
+
+        assert!(matches!(
+            manager_event_rx.try_recv().ok(),
+            Some(ManagerEvent::BlockReceived { .. })
+        ));
+        assert!(
+            manager_event_rx.try_recv().is_err(),
+            "file activity should flush on the tick, not the block path"
+        );
+
+        manager.apply_action(Action::Tick { dt_ms: 1000 });
+
+        let metrics = metrics_rx.borrow_and_update().clone();
+        assert_eq!(metrics.file_activity_updates.len(), 1);
+        assert_eq!(
+            metrics.file_activity_updates[0].touched_relative_paths,
+            vec!["test_torrent".to_string()]
+        );
+        assert_eq!(
+            metrics.file_activity_updates[0].direction,
+            crate::torrent_manager::FileActivityDirection::Download
+        );
     }
 
     // --- Helper to spawn a manager quickly ---

@@ -28,6 +28,7 @@ use crate::torrent_file::{Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
 use crate::torrent_manager::piece_manager::PieceManager;
 use crate::torrent_manager::piece_manager::PieceStatus;
+use crate::torrent_manager::FileActivityUpdate;
 use std::collections::{HashMap, HashSet};
 
 const MAX_TIMEOUT_COUNT: u32 = 10;
@@ -182,6 +183,7 @@ pub enum Effect {
     EmitMetrics {
         bytes_dl: u64,
         bytes_ul: u64,
+        file_activity_updates: Vec<FileActivityUpdate>,
     },
     EmitManagerEvent(ManagerEvent),
     SendToPeer {
@@ -310,6 +312,12 @@ pub enum ChokeStatus {
     Unchoke,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileActivityInterval {
+    start: u64,
+    end: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentState {
     pub info_hash: Vec<u8>,
@@ -348,6 +356,8 @@ pub struct TorrentState {
     pub pending_disconnects: Vec<String>,
     pub pending_failures: Vec<String>,
     pub accepting_new_peers: bool,
+    pending_download_file_activity: Vec<FileActivityInterval>,
+    pending_upload_file_activity: Vec<FileActivityInterval>,
 }
 impl Default for TorrentState {
     fn default() -> Self {
@@ -388,6 +398,8 @@ impl Default for TorrentState {
             pending_disconnects: Vec::with_capacity(100),
             pending_failures: Vec::with_capacity(100),
             accepting_new_peers: true,
+            pending_download_file_activity: Vec::with_capacity(64),
+            pending_upload_file_activity: Vec::with_capacity(64),
         }
     }
 }
@@ -576,6 +588,7 @@ impl TorrentState {
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: dl_tick,
                     bytes_ul: ul_tick,
+                    file_activity_updates: self.drain_file_activity_updates(),
                 }];
 
                 if self.torrent_status == TorrentStatus::Validating || self.is_paused {
@@ -1214,15 +1227,12 @@ impl TorrentState {
                 effects.push(Effect::EmitManagerEvent(ManagerEvent::BlockReceived {
                     info_hash: self.info_hash.clone(),
                 }));
-                effects.push(Effect::EmitManagerEvent(ManagerEvent::FileActivity {
-                    info_hash: self.info_hash.clone(),
-                    touched_relative_paths: self.touched_relative_paths_for_activity(
-                        piece_index,
-                        block_offset,
-                        data.len() as u32,
-                    ),
-                    direction: FileActivityDirection::Download,
-                }));
+                self.record_pending_file_activity(
+                    piece_index,
+                    block_offset,
+                    data.len() as u32,
+                    FileActivityDirection::Download,
+                );
 
                 if is_piece_done {
                     return effects;
@@ -1597,25 +1607,20 @@ impl TorrentState {
                 }
 
                 if allowed {
-                    vec![
-                        Effect::EmitManagerEvent(ManagerEvent::FileActivity {
-                            info_hash: self.info_hash.clone(),
-                            touched_relative_paths: self.touched_relative_paths_for_activity(
-                                piece_index,
-                                block_offset,
-                                length,
-                            ),
-                            direction: FileActivityDirection::Upload,
-                        }),
-                        Effect::ReadFromDisk {
-                            peer_id,
-                            block_info: BlockInfo {
-                                piece_index,
-                                offset: block_offset,
-                                length,
-                            },
+                    self.record_pending_file_activity(
+                        piece_index,
+                        block_offset,
+                        length,
+                        FileActivityDirection::Upload,
+                    );
+                    vec![Effect::ReadFromDisk {
+                        peer_id,
+                        block_info: BlockInfo {
+                            piece_index,
+                            offset: block_offset,
+                            length,
                         },
-                    ]
+                    }]
                 } else {
                     vec![Effect::DoNothing]
                 }
@@ -1991,6 +1996,7 @@ impl TorrentState {
                     Effect::EmitMetrics {
                         bytes_dl: self.bytes_downloaded_in_interval,
                         bytes_ul: self.bytes_uploaded_in_interval,
+                        file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::ClearAllUploads,
                 ];
@@ -2250,73 +2256,218 @@ impl TorrentState {
         (data_len, 0, data_len)
     }
 
+    fn record_pending_file_activity(
+        &mut self,
+        piece_index: u32,
+        block_offset: u32,
+        length: u32,
+        direction: FileActivityDirection,
+    ) {
+        let piece_length = match self
+            .torrent
+            .as_ref()
+            .map(|torrent| torrent.info.piece_length as u64)
+        {
+            Some(piece_length) if length > 0 && piece_length > 0 => piece_length,
+            _ => return,
+        };
+
+        let start = (piece_index as u64)
+            .saturating_mul(piece_length)
+            .saturating_add(block_offset as u64);
+        let end = start.saturating_add(length as u64);
+        if end <= start {
+            return;
+        }
+
+        let pending = match direction {
+            FileActivityDirection::Download => &mut self.pending_download_file_activity,
+            FileActivityDirection::Upload => &mut self.pending_upload_file_activity,
+        };
+
+        if let Some(last) = pending.last_mut() {
+            if start <= last.end {
+                last.end = last.end.max(end);
+                return;
+            }
+        }
+
+        pending.push(FileActivityInterval { start, end });
+    }
+
     fn touched_relative_paths_for_activity(
         &self,
         piece_index: u32,
         block_offset: u32,
         length: u32,
     ) -> Vec<String> {
-        if length == 0 {
-            Vec::new()
-        } else {
-            self.multi_file_info
-                .as_ref()
-                .and_then(|multi_file_info| {
-                    self.torrent.as_ref().map(|torrent| {
-                        let global_offset = (piece_index as u64 * torrent.info.piece_length as u64)
-                            + block_offset as u64;
-                        let range_end = global_offset.saturating_add(length as u64);
-                        let effective_root = match &self.container_name {
-                            Some(name) if !name.is_empty() => {
-                                self.torrent_data_path.as_ref().map(|path| path.join(name))
-                            }
-                            _ => self.torrent_data_path.clone(),
-                        };
-                        multi_file_info
-                            .files
-                            .iter()
-                            .filter_map(|file_info| {
-                                let file_start = file_info.global_start_offset;
-                                let file_end = file_start.saturating_add(file_info.length);
-                                if global_offset < file_end && range_end > file_start {
-                                    Some(
-                                        effective_root
-                                            .as_ref()
-                                            .and_then(|root| {
-                                                file_info.path.strip_prefix(root).ok().map(
-                                                    |relative| {
-                                                        relative
-                                                            .iter()
-                                                            .map(|part| {
-                                                                part.to_string_lossy().into_owned()
-                                                            })
-                                                            .collect::<Vec<_>>()
-                                                            .join("/")
-                                                    },
-                                                )
-                                            })
-                                            .unwrap_or_else(|| {
-                                                file_info
-                                                    .path
-                                                    .file_name()
-                                                    .map(|name| name.to_string_lossy().into_owned())
-                                                    .unwrap_or_else(|| {
-                                                        file_info
-                                                            .path
-                                                            .to_string_lossy()
-                                                            .into_owned()
-                                                    })
-                                            }),
-                                    )
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
+        let piece_length = match self
+            .torrent
+            .as_ref()
+            .map(|torrent| torrent.info.piece_length as u64)
+        {
+            Some(piece_length) if length > 0 && piece_length > 0 => piece_length,
+            _ => return Vec::new(),
+        };
+        let global_offset = (piece_index as u64)
+            .saturating_mul(piece_length)
+            .saturating_add(block_offset as u64);
+        let range_end = global_offset.saturating_add(length as u64);
+
+        let effective_root = match &self.container_name {
+            Some(name) if !name.is_empty() => {
+                self.torrent_data_path.as_ref().map(|path| path.join(name))
+            }
+            _ => self.torrent_data_path.clone(),
+        };
+
+        self.multi_file_info
+            .as_ref()
+            .map(|multi_file_info| {
+                multi_file_info
+                    .files
+                    .iter()
+                    .filter_map(|file_info| {
+                        let file_start = file_info.global_start_offset;
+                        let file_end = file_start.saturating_add(file_info.length);
+                        if global_offset >= file_end || range_end <= file_start {
+                            return None;
+                        }
+
+                        Some(
+                            effective_root
+                                .as_ref()
+                                .and_then(|root| {
+                                    file_info.path.strip_prefix(root).ok().map(|relative| {
+                                        relative
+                                            .iter()
+                                            .map(|part| part.to_string_lossy().into_owned())
+                                            .collect::<Vec<_>>()
+                                            .join("/")
+                                    })
+                                })
+                                .unwrap_or_else(|| {
+                                    file_info
+                                        .path
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| {
+                                            file_info.path.to_string_lossy().into_owned()
+                                        })
+                                }),
+                        )
                     })
-                })
-                .unwrap_or_default()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn drain_file_activity_updates(&mut self) -> Vec<FileActivityUpdate> {
+        let mut updates = Vec::with_capacity(2);
+        let effective_root = match &self.container_name {
+            Some(name) if !name.is_empty() => {
+                self.torrent_data_path.as_ref().map(|path| path.join(name))
+            }
+            _ => self.torrent_data_path.clone(),
+        };
+        let Some(multi_file_info) = self.multi_file_info.as_ref() else {
+            self.pending_download_file_activity.clear();
+            self.pending_upload_file_activity.clear();
+            return updates;
+        };
+
+        let drain_direction = |intervals: &mut Vec<FileActivityInterval>,
+                               direction: FileActivityDirection| {
+            if intervals.is_empty() {
+                return None;
+            }
+
+            intervals.sort_unstable_by_key(|interval| interval.start);
+
+            let mut write_idx = 0usize;
+            for read_idx in 1..intervals.len() {
+                if intervals[read_idx].start <= intervals[write_idx].end {
+                    intervals[write_idx].end =
+                        intervals[write_idx].end.max(intervals[read_idx].end);
+                } else {
+                    write_idx += 1;
+                    intervals[write_idx] = intervals[read_idx];
+                }
+            }
+            intervals.truncate(write_idx + 1);
+
+            let mut touched_paths = Vec::new();
+            let mut interval_idx = 0usize;
+
+            for file_info in &multi_file_info.files {
+                let file_start = file_info.global_start_offset;
+                let file_end = file_start.saturating_add(file_info.length);
+
+                while interval_idx < intervals.len() && intervals[interval_idx].end <= file_start {
+                    interval_idx += 1;
+                }
+
+                if interval_idx == intervals.len() {
+                    break;
+                }
+
+                let mut candidate_idx = interval_idx;
+                let mut touches_file = false;
+                while candidate_idx < intervals.len() {
+                    let interval = intervals[candidate_idx];
+                    if interval.start >= file_end {
+                        break;
+                    }
+                    if interval.end > file_start && interval.start < file_end {
+                        touches_file = true;
+                        break;
+                    }
+                    candidate_idx += 1;
+                }
+
+                if touches_file {
+                    touched_paths.push(
+                        effective_root
+                            .as_ref()
+                            .and_then(|root| {
+                                file_info.path.strip_prefix(root).ok().map(|relative| {
+                                    relative
+                                        .iter()
+                                        .map(|part| part.to_string_lossy().into_owned())
+                                        .collect::<Vec<_>>()
+                                        .join("/")
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                file_info
+                                    .path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| {
+                                        file_info.path.to_string_lossy().into_owned()
+                                    })
+                            }),
+                    );
+                }
+            }
+
+            (!touched_paths.is_empty()).then_some(FileActivityUpdate {
+                touched_relative_paths: touched_paths,
+                direction,
+            })
+        };
+
+        let mut downloads = std::mem::take(&mut self.pending_download_file_activity);
+        if let Some(update) = drain_direction(&mut downloads, FileActivityDirection::Download) {
+            updates.push(update);
         }
+
+        let mut uploads = std::mem::take(&mut self.pending_upload_file_activity);
+        if let Some(update) = drain_direction(&mut uploads, FileActivityDirection::Upload) {
+            updates.push(update);
+        }
+
+        updates
     }
 
     pub fn rebuild_multi_file_info(&mut self) {
@@ -7644,6 +7795,123 @@ mod tests {
             state.touched_relative_paths_for_activity(0, 50, 10),
             vec!["two.bin".to_string()]
         );
+    }
+
+    #[test]
+    fn incoming_block_queues_file_activity_updates_until_tick_flush() {
+        let mut state = create_empty_state();
+        state.torrent_data_path = Some(PathBuf::from("/downloads"));
+        state.torrent = Some(Torrent {
+            info: crate::torrent_file::Info {
+                piece_length: 100,
+                pieces: vec![0u8; 20],
+                length: 120,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.piece_manager.bitfield = vec![PieceStatus::Need];
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
+                crate::storage::FileInfo {
+                    path: PathBuf::from("one.bin"),
+                    length: 50,
+                    global_start_offset: 0,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+                crate::storage::FileInfo {
+                    path: PathBuf::from("two.bin"),
+                    length: 70,
+                    global_start_offset: 50,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+            ],
+            total_size: 120,
+        });
+
+        let effects = state.update(Action::IncomingBlock {
+            peer_id: "peer_a".to_string(),
+            piece_index: 0,
+            block_offset: 40,
+            data: vec![1; 30],
+        });
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::EmitManagerEvent(ManagerEvent::BlockReceived { .. })
+        )));
+
+        let updates = state.drain_file_activity_updates();
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        assert_eq!(
+            update.touched_relative_paths,
+            vec!["one.bin".to_string(), "two.bin".to_string()]
+        );
+        assert_eq!(update.direction, FileActivityDirection::Download);
+        assert!(state.drain_file_activity_updates().is_empty());
+    }
+
+    #[test]
+    fn drain_file_activity_updates_dedupes_paths_within_each_direction() {
+        let mut state = create_empty_state();
+        state.torrent_data_path = Some(PathBuf::from("/downloads"));
+        state.torrent = Some(Torrent {
+            info: crate::torrent_file::Info {
+                piece_length: 100,
+                pieces: vec![0u8; 20],
+                length: 120,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
+                crate::storage::FileInfo {
+                    path: PathBuf::from("one.bin"),
+                    length: 50,
+                    global_start_offset: 0,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+                crate::storage::FileInfo {
+                    path: PathBuf::from("two.bin"),
+                    length: 70,
+                    global_start_offset: 50,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+            ],
+            total_size: 120,
+        });
+
+        state.record_pending_file_activity(0, 0, 10, FileActivityDirection::Download);
+        state.record_pending_file_activity(0, 20, 10, FileActivityDirection::Download);
+        state.record_pending_file_activity(0, 60, 10, FileActivityDirection::Upload);
+
+        let updates = state.drain_file_activity_updates();
+        assert_eq!(updates.len(), 2);
+
+        let mut saw_download = false;
+        let mut saw_upload = false;
+
+        for update in updates {
+            match update.direction {
+                FileActivityDirection::Download => {
+                    saw_download = true;
+                    assert_eq!(update.touched_relative_paths, vec!["one.bin".to_string()]);
+                }
+                FileActivityDirection::Upload => {
+                    saw_upload = true;
+                    assert_eq!(update.touched_relative_paths, vec!["two.bin".to_string()]);
+                }
+            }
+        }
+
+        assert!(saw_download);
+        assert!(saw_upload);
     }
 
     #[test]
