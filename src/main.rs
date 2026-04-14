@@ -28,7 +28,7 @@ use app::{App, AppRuntimeMode};
 use rand::Rng;
 
 use std::fs;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::io::Write;
 
@@ -106,33 +106,6 @@ fn init_tracing(
     let quiet_filter = Targets::new()
         .with_default(DEFAULT_LOG_FILTER)
         .with_target("mainline::rpc::socket", LevelFilter::ERROR);
-
-    if !emit_stderr {
-        for log_dir in &log_dirs {
-            if fs::create_dir_all(log_dir).is_err() {
-                continue;
-            }
-
-            let log_path = log_dir.join(format!("{}.log", filename_prefix));
-            let file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
-
-            let (non_blocking_general, guard_general) = tracing_appender::non_blocking(file);
-            let general_layer = fmt::layer()
-                .with_writer(non_blocking_general)
-                .with_ansi(false)
-                .with_filter(quiet_filter.clone());
-            if tracing_subscriber::registry()
-                .with(general_layer)
-                .try_init()
-                .is_ok()
-            {
-                return vec![guard_general];
-            }
-        }
-    }
 
     for log_dir in log_dirs {
         if let Err(error) = fs::create_dir_all(&log_dir) {

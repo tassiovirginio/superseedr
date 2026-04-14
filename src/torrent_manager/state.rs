@@ -2283,7 +2283,7 @@ impl TorrentState {
         };
 
         if let Some(last) = pending.last_mut() {
-            if start <= last.end {
+            if start >= last.start && start <= last.end {
                 last.end = last.end.max(end);
                 return;
             }
@@ -7861,6 +7861,51 @@ mod tests {
 
         assert!(saw_download);
         assert!(saw_upload);
+    }
+
+    #[test]
+    fn drain_file_activity_updates_preserves_out_of_order_intervals() {
+        let mut state = create_empty_state();
+        state.torrent_data_path = Some(PathBuf::from("/downloads"));
+        state.torrent = Some(Torrent {
+            info: crate::torrent_file::Info {
+                piece_length: 100,
+                pieces: vec![0u8; 20],
+                length: 120,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
+                crate::storage::FileInfo {
+                    path: PathBuf::from("one.bin"),
+                    length: 50,
+                    global_start_offset: 0,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+                crate::storage::FileInfo {
+                    path: PathBuf::from("two.bin"),
+                    length: 70,
+                    global_start_offset: 50,
+                    is_padding: false,
+                    is_skipped: false,
+                },
+            ],
+            total_size: 120,
+        });
+
+        state.record_pending_file_activity(0, 60, 10, FileActivityDirection::Download);
+        state.record_pending_file_activity(0, 0, 10, FileActivityDirection::Download);
+
+        let updates = state.drain_file_activity_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].touched_relative_paths,
+            vec!["one.bin".to_string(), "two.bin".to_string()]
+        );
+        assert_eq!(updates[0].direction, FileActivityDirection::Download);
     }
 
     #[test]
