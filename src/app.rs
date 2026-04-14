@@ -6681,7 +6681,7 @@ mod tests {
         let path = dir.path().join("folder");
         std::fs::create_dir(&path).expect("create folder");
 
-        let error = io::Error::new(io::ErrorKind::Other, "raw os text");
+        let error = io::Error::other("raw os text");
         let message = format_filesystem_path_error("Failed to read torrent file", &path, &error);
 
         assert!(message.contains("Failed to read torrent file"));

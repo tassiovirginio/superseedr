@@ -1752,10 +1752,7 @@ impl TorrentState {
                 }
 
                 let tracker_urls = normalize_tracker_urls(
-                    self.trackers
-                        .keys()
-                        .cloned()
-                        .chain(torrent.tracker_urls().into_iter()),
+                    self.trackers.keys().cloned().chain(torrent.tracker_urls()),
                 );
                 self.trackers = tracker_urls
                     .into_iter()
