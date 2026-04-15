@@ -4336,12 +4336,13 @@ fn build_torrent_file_list_items(
     for node in &torrent.file_preview_tree {
         node.expand_all(&mut expanded_state);
     }
+    let visible_tree_height = (height as usize).saturating_sub(root_depth);
 
     let visible_rows = TreeMathHelper::get_visible_slice(
         &torrent.file_preview_tree,
         &expanded_state,
         TreeFilter::default(),
-        usize::MAX,
+        visible_tree_height,
     );
 
     list_items.extend(visible_rows.iter().map(|item| {
@@ -6774,6 +6775,23 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "file.bin");
         assert_eq!(spans[0].style, ctx.apply(base_style));
+    }
+
+    #[test]
+    fn build_torrent_file_list_items_limits_tree_rows_to_viewport_height() {
+        let mut torrent = create_mock_display_state(0);
+        torrent.latest_state.torrent_name = "sample-tree".to_string();
+        torrent.file_preview_tree = crate::app::build_torrent_preview_tree(
+            (0..20)
+                .map(|idx| (vec![format!("file_{idx:02}.bin")], 1_u64))
+                .collect(),
+            &Default::default(),
+        );
+
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let items = build_torrent_file_list_items(&torrent, 40, 3, false, 0.0, 0.0, &ctx);
+
+        assert_eq!(items.len(), 3);
     }
 
     #[test]
