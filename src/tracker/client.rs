@@ -27,6 +27,7 @@ const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
 const UDP_ERROR_ACTION: u32 = 3;
 const TRACKER_PEER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
+const UDP_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_REQUEST_RETRIES: usize = 3;
 
@@ -341,6 +342,15 @@ async fn make_udp_announce_request(
 ) -> Result<TrackerResponse, TrackerError> {
     let url = Url::parse(&params.announce_link)
         .map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
+    let resolved_addrs = resolve_udp_tracker_addrs(&url).await?;
+
+    retry_udp_announce_across_addrs(&resolved_addrs, |tracker_addr| {
+        try_udp_announce_once_to_addr(params, tracker_addr)
+    })
+    .await
+}
+
+async fn resolve_udp_tracker_addrs(url: &Url) -> Result<Vec<SocketAddr>, TrackerError> {
     let host = url
         .host_str()
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a host".to_string()))?;
@@ -348,18 +358,51 @@ async fn make_udp_announce_request(
         .port_or_known_default()
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a port".to_string()))?;
 
-    let resolved_addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
-    if resolved_addrs.is_empty() {
-        return Err(TrackerError::Protocol(
-            "tracker host resolved to no socket addresses".to_string(),
-        ));
-    }
+    resolve_udp_tracker_addrs_with_lookup(host, port, UDP_TRACKER_DNS_TIMEOUT, async {
+        lookup_host((host, port))
+            .await
+            .map(|resolved| resolved.collect())
+    })
+    .await
+}
 
+async fn resolve_udp_tracker_addrs_with_lookup<F>(
+    host: &str,
+    port: u16,
+    lookup_timeout: Duration,
+    lookup: F,
+) -> Result<Vec<SocketAddr>, TrackerError>
+where
+    F: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    match timeout(lookup_timeout, lookup).await {
+        Ok(Ok(resolved_addrs)) if resolved_addrs.is_empty() => Err(TrackerError::Protocol(
+            "tracker host resolved to no socket addresses".to_string(),
+        )),
+        Ok(Ok(resolved_addrs)) => Ok(resolved_addrs),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(TrackerError::Protocol(format!(
+            "UDP tracker host DNS lookup timed out for {}:{}",
+            host, port
+        ))),
+    }
+}
+
+async fn retry_udp_announce_across_addrs<F, Fut>(
+    tracker_addrs: &[SocketAddr],
+    mut attempt: F,
+) -> Result<TrackerResponse, TrackerError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<TrackerResponse, TrackerError>>,
+{
     let mut last_error = None;
-    for tracker_addr in resolved_addrs {
-        match try_udp_announce_to_addr(params, tracker_addr).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+    for _ in 0..UDP_REQUEST_RETRIES {
+        for &tracker_addr in tracker_addrs {
+            match attempt(tracker_addr).await {
+                Ok(response) => return Ok(response),
+                Err(error) => last_error = Some(error),
+            }
         }
     }
 
@@ -368,28 +411,17 @@ async fn make_udp_announce_request(
     }))
 }
 
-async fn try_udp_announce_to_addr(
+async fn try_udp_announce_once_to_addr(
     params: &AnnounceParams,
     tracker_addr: SocketAddr,
 ) -> Result<TrackerResponse, TrackerError> {
-    let mut last_error = None;
-    for _ in 0..UDP_REQUEST_RETRIES {
-        let bind_addr = match tracker_addr {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        let socket = UdpSocket::bind(bind_addr).await?;
-        socket.connect(tracker_addr).await?;
-
-        match try_udp_announce_once(&socket, params, tracker_addr).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        TrackerError::Protocol("UDP tracker attempt failed without an error".to_string())
-    }))
+    let bind_addr = match tracker_addr {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(tracker_addr).await?;
+    try_udp_announce_once(&socket, params, tracker_addr).await
 }
 
 async fn try_udp_announce_once(
@@ -644,10 +676,13 @@ mod tests {
     use super::parse_compact_ipv6_peers;
     use super::parse_http_tracker_response;
     use super::resolve_tracker_peer_hostname_with_lookup;
+    use super::resolve_udp_tracker_addrs_with_lookup;
+    use super::retry_udp_announce_across_addrs;
     use crate::errors::TrackerError;
+    use crate::tracker::TrackerResponse;
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::net::UdpSocket;
     use tokio::time::{sleep, Duration};
 
@@ -703,6 +738,65 @@ mod tests {
         .await;
 
         assert!(resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_udp_tracker_addrs_timeout_returns_protocol_error() {
+        let error = resolve_udp_tracker_addrs_with_lookup(
+            "tracker.local",
+            6969,
+            Duration::from_millis(1),
+            async {
+                sleep(Duration::from_millis(25)).await;
+                Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
+            },
+        )
+        .await
+        .expect_err("timeout should fail");
+
+        assert!(matches!(
+            error,
+            TrackerError::Protocol(message) if message.contains("DNS lookup timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_udp_announce_across_addrs_tries_next_address_before_retrying_first() {
+        let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10001);
+        let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10002);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let expected = TrackerResponse {
+            failure_reason: None,
+            warning_message: None,
+            interval: 30,
+            min_interval: None,
+            tracker_id: None,
+            complete: 0,
+            incomplete: 0,
+            peers: Vec::new(),
+        };
+
+        let response = retry_udp_announce_across_addrs(&[first, second], {
+            let attempts = Arc::clone(&attempts);
+            let expected = expected.clone();
+            move |tracker_addr| {
+                let attempts = Arc::clone(&attempts);
+                let expected = expected.clone();
+                async move {
+                    attempts.lock().expect("attempt lock").push(tracker_addr);
+                    if tracker_addr == second {
+                        Ok(expected)
+                    } else {
+                        Err(TrackerError::Protocol("first address failed".to_string()))
+                    }
+                }
+            }
+        })
+        .await
+        .expect("second address should succeed on first round");
+
+        assert_eq!(*attempts.lock().expect("attempt lock"), vec![first, second]);
+        assert_eq!(response, expected);
     }
 
     #[test]
