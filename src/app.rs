@@ -175,7 +175,7 @@ impl ListenerSet {
             Ok(listener) => Some(listener),
             Err(error) => {
                 tracing_event!(
-                    Level::WARN,
+                    Level::ERROR,
                     error = %error,
                     "IPv6 listener bind failed; continuing without IPv6 listener."
                 );
@@ -195,10 +195,9 @@ impl ListenerSet {
         .await
         {
             Ok(listener) => Some(listener),
-            Err(error) if error.kind() == io::ErrorKind::AddrInUse => return Err(error),
             Err(error) if ipv6.is_some() => {
                 tracing_event!(
-                    Level::WARN,
+                    Level::ERROR,
                     error = %error,
                     "IPv4 listener bind failed; continuing with IPv6 listener only."
                 );
@@ -6653,9 +6652,9 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::{
-        apply_network_history_persist_result, build_persist_payload, build_torrent_preview_tree,
-        clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
-        flush_persistence_writer_parts, format_filesystem_path_error,
+        apply_network_history_persist_result, bind_ipv6_listener, build_persist_payload,
+        build_torrent_preview_tree, clamp_selected_indices_in_state, compose_system_warning,
+        extract_magnet_display_name, flush_persistence_writer_parts, format_filesystem_path_error,
         is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
@@ -7288,10 +7287,18 @@ mod tests {
             .await
             .expect("create app");
         let original_port = app.client_configs.client_port;
-        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        let occupied_v4 = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .expect("bind occupied IPv4 port");
-        let occupied_port = occupied.local_addr().expect("occupied local addr").port();
+        let occupied_port = occupied_v4
+            .local_addr()
+            .expect("occupied local addr")
+            .port();
+        let _occupied_v6 = if bind_ipv6_listener(0).is_ok() {
+            Some(bind_ipv6_listener(occupied_port).expect("bind occupied IPv6 port"))
+        } else {
+            None
+        };
 
         let mut next_settings = app.client_configs.clone();
         next_settings.client_port = occupied_port;
@@ -9665,17 +9672,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_set_bind_fails_when_ipv4_port_is_already_in_use() {
+    async fn listener_set_bind_keeps_ipv6_listener_when_ipv4_port_is_already_in_use() {
+        let ipv6_supported = bind_ipv6_listener(0).is_ok();
         let occupied = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .expect("bind occupied IPv4 port");
         let port = occupied.local_addr().expect("occupied local addr").port();
 
-        let error = match ListenerSet::bind(port).await {
-            Ok(_) => panic!("bind should fail when IPv4 port is already in use"),
-            Err(error) => error,
-        };
+        match ListenerSet::bind(port).await {
+            Ok(listener_set) => {
+                assert!(ipv6_supported, "IPv6-only fallback requires IPv6 support");
+                assert!(listener_set.ipv6.is_some());
+                assert!(listener_set.ipv4.is_none());
+                assert_eq!(listener_set.local_port(), Some(port));
+            }
+            Err(error) => {
+                assert!(
+                    !ipv6_supported,
+                    "expected degraded IPv6-only bind, got {error}"
+                );
+                assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            }
+        }
+    }
 
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    #[tokio::test]
+    async fn listener_set_bind_keeps_ipv4_listener_when_ipv6_port_is_already_in_use() {
+        let occupied = match bind_ipv6_listener(0) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = occupied.local_addr().expect("occupied local addr").port();
+
+        let listener_set = ListenerSet::bind(port)
+            .await
+            .expect("IPv4-only fallback should succeed");
+
+        assert!(listener_set.ipv4.is_some());
+        assert!(listener_set.ipv6.is_none());
+        assert_eq!(listener_set.local_port(), Some(port));
     }
 }
