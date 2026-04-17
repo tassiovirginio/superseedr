@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -24,9 +24,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-interop-rust-checks-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install rustfmt and clippy
-        run: rustup component add rustfmt clippy
 
       - name: Check formatting
         run: cargo fmt --all --check

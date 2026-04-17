@@ -3595,7 +3595,7 @@ impl App {
                         });
 
                         if !has_target_files {
-                            data.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                            data.sort_by_key(|node| node.name.to_lowercase());
                         } else {
                             data.sort_by(|a, b| {
                                 let a_matches = target_exts
@@ -5691,11 +5691,7 @@ impl App {
     }
 
     fn flush_pending_watch_commands(&mut self) {
-        loop {
-            let Some(cmd) = self.app_state.pending_watch_commands.pop_front() else {
-                break;
-            };
-
+        while let Some(cmd) = self.app_state.pending_watch_commands.pop_front() {
             if let Err(error) = self.app_command_tx.try_send(cmd) {
                 match error {
                     tokio::sync::mpsc::error::TrySendError::Full(cmd) => {
