@@ -3541,6 +3541,89 @@ mod tests {
         assert!(metadata.torrents.is_empty());
     }
 
+    #[test]
+    fn test_normal_save_settings_overwrites_invalid_torrent_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+        let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
+        write_toml_atomically(&backend.paths.settings_path, &Settings::default())
+            .expect("write initial settings");
+        write_string_atomically(&backend.paths.metadata_path, invalid_metadata)
+            .expect("write invalid metadata");
+
+        let next_settings = Settings {
+            client_id: "after-invalid-metadata".to_string(),
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Node".to_string(),
+                file_priorities: HashMap::from([(1, FilePriority::Skip)]),
+                ..TorrentSettings::default()
+            }],
+            ..Settings::default()
+        };
+
+        backend
+            .save_settings(&next_settings)
+            .expect("invalid metadata should be overwritten");
+
+        let saved_settings: Settings =
+            read_toml_or_default(&backend.paths.settings_path).expect("reload saved settings");
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load rewritten metadata");
+
+        assert_eq!(saved_settings.client_id, "after-invalid-metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        assert_eq!(
+            saved_metadata.torrents[0].info_hash_hex,
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(saved_metadata.torrents[0].torrent_name, "Sample Node");
+        assert_eq!(
+            saved_metadata.torrents[0].file_priorities.get(&1),
+            Some(&FilePriority::Skip)
+        );
+        assert!(saved_metadata.torrents[0].files.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_torrent_metadata_overwrites_invalid_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+        let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
+        write_string_atomically(&backend.paths.metadata_path, invalid_metadata)
+            .expect("write invalid metadata");
+
+        ConfigBackend::Normal(backend.clone())
+            .upsert_torrent_metadata(TorrentMetadataEntry {
+                info_hash_hex: "2222222222222222222222222222222222222222".to_string(),
+                torrent_name: "Queued Sample".to_string(),
+                ..TorrentMetadataEntry::default()
+            })
+            .expect("invalid metadata should be overwritten on upsert");
+
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load rewritten metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        assert_eq!(
+            saved_metadata.torrents[0].info_hash_hex,
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(saved_metadata.torrents[0].torrent_name, "Queued Sample");
+    }
+
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {
         shared_env_guard_for_tests()
     }
