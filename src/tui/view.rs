@@ -441,4 +441,13 @@ mod tests {
 
         assert_eq!(commands_width, 18);
     }
+
+    #[test]
+    fn test_footer_status_width_reserves_visual_gutter() {
+        let raw = "Port 6681 | IPv4/IPv6 | OPEN".len() as u16;
+        let computed = crate::tui::screens::normal::compute_footer_status_width(6681, "OPEN");
+
+        assert!(computed > raw);
+        assert_eq!(computed, raw + 2);
+    }
 }

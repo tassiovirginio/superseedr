@@ -68,6 +68,7 @@ static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
 const MINUTES_HISTORY_MAX: usize = 48 * 60;
 const TUNING_LABEL_WIDTH: usize = 14;
+const FOOTER_STATUS_GUTTER: u16 = 2;
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
 const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
@@ -887,6 +888,11 @@ pub(crate) fn compute_footer_side_widths(
     (left_target.min(max_left), status_width)
 }
 
+pub(crate) fn compute_footer_status_width(client_port: u16, overall_port_status: &str) -> u16 {
+    format!("Port {} | IPv4/IPv6 | {}", client_port, overall_port_status).len() as u16
+        + FOOTER_STATUS_GUTTER
+}
+
 fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
     let fx_enabled = ctx.theme.effects.enabled();
     let theme_label = if fx_enabled {
@@ -972,11 +978,7 @@ pub fn draw_footer(
     let v6_highlight_active = app_state
         .externally_accessable_port_v6_highlight_until
         .is_some_and(|deadline| deadline > now);
-    let status_width = format!(
-        "Port {} | IPv4/IPv6 | {}",
-        settings.client_port, overall_port_status
-    )
-    .len() as u16;
+    let status_width = compute_footer_status_width(settings.client_port, overall_port_status);
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
