@@ -3474,6 +3474,11 @@ impl App {
                             highlight_until;
                         &mut self.app_state.externally_accessable_port_v4
                     }
+                    SocketAddr::V6(addr) if addr.ip().to_ipv4_mapped().is_some() => {
+                        self.app_state.externally_accessable_port_v4_highlight_until =
+                            highlight_until;
+                        &mut self.app_state.externally_accessable_port_v4
+                    }
                     SocketAddr::V6(_) => {
                         self.app_state.externally_accessable_port_v6_highlight_until =
                             highlight_until;
@@ -7260,6 +7265,27 @@ mod tests {
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(app.app_state.externally_accessable_port_v6);
+    }
+
+    #[tokio::test]
+    async fn mark_port_open_command_treats_ipv4_mapped_ipv6_as_ipv4_reachability() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+
+        let mapped_addr = SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 6681);
+        app.handle_app_command(AppCommand::MarkPortOpen(mapped_addr))
+            .await;
+
+        assert!(app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
     }
 
     #[tokio::test]

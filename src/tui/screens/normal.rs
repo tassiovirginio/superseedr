@@ -873,6 +873,20 @@ pub(crate) fn compute_footer_left_width(footer_width: u16, is_update: bool) -> u
     available_for_left.clamp(min_left, max_left)
 }
 
+pub(crate) fn compute_footer_side_widths(
+    footer_width: u16,
+    is_update: bool,
+    content_left: u16,
+    status_width: u16,
+) -> (u16, u16) {
+    let min_left = if is_update { 52u16 } else { 40u16 };
+    let min_commands = 18u16;
+    let desired_left = compute_footer_left_width(footer_width, is_update);
+    let left_target = desired_left.min(content_left.max(min_left));
+    let max_left = footer_width.saturating_sub(status_width.saturating_add(min_commands));
+    (left_target.min(max_left), status_width)
+}
+
 fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
     let fx_enabled = ctx.theme.effects.enabled();
     let theme_label = if fx_enabled {
@@ -966,25 +980,13 @@ pub fn draw_footer(
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
-        let min_left = if is_update { 52u16 } else { 40u16 };
-        let min_commands = 18u16;
-        let desired_left = compute_footer_left_width(footer_chunk.width, is_update);
         let content_left = estimate_footer_left_content_width(app_state, ctx);
-        let left_target = desired_left.min(content_left.max(min_left));
-        let symmetric_left_cap = footer_chunk.width.saturating_sub(min_commands) / 2;
-
-        if symmetric_left_cap >= min_left {
-            let symmetric_left = left_target.min(symmetric_left_cap);
-            (
-                Constraint::Length(symmetric_left),
-                Constraint::Length(symmetric_left),
-            )
-        } else {
-            (
-                Constraint::Length(left_target),
-                Constraint::Length(status_width),
-            )
-        }
+        let (left_width, right_width) =
+            compute_footer_side_widths(footer_chunk.width, is_update, content_left, status_width);
+        (
+            Constraint::Length(left_width),
+            Constraint::Length(right_width),
+        )
     } else {
         (Constraint::Length(0), Constraint::Length(status_width))
     };
