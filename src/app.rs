@@ -2222,7 +2222,7 @@ impl App {
         let payload = match self.resolve_add_payload(source, path) {
             Ok(payload) => payload,
             Err(message) => {
-                if is_shared_inbox_path && !path.exists() {
+                if is_shared_inbox_path && matches!(path.try_exists(), Ok(false)) {
                     return AddIngressAction::IgnoreMissingSharedInboxItem { message };
                 }
                 return AddIngressAction::Fail { message };
@@ -6675,9 +6675,9 @@ mod tests {
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
         torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
         AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority,
-        ListenerSet, PeerInfo, PersistPayload, SelectedHeader, SortDirection, TorrentControlState,
-        TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn, UiState,
-        BITTORRENT_PROTOCOL_STR,
+        IngestSource, ListenerSet, PeerInfo, PersistPayload, SelectedHeader, SortDirection,
+        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
+        TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -7929,6 +7929,66 @@ mod tests {
             app.resolve_add_ingress_action(IngestSource::MagnetFile, &verbatim_missing_path),
             super::AddIngressAction::IgnoreMissingSharedInboxItem { .. }
         ));
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_shared_inbox_magnet_is_not_ignored_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let shared_inbox = effective_root.join("inbox");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+        std::fs::create_dir_all(&shared_inbox).expect("create shared inbox");
+
+        let app = App::new(
+            crate::config::load_settings().expect("load shared settings"),
+            AppRuntimeMode::SharedLeader,
+        )
+        .await
+        .expect("build shared app");
+
+        let unreadable_path = shared_inbox.join("permission-denied.magnet");
+        std::fs::set_permissions(&shared_inbox, std::fs::Permissions::from_mode(0o000))
+            .expect("make shared inbox unreadable");
+
+        let action = app.resolve_add_ingress_action(IngestSource::MagnetFile, &unreadable_path);
+
+        std::fs::set_permissions(&shared_inbox, std::fs::Permissions::from_mode(0o700))
+            .expect("restore shared inbox permissions");
+
+        assert!(matches!(action, super::AddIngressAction::Fail { .. }));
 
         let _ = app.shutdown_tx.send(());
         if let Some(value) = original_shared_dir {
