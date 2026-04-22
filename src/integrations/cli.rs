@@ -24,6 +24,9 @@ pub struct Cli {
     #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
 
+    #[arg(long, global = true, help = "Force the TUI to open even when processing CLI requests")]
+    pub tui: bool,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 

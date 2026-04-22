@@ -304,10 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("[Error] Application failed: {}", error);
             }
-            std::process::exit(1);
+            if !cli.tui {
+                std::process::exit(1);
+            }
         }
-        tracing::info!("Command processed, exiting temporary instance.");
-        return Ok(());
+        if !cli.tui {
+            tracing::info!("Command processed, exiting temporary instance.");
+            return Ok(());
+        }
+        tracing::info!("Command processed, continuing to TUI.");
     }
 
     let runtime_mode = if shared_mode {
